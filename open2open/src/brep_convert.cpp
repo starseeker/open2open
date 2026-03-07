@@ -38,6 +38,7 @@
 
 #include <vector>
 #include <map>
+#include <set>
 
 namespace open2open {
 
@@ -178,6 +179,66 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
         if (f.m_bRev)
             f_map[fi].Reverse();
 
+        // Pre-scan all loops on this face for seam trim pairs.
+        // A seam edge appears twice in the same loop: once forward, once
+        // reversed.  OCCT requires both 2D pcurves set in a single call to
+        // BRep_Builder::UpdateEdge(edge, C1, C2, face, tol).  If we call the
+        // single-pcurve overload twice the second call overwrites the first.
+        struct SeamPair {
+            int c2i_fwd = -1;   // pcurve for edge FORWARD orientation
+            int c2i_rev = -1;   // pcurve for edge REVERSED orientation
+            double t0 = 0, t1 = 0;
+            double tol = 0;
+        };
+        std::map<int, SeamPair> seam_map;  // edge index → pcurve pair
+
+        for (int li_idx = 0; li_idx < f.m_li.Count(); ++li_idx) {
+            int loop_idx = f.m_li[li_idx];
+            if (loop_idx < 0 || loop_idx >= brep.m_L.Count()) continue;
+            const ON_BrepLoop& loop = brep.m_L[loop_idx];
+            for (int ti_idx = 0; ti_idx < loop.m_ti.Count(); ++ti_idx) {
+                int trim_idx = loop.m_ti[ti_idx];
+                if (trim_idx < 0 || trim_idx >= brep.m_T.Count()) continue;
+                const ON_BrepTrim& trim = brep.m_T[trim_idx];
+                if (trim.m_type != ON_BrepTrim::seam) continue;
+                int ei = trim.m_ei;
+                if (ei < 0 || ei >= brep.m_E.Count()) continue;
+                SeamPair& sp = seam_map[ei];
+                double t = trim.m_tolerance[0] > 0.0
+                               ? trim.m_tolerance[0]
+                               : linear_tolerance;
+                if (!trim.m_bRev3d) {
+                    sp.c2i_fwd = trim.m_c2i;
+                    sp.t0 = trim.Domain().Min();
+                    sp.t1 = trim.Domain().Max();
+                    sp.tol = t;
+                } else {
+                    sp.c2i_rev = trim.m_c2i;
+                    if (sp.tol == 0.0) sp.tol = t;
+                }
+            }
+        }
+
+        // Apply double-pcurve UpdateEdge for seam edges now (before the
+        // per-loop trim loop that would otherwise set them one at a time).
+        std::set<int> seam_c2_applied;
+        for (auto& kv : seam_map) {
+            int ei = kv.first;
+            const SeamPair& sp = kv.second;
+            if (ei >= (int)e_map.size()) continue;
+            if (sp.c2i_fwd >= 0 && sp.c2i_fwd < (int)c2_map.size() &&
+                sp.c2i_rev >= 0 && sp.c2i_rev < (int)c2_map.size() &&
+                !c2_map[sp.c2i_fwd].IsNull() && !c2_map[sp.c2i_rev].IsNull()) {
+                B.UpdateEdge(e_map[ei],
+                             c2_map[sp.c2i_fwd],
+                             c2_map[sp.c2i_rev],
+                             f_map[fi],
+                             sp.tol);
+                B.Range(e_map[ei], f_map[fi], sp.t0, sp.t1);
+                seam_c2_applied.insert(ei);
+            }
+        }
+
         for (int li_idx = 0; li_idx < f.m_li.Count(); ++li_idx) {
             int loop_idx = f.m_li[li_idx];
             if (loop_idx < 0 || loop_idx >= brep.m_L.Count())
@@ -198,20 +259,30 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                 const ON_BrepTrim& trim = brep.m_T[trim_idx];
                 int ei = trim.m_ei;
 
-                // Singular trims (no edge)
+                // Singular trims (no edge) → degenerate OCCT edge
                 if (ei < 0) {
-                    // Degenerate edge: create a point edge
-                    if (trim.m_vi[0] >= 0 && trim.m_vi[0] < (int)v_map.size()) {
+                    if (trim.m_vi[0] >= 0 &&
+                        trim.m_vi[0] < (int)v_map.size()) {
                         TopoDS_Edge degen_edge;
                         B.MakeEdge(degen_edge);
                         B.Degenerated(degen_edge, Standard_True);
+                        // Add pole vertex (both FORWARD and REVERSED since
+                        // the edge is topologically a point)
+                        TopoDS_Vertex pole_fwd = v_map[trim.m_vi[0]];
+                        pole_fwd.Orientation(TopAbs_FORWARD);
+                        B.Add(degen_edge, pole_fwd);
+                        TopoDS_Vertex pole_rev = v_map[trim.m_vi[0]];
+                        pole_rev.Orientation(TopAbs_REVERSED);
+                        B.Add(degen_edge, pole_rev);
                         if (trim.m_c2i >= 0 &&
                             trim.m_c2i < (int)c2_map.size() &&
                             !c2_map[trim.m_c2i].IsNull()) {
+                            double dt = trim.m_tolerance[0] > 0.0
+                                            ? trim.m_tolerance[0]
+                                            : linear_tolerance;
                             B.UpdateEdge(degen_edge,
                                          c2_map[trim.m_c2i],
-                                         f_map[fi],
-                                         trim.m_tolerance[0]);
+                                         f_map[fi], dt);
                             B.Range(degen_edge, f_map[fi],
                                     trim.Domain().Min(),
                                     trim.Domain().Max());
@@ -223,7 +294,18 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
 
                 if (ei >= (int)e_map.size()) continue;
 
-                // Attach 2D pcurve to this edge/face pair
+                // Seam edge: pcurves already set via the double-pcurve
+                // UpdateEdge above — just orient and add to wire.
+                if (trim.m_type == ON_BrepTrim::seam &&
+                    seam_c2_applied.count(ei)) {
+                    TopoDS_Edge oriented_edge = e_map[ei];
+                    if (trim.m_bRev3d)
+                        oriented_edge.Reverse();
+                    B.Add(wire, oriented_edge);
+                    continue;
+                }
+
+                // Non-seam edge: attach single 2D pcurve
                 if (trim.m_c2i >= 0 &&
                     trim.m_c2i < (int)c2_map.size() &&
                     !c2_map[trim.m_c2i].IsNull()) {
@@ -308,26 +390,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         Standard_Address key = edge.TShape().get();
         if (edge_map.count(key)) continue;
 
-        // If degenerate there is no 3-D curve
+        // Degenerate edges (poles) must NOT become ON_BrepEdge objects —
+        // they are represented as singular trims in openNURBS.  We store
+        // a sentinel value (-2) so Pass 3 can detect them.
         if (BRep_Tool::Degenerated(edge)) {
-            // Look up the vertex (pole) for this degenerate edge
-            int dv0 = -1;
-            for (TopExp_Explorer vex(edge, TopAbs_VERTEX); vex.More(); vex.Next()) {
-                Standard_Address vk = vex.Current().TShape().get();
-                auto it = vertex_map.find(vk);
-                if (it != vertex_map.end()) { dv0 = it->second; break; }
-            }
-            ON_BrepEdge* pdoe = nullptr;
-            if (dv0 >= 0) {
-                pdoe = &brep.NewEdge(brep.m_V[dv0], brep.m_V[dv0], -1,
-                                     nullptr, linear_tolerance);
-            } else {
-                pdoe = &brep.NewEdge(-1);
-                pdoe->m_vi[0] = pdoe->m_vi[1] = -1;
-                pdoe->m_tolerance = linear_tolerance;
-            }
-            brep.m_E[pdoe->m_edge_index].m_tolerance = linear_tolerance;
-            edge_map[key] = pdoe->m_edge_index;
+            edge_map[key] = -2;
             continue;
         }
 
@@ -508,54 +575,58 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 // Trim orientation
                 bool bRev3d = (edge.Orientation() == TopAbs_REVERSED);
 
+                if (ei == -2) {
+                    // Degenerate OCCT edge → openNURBS singular trim.
+                    // Find the pole vertex by evaluating the surface at the
+                    // start point of the 2D pcurve and picking the nearest
+                    // already-translated vertex.  O(|vertices|) search; for
+                    // typical B-Rep models (2-8 vertices) this is negligible.
+                    int pole_vi = -1;
+                    if (c2i >= 0 && si >= 0 && brep.m_V.Count() > 0) {
+                        const ON_Surface* srf = brep.m_S[si];
+                        const ON_NurbsCurve* c2 =
+                            ON_NurbsCurve::Cast(brep.m_C2[c2i]);
+                        if (srf && c2) {
+                            ON_Interval dom = c2->Domain();
+                            ON_3dPoint uv = c2->PointAt(dom.Min());
+                            ON_3dPoint pt3;
+                            if (srf->EvPoint(uv.x, uv.y, pt3)) {
+                                double best_d = 1e30;
+                                for (int vi = 0; vi < brep.m_V.Count(); ++vi) {
+                                    double d = brep.m_V[vi].point.DistanceTo(pt3);
+                                    if (d < best_d) {
+                                        best_d = d;
+                                        pole_vi = vi;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (pole_vi < 0) continue; // no vertex found — skip trim
+
+                    ON_BrepTrim& strim = brep.NewSingularTrim(
+                        brep.m_V[pole_vi], ol, ON_Surface::not_iso, c2i);
+                    strim.m_tolerance[0] = BRep_Tool::Tolerance(edge);
+                    strim.m_tolerance[1] = strim.m_tolerance[0];
+                    if (c2i >= 0)
+                        strim.SetProxyCurveDomain(ON_Interval(pc_t0, pc_t1));
+                    continue;
+                }
+
                 ON_BrepTrim& trim =
                     brep.NewTrim(brep.m_E[ei], bRev3d, ol, c2i);
                 trim.m_tolerance[0] = BRep_Tool::Tolerance(edge);
                 trim.m_tolerance[1] = trim.m_tolerance[0];
                 if (c2i >= 0)
                     trim.SetProxyCurveDomain(ON_Interval(pc_t0, pc_t1));
-
-                // Classify trim type
-                if (BRep_Tool::Degenerated(edge))
-                    trim.m_type = ON_BrepTrim::singular;
-                else
-                    trim.m_type = ON_BrepTrim::mated;
+                // Note: trim.m_type is set automatically by NewTrim
+                // (boundary→seam→mated) — do NOT override it here.
             }
 
             // Fix up loop type based on orientation
             ol.m_type = (ol.m_loop_index == of.m_li[0])
                             ? ON_BrepLoop::outer
                             : ON_BrepLoop::inner;
-
-            // Fix degenerate trim vertices: for singular trims (collapsed
-            // edges), m_vi[] was inherited as -1 from the degenerate edge.
-            // Propagate vertex indices from neighbouring trims in the loop.
-            {
-                const int lti_count = ol.m_ti.Count();
-                // Two passes to handle runs of degenerate trims.
-                for (int pass = 0; pass < 2; ++pass) {
-                    for (int lti = 0; lti < lti_count; ++lti) {
-                        ON_BrepTrim& t = brep.m_T[ol.m_ti[lti]];
-                        if (t.m_vi[0] >= 0 && t.m_vi[1] >= 0) continue;
-                        // Try to borrow from prev/next
-                        int prev_ti = ol.m_ti[(lti - 1 + lti_count) % lti_count];
-                        int next_ti = ol.m_ti[(lti + 1) % lti_count];
-                        int pv1 = brep.m_T[prev_ti].m_vi[1];
-                        int nv0 = brep.m_T[next_ti].m_vi[0];
-                        if (t.m_vi[0] < 0)
-                            t.m_vi[0] = (pv1 >= 0) ? pv1 : nv0;
-                        if (t.m_vi[1] < 0)
-                            t.m_vi[1] = (nv0 >= 0) ? nv0 : pv1;
-                        // Update the associated degenerate edge's vertices too
-                        int dei = t.m_ei;
-                        if (dei >= 0) {
-                            ON_BrepEdge& de = brep.m_E[dei];
-                            if (de.m_vi[0] < 0) de.m_vi[0] = t.m_vi[0];
-                            if (de.m_vi[1] < 0) de.m_vi[1] = t.m_vi[1];
-                        }
-                    }
-                }
-            }
         }
     }
 
