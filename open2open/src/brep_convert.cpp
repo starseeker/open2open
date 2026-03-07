@@ -48,6 +48,8 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <tuple>
+#include <cmath>
 
 namespace open2open {
 
@@ -448,10 +450,44 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
     if (shape.IsNull()) return false;
 
-    // Maps from OCCT shape (by pointer/hash) to openNURBS index
-    std::map<Standard_Address, int> vertex_map;  // TShape* → vertex index
-    std::map<Standard_Address, int> edge_map;    // TShape* → edge index
-    std::map<Standard_Address, int> surface_map; // TShape* → surface index
+    // Maps from OCCT shape (by pointer/hash) to openNURBS index.
+    // vertex_map is keyed on (TShape*, rounded_3D_position) so that the same
+    // underlying vertex TShape instantiated at different locations (e.g. on a
+    // body-of-revolution that has been translated) creates separate ON_BrepVertex
+    // objects at their correct 3D positions instead of falsely collapsing to one.
+    using PntKey = std::tuple<long long, long long, long long>;
+    auto make_pnt_key = [](const gp_Pnt& p) -> PntKey {
+        // 1e9 precision: ~1 nm resolution, covers coordinates up to ±9e9 units.
+        return { llround(p.X() * 1e9),
+                 llround(p.Y() * 1e9),
+                 llround(p.Z() * 1e9) };
+    };
+
+    // Edge map key: (TShape*, PntKey_of_start_vertex).
+    // Using the start-vertex world position disambiguates the same TShape
+    // appearing at different body-of-revolution locations (translations) while
+    // still collapsing all traversals (FORWARD and REVERSED) of the same physical
+    // edge to the same ON_BrepEdge index.
+    // Degenerate edges get PntKey{0,0,0} as a sentinel (they share the pole vertex).
+    using EdgeKey = std::pair<Standard_Address, PntKey>;
+    std::map<PntKey, int>          vertex_map;  // rounded 3D pos → vertex index
+    std::map<EdgeKey, int>         edge_map;    // (TShape*, start_pos) → edge index
+    std::map<Standard_Address, int> surface_map;// TShape* → surface index
+
+    // Helper: compute the EdgeKey for a (non-degenerate) edge.
+    // TopExp::Vertices with CumOri=false always returns tv0 as the FORWARD
+    // (curve-start) vertex regardless of wire orientation, so both FORWARD and
+    // REVERSED traversals of the same physical edge produce the same key.
+    auto make_edge_key = [&](const TopoDS_Edge& e) -> EdgeKey {
+        Standard_Address tsh = e.TShape().get();
+        if (BRep_Tool::Degenerated(e))
+            return { tsh, PntKey{0LL, 0LL, 0LL} };
+        TopoDS_Vertex tv0, tv1;
+        TopExp::Vertices(e, tv0, tv1, /*CumOri=*/false);
+        if (tv0.IsNull())
+            return { tsh, PntKey{0LL, 0LL, 0LL} };
+        return { tsh, make_pnt_key(BRep_Tool::Pnt(tv0)) };
+    };
 
     // ------------------------------------------------------------------
     // Pass 1 — collect and translate all vertices
@@ -459,10 +495,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     for (TopExp_Explorer ex(shape, TopAbs_VERTEX); ex.More(); ex.Next()) {
         const TopoDS_Vertex& vtx =
             TopoDS::Vertex(ex.Current());
-        Standard_Address key = vtx.TShape().get();
+
+        gp_Pnt p = BRep_Tool::Pnt(vtx);  // applies location transform
+        PntKey key = make_pnt_key(p);
         if (vertex_map.count(key)) continue;
 
-        gp_Pnt p = BRep_Tool::Pnt(vtx);
         double tol = BRep_Tool::Tolerance(vtx);
 
         ON_BrepVertex& ov = brep.NewVertex(
@@ -475,32 +512,36 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     // ------------------------------------------------------------------
     for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) {
         const TopoDS_Edge& edge = TopoDS::Edge(ex.Current());
-        Standard_Address key = edge.TShape().get();
-        if (edge_map.count(key)) continue;
+        EdgeKey ek = make_edge_key(edge);
+        if (edge_map.count(ek)) continue;
 
         // Degenerate edges (poles) must NOT become ON_BrepEdge objects —
         // they are represented as singular trims in openNURBS.  We store
         // a sentinel value (-2) so Pass 3 can detect them.
         if (BRep_Tool::Degenerated(edge)) {
-            edge_map[key] = -2;
+            edge_map[ek] = -2;
             continue;
         }
 
-        // Detect topologically-closed edges (same underlying vertex at both
-        // ends, e.g. a full circle).  This must be known before curve
-        // conversion because such edges must have ON_NurbsCurve::IsClosed()
-        // == true — the curve's own domain endpoints must be the same 3D
-        // point.  When gc is a BSpline we would normally reuse its full
-        // domain [gc->First, gc->Last], but for a closed edge the full
-        // domain may not start/end at the same 3D point.  By forcing the
-        // TrimmedCurve path we get a curve with domain exactly [t0, t1]
-        // whose endpoints coincide (topological invariant).
+        // Detect topologically-closed edges: same underlying vertex TShape at
+        // both ends AND the same 3D world position.  Edges where the same TShape
+        // appears at two DIFFERENT positions (e.g. a translated body-of-revolution
+        // with a shared seam vertex at two Z heights) are NOT closed edges.
         bool topoClosedEdge = false;
         {
             TopoDS_Vertex tv0, tv1;
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
-            topoClosedEdge = (!tv0.IsNull() && !tv1.IsNull() &&
-                              tv0.TShape() == tv1.TShape());
+            if (!tv0.IsNull() && !tv1.IsNull() &&
+                tv0.TShape() == tv1.TShape()) {
+                gp_Pnt p0 = BRep_Tool::Pnt(tv0);
+                gp_Pnt p1 = BRep_Tool::Pnt(tv1);
+                // Closed only when the two vertex instances are at the same
+                // 3D location (within a generous position tolerance).
+                double vtx_tol =
+                    std::max(BRep_Tool::Tolerance(tv0),
+                             BRep_Tool::Tolerance(tv1));
+                topoClosedEdge = (p0.Distance(p1) <= vtx_tol + 1e-7);
+            }
         }
 
         double t0, t1;
@@ -576,18 +617,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             cvN[k] = cv0[k];
                     }
                 }
-                // Debug: print diagnostic for still-failing cases
-                if (!nc->IsClosed()) {
-                    fprintf(stderr,
-                        "[DBG] closed-edge curve not closed:"
-                        " domain=[%g,%g] d=%g scale=%g"
-                        " cv_count=%d rat=%d"
-                        " p0=(%g,%g,%g) p1=(%g,%g,%g)\n",
-                        nc->Domain()[0], nc->Domain()[1],
-                        d, scale,
-                        nc->m_cv_count, nc->IsRational() ? 1 : 0,
-                        p0.x, p0.y, p0.z, p1.x, p1.y, p1.z);
-                }
             }
         }
 
@@ -602,13 +631,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             TopoDS_Vertex tv0, tv1;
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
             if (!tv0.IsNull()) {
-                Standard_Address vk = tv0.TShape().get();
-                auto it = vertex_map.find(vk);
+                auto it = vertex_map.find(make_pnt_key(BRep_Tool::Pnt(tv0)));
                 if (it != vertex_map.end()) vi0 = it->second;
             }
             if (!tv1.IsNull()) {
-                Standard_Address vk = tv1.TShape().get();
-                auto it = vertex_map.find(vk);
+                auto it = vertex_map.find(make_pnt_key(BRep_Tool::Pnt(tv1)));
                 if (it != vertex_map.end()) vi1 = it->second;
             }
         }
@@ -646,7 +673,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 brep.m_E[this_ei].SetProxyCurveDomain(ON_Interval(t0, t1));
             }
         }
-        edge_map[key] = this_ei;
+        edge_map[ek] = this_ei;
     }
 
     // ------------------------------------------------------------------
@@ -731,19 +758,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next())
                     wire_edges.push_back(we.Current());
             }
-            // Count unique edge TShapes from TopExp_Explorer
+            // Count unique physical edges (TShape + start-vertex position) from
+            // TopExp_Explorer.  WireExplorer may visit seam edges twice (FORWARD
+            // and REVERSED); since both traversals produce the same EdgeKey, the
+            // unique-key count is the right comparison.
             {
-                std::set<Standard_Address> tex_keys;
+                std::set<EdgeKey> tex_keys;
                 for (TopExp_Explorer eex(wire, TopAbs_EDGE);
                      eex.More(); eex.Next()) {
                     tex_keys.insert(
-                        TopoDS::Edge(eex.Current()).TShape().get());
+                        make_edge_key(TopoDS::Edge(eex.Current())));
                 }
-                // WireExplorer may visit seam edges twice (once FORWARD, once
-                // REVERSED); unique TShape count is the right comparison
-                std::set<Standard_Address> we_keys;
+                std::set<EdgeKey> we_keys;
                 for (const TopoDS_Edge& e : wire_edges)
-                    we_keys.insert(e.TShape().get());
+                    we_keys.insert(make_edge_key(e));
                 if (we_keys.size() < tex_keys.size()) {
                     // WireExplorer missed some edges — revert to TopExp order
                     wire_edges.clear();
@@ -754,7 +782,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
 
             for (const TopoDS_Edge& edge : wire_edges) {
-                Standard_Address ek = edge.TShape().get();
+                EdgeKey ek = make_edge_key(edge);
 
                 auto eit = edge_map.find(ek);
                 if (eit == edge_map.end()) continue;
@@ -1078,45 +1106,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         const double new_etol = d_max / 9.0;
         if (new_etol > edge.m_tolerance)
             edge.m_tolerance = new_etol;
-    }
-
-    // For closed trims (both trim and edge start/end at the same vertex),
-    // the validation additionally checks that the trim tangent aligns with
-    // the edge tangent.  If it does not, flip m_bRev3d so the directions agree.
-    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
-        ON_BrepTrim& trim = brep.m_T[ti];
-        if (trim.m_ei < 0 || trim.m_li < 0) continue;
-        if (trim.m_vi[0] != trim.m_vi[1]) continue;  // not a closed trim
-
-        const ON_BrepEdge& edge = brep.m_E[trim.m_ei];
-        if (edge.m_vi[0] != edge.m_vi[1]) continue;  // not a closed edge
-        if (trim.m_vi[0] != edge.m_vi[0]) continue;  // different vertex
-
-        const int fi = brep.m_L[trim.m_li].m_fi;
-        if (fi < 0) continue;
-        const ON_Surface* srf = brep.m_F[fi].SurfaceOf();
-        if (!srf) continue;
-
-        // Compute the 3D tangent of the trim at its start via surface Jacobian.
-        ON_Interval td = trim.Domain();
-        ON_3dPoint  uv; ON_3dVector du, dv, trim_tan_uv;
-        if (!trim.Ev1Der(td[0], uv, trim_tan_uv)) continue;
-        ON_3dPoint  srf_pt; ON_3dVector srf_du, srf_dv;
-        if (!srf->Ev1Der(uv.x, uv.y, srf_pt, srf_du, srf_dv)) continue;
-        ON_3dVector trim_tan3d = trim_tan_uv.x * srf_du + trim_tan_uv.y * srf_dv;
-        if (!trim_tan3d.Unitize()) continue;
-
-        // Edge tangent at the start of the edge curve.
-        ON_3dVector edge_tan = edge.TangentAt(edge.Domain()[0]);
-        if (!edge_tan.IsValid()) continue;
-
-        double dot = trim_tan3d * edge_tan;
-        if (trim.m_bRev3d) dot = -dot;  // expected sign is positive
-
-        if (dot < 0.0) {
-            // Tangent directions disagree — flip m_bRev3d.
-            trim.m_bRev3d = !trim.m_bRev3d;
-        }
     }
 
     return brep.IsValid() ? true : false;
