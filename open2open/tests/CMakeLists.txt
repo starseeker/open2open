@@ -31,3 +31,21 @@ add_executable(test_3dm_examples test_3dm_examples.cpp)
 target_link_libraries(test_3dm_examples PRIVATE open2open)
 add_test(NAME test_3dm_examples
          COMMAND test_3dm_examples "${_3dm_example_dir}")
+
+# Round-trip tests for user-supplied .3dm files in a flat directory.
+# .3dm.gz files are decompressed on-the-fly to a temporary location.
+# The test3dm directory is expected at ${CMAKE_SOURCE_DIR}/../test3dm
+set(_3dm_roundtrip_dir "${CMAKE_SOURCE_DIR}/../test3dm")
+add_executable(test_3dm_roundtrip test_3dm_roundtrip.cpp)
+target_link_libraries(test_3dm_roundtrip PRIVATE open2open)
+add_test(NAME test_3dm_roundtrip
+         COMMAND test_3dm_roundtrip "${_3dm_roundtrip_dir}")
+
+# Round-trip tests for OpenCASCADE .brep files:
+#   OCCT → ON_Brep → OCCT, then validate with BRepCheck_Analyzer.
+# The brep directory is expected at ${CMAKE_SOURCE_DIR}/../OCCT-7_9_3/data/occ
+set(_occ_brep_dir "${CMAKE_SOURCE_DIR}/../OCCT-7_9_3/data/occ")
+add_executable(test_occ_roundtrip test_occ_roundtrip.cpp)
+target_link_libraries(test_occ_roundtrip PRIVATE open2open)
+add_test(NAME test_occ_roundtrip
+         COMMAND test_occ_roundtrip "${_occ_brep_dir}")

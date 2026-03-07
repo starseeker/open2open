@@ -486,6 +486,23 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             continue;
         }
 
+        // Detect topologically-closed edges (same underlying vertex at both
+        // ends, e.g. a full circle).  This must be known before curve
+        // conversion because such edges must have ON_NurbsCurve::IsClosed()
+        // == true — the curve's own domain endpoints must be the same 3D
+        // point.  When gc is a BSpline we would normally reuse its full
+        // domain [gc->First, gc->Last], but for a closed edge the full
+        // domain may not start/end at the same 3D point.  By forcing the
+        // TrimmedCurve path we get a curve with domain exactly [t0, t1]
+        // whose endpoints coincide (topological invariant).
+        bool topoClosedEdge = false;
+        {
+            TopoDS_Vertex tv0, tv1;
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+            topoClosedEdge = (!tv0.IsNull() && !tv1.IsNull() &&
+                              tv0.TShape() == tv1.TShape());
+        }
+
         double t0, t1;
         Handle(Geom_Curve) gc = BRep_Tool::Curve(edge, t0, t1);
 
@@ -496,8 +513,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // [t0, t1] using a Geom_TrimmedCurve.  This avoids domain
             // mismatch when the full curve spans more than the edge (e.g.
             // Geom_Circle with t=[3π/2..5π/2]) and avoids periodic BSplines.
-            Handle(Geom_BSplineCurve) bc =
-                Handle(Geom_BSplineCurve)::DownCast(gc);
+            //
+            // For topologically-closed edges we also force the TrimmedCurve
+            // path even when gc is already a BSpline, so that the resulting
+            // ON_NurbsCurve has domain exactly [t0, t1] with matching
+            // start/end 3D points (required for IsClosed() == true).
+            Handle(Geom_BSplineCurve) bc;
+            if (!topoClosedEdge) {
+                bc = Handle(Geom_BSplineCurve)::DownCast(gc);
+            }
             if (bc.IsNull()) {
                 // Trimmed conversion first (preserves arc domain)
                 try {
@@ -522,6 +546,47 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     c3i = brep.AddEdgeCurve(nc);
                 } else {
                     delete nc;
+                }
+            }
+        }
+
+        // For topologically-closed edges the curve's own domain endpoints
+        // must be coincident (IsClosed() == true).  After the TrimmedCurve
+        // conversion the endpoints should already be equal; snap the last
+        // CV to exactly match the first to eliminate any floating-point
+        // residual so that ON_PointsAreCoincident() returns true.
+        if (topoClosedEdge && c3i >= 0) {
+            ON_NurbsCurve* nc =
+                ON_NurbsCurve::Cast(brep.m_C3[c3i]);
+            if (nc && nc->m_cv_count >= 2) {
+                ON_3dPoint p0 = nc->PointAt(nc->Domain()[0]);
+                ON_3dPoint p1 = nc->PointAt(nc->Domain()[1]);
+                double d = p0.DistanceTo(p1);
+                double scale = std::max(
+                    1.0, std::max(fabs(p0.x),
+                         std::max(fabs(p0.y), fabs(p0.z))));
+                // Only snap when the endpoints are already geometrically
+                // close (genuine floating-point residual, not a mismatch).
+                if (d <= 1e-4 * scale) {
+                    const int stride = nc->m_cv_stride;
+                    double* cv0 = nc->CV(0);
+                    double* cvN = nc->CV(nc->m_cv_count - 1);
+                    if (cv0 && cvN) {
+                        for (int k = 0; k < stride; ++k)
+                            cvN[k] = cv0[k];
+                    }
+                }
+                // Debug: print diagnostic for still-failing cases
+                if (!nc->IsClosed()) {
+                    fprintf(stderr,
+                        "[DBG] closed-edge curve not closed:"
+                        " domain=[%g,%g] d=%g scale=%g"
+                        " cv_count=%d rat=%d"
+                        " p0=(%g,%g,%g) p1=(%g,%g,%g)\n",
+                        nc->Domain()[0], nc->Domain()[1],
+                        d, scale,
+                        nc->m_cv_count, nc->IsRational() ? 1 : 0,
+                        p0.x, p0.y, p0.z, p1.x, p1.y, p1.z);
                 }
             }
         }
@@ -566,7 +631,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // Defensive: force tolerance on the edge after creation
         brep.m_E[this_ei].m_tolerance = edge_tol;
         if (c3i >= 0) {
-            brep.m_E[this_ei].SetProxyCurveDomain(ON_Interval(t0, t1));
+            // For closed edges we set the proxy domain to the curve's own
+            // domain so that ON_CurveProxy::IsClosed() can delegate to the
+            // underlying curve (it requires ProxyCurveDomain()==Curve()->Domain()).
+            // For non-closed edges the proxy domain is the edge's actual
+            // parameter range [t0, t1] within a potentially wider BSpline.
+            if (topoClosedEdge) {
+                ON_NurbsCurve* nc_chk =
+                    ON_NurbsCurve::Cast(brep.m_C3[c3i]);
+                ON_Interval crv_dom = nc_chk ? nc_chk->Domain()
+                                             : ON_Interval(t0, t1);
+                brep.m_E[this_ei].SetProxyCurveDomain(crv_dom);
+            } else {
+                brep.m_E[this_ei].SetProxyCurveDomain(ON_Interval(t0, t1));
+            }
         }
         edge_map[key] = this_ei;
     }
