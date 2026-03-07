@@ -16,3 +16,5 @@ add_test(test_surfaces_complex "/home/runner/work/open2open/open2open/build/test
 set_tests_properties(test_surfaces_complex PROPERTIES  _BACKTRACE_TRIPLES "/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;16;add_test;/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;0;")
 add_test(test_brep_complex "/home/runner/work/open2open/open2open/build/tests/test_brep_complex")
 set_tests_properties(test_brep_complex PROPERTIES  _BACKTRACE_TRIPLES "/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;23;add_test;/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;0;")
+add_test(test_3dm_examples "/home/runner/work/open2open/open2open/build/tests/test_3dm_examples" "/home/runner/work/open2open/open2open/open2open/../opennurbs-8.24.25281.15001/example_files")
+set_tests_properties(test_3dm_examples PROPERTIES  _BACKTRACE_TRIPLES "/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;32;add_test;/home/runner/work/open2open/open2open/open2open/tests/CMakeLists.txt;0;")

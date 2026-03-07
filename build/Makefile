@@ -327,6 +327,19 @@ test_brep_complex/fast:
 	$(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_brep_complex.dir/build.make tests/CMakeFiles/test_brep_complex.dir/build
 .PHONY : test_brep_complex/fast
 
+#=============================================================================
+# Target rules for targets named test_3dm_examples
+
+# Build rule for target.
+test_3dm_examples: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_3dm_examples
+.PHONY : test_3dm_examples
+
+# fast build rule for target.
+test_3dm_examples/fast:
+	$(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_3dm_examples.dir/build.make tests/CMakeFiles/test_3dm_examples.dir/build
+.PHONY : test_3dm_examples/fast
+
 src/brep_convert.o: src/brep_convert.cpp.o
 .PHONY : src/brep_convert.o
 
@@ -393,6 +406,7 @@ help:
 	@echo "... open2open"
 	@echo "... opennurbsStatic"
 	@echo "... opennurbs_public_freetype"
+	@echo "... test_3dm_examples"
 	@echo "... test_brep"
 	@echo "... test_brep_complex"
 	@echo "... test_curves"

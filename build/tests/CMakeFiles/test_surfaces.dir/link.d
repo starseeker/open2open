@@ -30,8 +30,8 @@ test_surfaces: \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/librt.a \
   /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libdl.a \
-  /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbb.so \
-  /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbbmalloc.so \
+  /usr/lib/x86_64-linux-gnu/libtbb.so \
+  /usr/lib/x86_64-linux-gnu/libtbbmalloc.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libm.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libm.so \
@@ -59,8 +59,8 @@ test_surfaces: \
   /usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o \
   /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crtn.o \
   /usr/lib/x86_64-linux-gnu/libTKMath.so.7.6.3 \
-  /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbb.so \
-  /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbbmalloc.so
+  /usr/lib/x86_64-linux-gnu/libtbb.so \
+  /usr/lib/x86_64-linux-gnu/libtbbmalloc.so
 
 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/Scrt1.o:
 
@@ -124,9 +124,9 @@ CMakeFiles/test_surfaces.dir/test_surfaces.cpp.o:
 
 /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libdl.a:
 
-/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbb.so:
+/usr/lib/x86_64-linux-gnu/libtbb.so:
 
-/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbbmalloc.so:
+/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:
 
 /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so:
 
@@ -182,6 +182,6 @@ CMakeFiles/test_surfaces.dir/test_surfaces.cpp.o:
 
 /usr/lib/x86_64-linux-gnu/libTKMath.so.7.6.3:
 
-/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbb.so:
+/usr/lib/x86_64-linux-gnu/libtbb.so:
 
-/usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/libtbbmalloc.so:
+/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:

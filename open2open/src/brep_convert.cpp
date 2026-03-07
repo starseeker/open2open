@@ -41,6 +41,9 @@
 // ---- OCCT containers ----
 #include <Standard_Handle.hxx>
 #include <NCollection_Map.hxx>
+#include <TColgp_Array1OfPnt2d.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColStd_Array1OfInteger.hxx>
 
 #include <vector>
 #include <map>
@@ -246,18 +249,75 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             if (sp.c2i_fwd >= 0 && sp.c2i_fwd < (int)c2_map.size() &&
                 sp.c2i_rev >= 0 && sp.c2i_rev < (int)c2_map.size() &&
                 !c2_map[sp.c2i_fwd].IsNull() && !c2_map[sp.c2i_rev].IsNull()) {
-                // OCCT's UpdateEdge(e, C1, C2, F, tol) stores:
-                //   C1 = pcurve for FORWARD orientation (edge direction)
-                //   C2 = pcurve for REVERSED orientation (also in edge direction)
-                // The openNURBS seam_rev pcurve is in TRIM traversal direction
-                // (= reversed edge direction).  Un-reverse it before storing so
-                // both C1 and C2 are in the edge-forward convention.
-                Handle(Geom2d_Curve) c2_rev_occt = c2_map[sp.c2i_rev]->Reversed();
-                B.UpdateEdge(e_map[ei],
-                             c2_map[sp.c2i_fwd],
-                             c2_rev_occt,
-                             f_map[fi],
-                             sp.tol);
+                // Build C_fwd (edge-forward at the U_max seam) and
+                // C_rev_edgefwd (edge-forward at the U_0 seam).
+                //
+                // The openNURBS seam_rev pcurve is stored in TRIM traversal
+                // direction (= reversed edge direction).  Reverse it so both
+                // pcurves are in the edge-forward convention.
+                Handle(Geom2d_Curve) c_fwd      = c2_map[sp.c2i_fwd];
+                Handle(Geom2d_Curve) c_rev_efwd = c2_map[sp.c2i_rev]->Reversed();
+
+                // OCCT keeps the original domain when reversing a BSpline,
+                // so c_rev_efwd may have domain [-t1, -t0] instead of
+                // [sp.t0, sp.t1].  Build a new BSpline with the same poles
+                // but linearly remapped knots so that BRep_Tool::CurveOnSurface
+                // never extrapolates outside the stored range.
+                Handle(Geom2d_BSplineCurve) brev =
+                    Handle(Geom2d_BSplineCurve)::DownCast(c_rev_efwd);
+                if (!brev.IsNull() && brev->NbKnots() >= 2) {
+                    double old0 = brev->FirstParameter();
+                    double old1 = brev->LastParameter();
+                    double span = old1 - old0;
+                    if (std::abs(span) > 1e-12 &&
+                        (std::abs(old0 - sp.t0) > 1e-10 ||
+                         std::abs(old1 - sp.t1) > 1e-10)) {
+                        // Build remapped knot array (distinct knots)
+                        const int nk = brev->NbKnots();
+                        double scale = (sp.t1 - sp.t0) / span;
+                        TColStd_Array1OfReal    new_knots(1, nk);
+                        TColStd_Array1OfInteger new_mults(1, nk);
+                        for (int k = 1; k <= nk; ++k) {
+                            new_knots.SetValue(k, sp.t0 + (brev->Knot(k) - old0) * scale);
+                            new_mults.SetValue(k, brev->Multiplicity(k));
+                        }
+                        const int np = brev->NbPoles();
+                        TColgp_Array1OfPnt2d poles(1, np);
+                        TColStd_Array1OfReal  weights(1, np);
+                        bool rat = brev->IsRational();
+                        for (int p = 1; p <= np; ++p) {
+                            poles.SetValue(p, brev->Pole(p));
+                            weights.SetValue(p, rat ? brev->Weight(p) : 1.0);
+                        }
+                        try {
+                            Handle(Geom2d_BSplineCurve) remap;
+                            if (rat)
+                                remap = new Geom2d_BSplineCurve(poles, weights,
+                                            new_knots, new_mults, brev->Degree());
+                            else
+                                remap = new Geom2d_BSplineCurve(poles,
+                                            new_knots, new_mults, brev->Degree());
+                            c_rev_efwd = remap;
+                        } catch (...) {}
+                    }
+                }
+
+                // OCCT's BRep_Tool::CurveOnSurface(E, F) returns:
+                //   PCurve()  when the face is FORWARD  → use C1 for FORWARD
+                //   PCurve2() when the face is REVERSED → use C2 for REVERSED
+                // When the face itself is reversed (m_bRev=1), OCCT swaps
+                // which of C1/C2 is associated with which wire orientation.
+                // Swap the assignment so the correct pcurve reaches each
+                // edge occurrence in OCCTToON_Brep.
+                Handle(Geom2d_Curve) C1, C2;
+                if (f.m_bRev) {
+                    C1 = c_rev_efwd;  // returned for REVERSED edge (PCurve)
+                    C2 = c_fwd;       // returned for FORWARD edge (PCurve2)
+                } else {
+                    C1 = c_fwd;       // returned for FORWARD edge (PCurve)
+                    C2 = c_rev_efwd;  // returned for REVERSED edge (PCurve2)
+                }
+                B.UpdateEdge(e_map[ei], C1, C2, f_map[fi], sp.tol);
                 B.Range(e_map[ei], f_map[fi], sp.t0, sp.t1);
                 seam_c2_applied.insert(ei);
             }

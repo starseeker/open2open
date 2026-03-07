@@ -597,8 +597,6 @@ tests/test_surfaces_complex: libopen2open.a \
   /usr/lib/x86_64-linux-gnu/libm.so \
   /usr/lib/x86_64-linux-gnu/libpthread.a \
   /usr/lib/x86_64-linux-gnu/librt.a \
-  /usr/lib/x86_64-linux-gnu/libtbb.so \
-  /usr/lib/x86_64-linux-gnu/libtbbmalloc.so \
   /usr/lib/gcc/x86_64-linux-gnu/13/crtbeginS.o \
   /usr/lib/gcc/x86_64-linux-gnu/13/crtendS.o \
   /usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a \
@@ -623,10 +621,14 @@ tests/test_surfaces_complex: libopen2open.a \
   /usr/lib/x86_64-linux-gnu/libTKXMesh.so.7.6.3 \
   /usr/lib/x86_64-linux-gnu/libTKernel.so.7.6.3 \
   /usr/lib/x86_64-linux-gnu/libc_nonshared.a \
+  /usr/lib/x86_64-linux-gnu/libtbb.so \
+  /usr/lib/x86_64-linux-gnu/libtbbmalloc.so \
   tests/CMakeFiles/test_surfaces_complex.dir/test_surfaces_complex.cpp.o
 
 
 tests/CMakeFiles/test_surfaces_complex.dir/test_surfaces_complex.cpp.o:
+
+/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:
 
 /usr/lib/x86_64-linux-gnu/libTKernel.so.7.6.3:
 
@@ -643,8 +645,6 @@ tests/CMakeFiles/test_surfaces_complex.dir/test_surfaces_complex.cpp.o:
 /usr/lib/x86_64-linux-gnu/libTKBRep.so.7.6.3:
 
 /usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.so:
-
-/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:
 
 /usr/lib/x86_64-linux-gnu/libpthread.a:
 

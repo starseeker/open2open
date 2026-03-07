@@ -255,6 +255,44 @@ test_brep_complex/fast:
 	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_brep_complex.dir/build.make tests/CMakeFiles/test_brep_complex.dir/build
 .PHONY : test_brep_complex/fast
 
+# Convenience name for target.
+tests/CMakeFiles/test_3dm_examples.dir/rule:
+	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_3dm_examples.dir/rule
+.PHONY : tests/CMakeFiles/test_3dm_examples.dir/rule
+
+# Convenience name for target.
+test_3dm_examples: tests/CMakeFiles/test_3dm_examples.dir/rule
+.PHONY : test_3dm_examples
+
+# fast build rule for target.
+test_3dm_examples/fast:
+	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_3dm_examples.dir/build.make tests/CMakeFiles/test_3dm_examples.dir/build
+.PHONY : test_3dm_examples/fast
+
+test_3dm_examples.o: test_3dm_examples.cpp.o
+.PHONY : test_3dm_examples.o
+
+# target to build an object file
+test_3dm_examples.cpp.o:
+	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_3dm_examples.dir/build.make tests/CMakeFiles/test_3dm_examples.dir/test_3dm_examples.cpp.o
+.PHONY : test_3dm_examples.cpp.o
+
+test_3dm_examples.i: test_3dm_examples.cpp.i
+.PHONY : test_3dm_examples.i
+
+# target to preprocess a source file
+test_3dm_examples.cpp.i:
+	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_3dm_examples.dir/build.make tests/CMakeFiles/test_3dm_examples.dir/test_3dm_examples.cpp.i
+.PHONY : test_3dm_examples.cpp.i
+
+test_3dm_examples.s: test_3dm_examples.cpp.s
+.PHONY : test_3dm_examples.s
+
+# target to generate assembly for a file
+test_3dm_examples.cpp.s:
+	cd /home/runner/work/open2open/open2open/build && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_3dm_examples.dir/build.make tests/CMakeFiles/test_3dm_examples.dir/test_3dm_examples.cpp.s
+.PHONY : test_3dm_examples.cpp.s
+
 test_brep.o: test_brep.cpp.o
 .PHONY : test_brep.o
 
@@ -412,12 +450,16 @@ help:
 	@echo "... list_install_components"
 	@echo "... rebuild_cache"
 	@echo "... test"
+	@echo "... test_3dm_examples"
 	@echo "... test_brep"
 	@echo "... test_brep_complex"
 	@echo "... test_curves"
 	@echo "... test_curves_complex"
 	@echo "... test_surfaces"
 	@echo "... test_surfaces_complex"
+	@echo "... test_3dm_examples.o"
+	@echo "... test_3dm_examples.i"
+	@echo "... test_3dm_examples.s"
 	@echo "... test_brep.o"
 	@echo "... test_brep.i"
 	@echo "... test_brep.s"
