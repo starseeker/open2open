@@ -801,6 +801,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     // so the knot count matches the non-periodic convention.
                     Handle(Geom2d_BSplineCurve) bc2 =
                         Handle(Geom2d_BSplineCurve)::DownCast(gc2);
+
+                    // For closed-loop periodic pcurves (gc2(t0)≈gc2(t1)),
+                    // SetNotPeriodic() introduces a kink at the junction that
+                    // breaks the ON_Brep tangent-direction validation for closed
+                    // trims.  Force the TrimmedCurve path instead, which converts
+                    // the full period to a non-periodic B-spline without a kink.
+                    if (!bc2.IsNull() && bc2->IsPeriodic()) {
+                        gp_Pnt2d p_s, p_e;
+                        gc2->D0(pc_t0, p_s);
+                        gc2->D0(pc_t1, p_e);
+                        if (p_s.Distance(p_e) < 1e-4)
+                            bc2.Nullify(); // force TrimmedCurve path below
+                    }
+
                     if (bc2.IsNull()) {
                         try {
                             Handle(Geom2d_TrimmedCurve) tc2 =
@@ -1106,6 +1120,136 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         const double new_etol = d_max / 9.0;
         if (new_etol > edge.m_tolerance)
             edge.m_tolerance = new_etol;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Post-processing pass: fix the tangent-direction check for closed trims on
+    // closed edges (ON_Brep.m_T[i].m_bRev3d validation).
+    //
+    // The openNURBS validation requires that for a closed trim on a closed edge
+    // the 3-D tangent of the pcurve mapped through the surface Jacobian aligns
+    // with the edge-curve tangent at BOTH the start (d0) and end (d1) of the
+    // trim domain.  OCCT Boolean-result B-spline pcurves often have a small
+    // tangent discontinuity (kink) at the parameter-domain junction (where the
+    // closed loop starts/ends), introduced during OCCT's intersection
+    // computation.  This kink causes d0 or d1 to be barely negative even though
+    // the geometric direction is correct.
+    //
+    // Fix: for each closed trim on a closed edge whose d0 or d1 fails, snap the
+    // 2-D pcurve's last interior control-vertex (CV[n-2] for d1-fail, or CV[1]
+    // for d0-fail) so that the end tangent exactly equals the start tangent
+    // (C1 closure without kink).  The fix preserves the start and end UV points
+    // (only the tangent direction changes) so loop UV connectivity is unaffected.
+    // ---------------------------------------------------------------------------
+    // NOTE: Do NOT call brep.SetTolerancesBoxesAndFlags() here: it would reset
+    // the edge tolerances we adjusted in the loop above.  The trim proxy-curve
+    // domains were already set during the conversion loop via
+    // SetProxyCurveDomain, so trim.Domain() and trim.Ev1Der() work without it.
+
+    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+        ON_BrepTrim& trim = brep.m_T[ti];
+        if (trim.m_ei < 0 || trim.m_li < 0) continue;
+        const ON_BrepEdge& edge = brep.m_E[trim.m_ei];
+
+        // Only process truly closed trims on closed edges
+        if (trim.m_vi[0] != trim.m_vi[1]) continue;
+        if (edge.m_vi[0] != edge.m_vi[1]) continue;
+        if (trim.m_vi[0] != edge.m_vi[0]) continue;
+
+        const int fi = brep.m_L[trim.m_li].m_fi;
+        if (fi < 0) continue;
+        const ON_Surface* srf = brep.m_F[fi].SurfaceOf();
+        if (!srf) continue;
+
+        // Compute the tangent check values d0 and d1
+        auto compute_checks = [&](const ON_BrepTrim& t) -> std::pair<double,double> {
+            ON_Interval td = t.Domain();
+            ON_3dPoint uv0, uv1; ON_3dVector td0, td1;
+            t.Ev1Der(td[0], uv0, td0);
+            t.Ev1Der(td[1], uv1, td1);
+            ON_3dPoint sp; ON_3dVector sdu, sdv;
+            srf->Ev1Der(uv0.x, uv0.y, sp, sdu, sdv);
+            ON_3dVector tt0 = td0.x*sdu + td0.y*sdv; tt0.Unitize();
+            srf->Ev1Der(uv1.x, uv1.y, sp, sdu, sdv);
+            ON_3dVector tt1 = td1.x*sdu + td1.y*sdv; tt1.Unitize();
+            const ON_BrepEdge& e = brep.m_E[t.m_ei];
+            bool rev = t.m_bRev3d ? true : false;
+            ON_3dVector et0 = e.TangentAt(e.Domain()[rev ? 1 : 0]);
+            ON_3dVector et1 = e.TangentAt(e.Domain()[rev ? 0 : 1]);
+            double d0 = tt0 * et0; if (rev) d0 = -d0;
+            double d1 = tt1 * et1; if (rev) d1 = -d1;
+            return {d0, d1};
+        };
+
+        auto [d0, d1] = compute_checks(trim);
+        // Only snap when d is significantly negative (not just floating-point
+        // noise).  Genuine kink failures have d ≈ -0.05 to -0.2.
+        const double kSnapThreshold = -0.02;
+        if (d0 >= kSnapThreshold && d1 >= kSnapThreshold) continue;
+
+        // Get the ON_NurbsCurve for this trim's pcurve
+        if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
+        ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
+        if (!nc || nc->Degree() < 1 || nc->CVCount() < 3) continue;
+
+        // We need at least CV[0], CV[1], CV[n-2], CV[n-1] to be accessible
+        const int nCV = nc->CVCount();
+        const int dim = nc->m_dim; // should be 2
+        if (dim < 2) continue;
+
+        // Read CV[0], CV[1] and CV[n-1], CV[n-2] in Euclidean 2D
+        // (divide by weight for rational curves)
+        auto get_cv2d = [&](int i) -> ON_2dPoint {
+            ON_4dPoint h; nc->GetCV(i, h);
+            double w = (h.w != 0.0) ? h.w : 1.0;
+            return ON_2dPoint(h.x / w, h.y / w);
+        };
+        auto get_cv_weight = [&](int i) -> double {
+            ON_4dPoint h; nc->GetCV(i, h);
+            return (h.w != 0.0) ? h.w : 1.0;
+        };
+        auto set_cv2d = [&](int i, const ON_2dPoint& p, double w) {
+            nc->SetCV(i, ON_3dPoint(p.x * w, p.y * w, w));
+        };
+
+        // First interior knot span at start: m_knot[deg] - m_knot[0]
+        // Last interior knot span at end  : m_knot[kc-1] - m_knot[kc-1-deg]
+        // (openNURBS stores d-1 phantom knots at each end; the tangent formula is
+        //  T'(t0) ∝ (CV[1]-CV[0]) / span_s  and  T'(t1) ∝ (CV[n-1]-CV[n-2]) / span_e)
+        const int deg = nc->Degree();
+        const int kc  = nc->KnotCount(); // = nCV + deg - 1
+        double span_s = 0.0, span_e = 0.0;
+        if (deg >= 1 && kc > deg) {
+            span_s = nc->m_knot[deg] - nc->m_knot[0];
+        }
+        if (kc >= deg + 1) {
+            span_e = nc->m_knot[kc-1] - nc->m_knot[kc-1-deg];
+        }
+        double scale = (span_s > 1e-14) ? (span_e / span_s) : 1.0;
+
+        ON_2dPoint cv0  = get_cv2d(0);
+        ON_2dPoint cv1  = get_cv2d(1);
+        ON_2dPoint cvn1 = get_cv2d(nCV-1);
+        ON_2dPoint cvn2 = get_cv2d(nCV-2);
+
+        if (d1 < 0.0) {
+            // End tangent bad: snap CV[n-2] to enforce T_end = T_start
+            // T_start direction in 2D: (cv1 - cv0) / span_s
+            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
+            // C1 closure: (cvn1 - cvn2_new) / span_e = (cv1 - cv0) / span_s
+            ON_2dPoint cvn2_new;
+            cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
+            cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
+            set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
+        } else {
+            // Start tangent bad: snap CV[1] to enforce T_start = T_end
+            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
+            // C1 closure: (cv1_new - cv0) / span_s = (cvn1 - cvn2) / span_e
+            ON_2dPoint cv1_new;
+            cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
+            cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
+            set_cv2d(1, cv1_new, get_cv_weight(1));
+        }
     }
 
     return brep.IsValid() ? true : false;
