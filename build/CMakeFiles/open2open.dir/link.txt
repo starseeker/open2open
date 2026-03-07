@@ -1,2 +1,0 @@
-/usr/bin/ar qc libopen2open.a CMakeFiles/open2open.dir/src/geom_convert.cpp.o CMakeFiles/open2open.dir/src/brep_convert.cpp.o
-/usr/bin/ranlib libopen2open.a
