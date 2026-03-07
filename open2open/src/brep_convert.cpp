@@ -21,15 +21,21 @@
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopExp.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopAbs_Orientation.hxx>
 
 // ---- OCCT geometry ----
 #include <Geom_BSplineCurve.hxx>
 #include <Geom_BSplineSurface.hxx>
+#include <Geom_TrimmedCurve.hxx>
+#include <Geom_RectangularTrimmedSurface.hxx>
 #include <Geom2d_BSplineCurve.hxx>
+#include <Geom2d_TrimmedCurve.hxx>
 #include <GeomConvert.hxx>
 #include <Geom2dConvert.hxx>
+#include <BRepTools.hxx>
+#include <BRepTools_WireExplorer.hxx>
 #include <gp_Pnt.hxx>
 
 // ---- OCCT containers ----
@@ -305,17 +311,21 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     continue;
                 }
 
-                // Non-seam edge: attach single 2D pcurve
+                // Non-seam edge: attach single 2D pcurve.
+                // OCCT convention: the pcurve goes in the 3D edge direction
+                // (from edge.vi[0] to edge.vi[1]).  When the trim is reversed
+                // (m_bRev3d = true) the openNURBS pcurve goes in the opposite
+                // direction, so we reverse it before passing to UpdateEdge.
                 if (trim.m_c2i >= 0 &&
                     trim.m_c2i < (int)c2_map.size() &&
                     !c2_map[trim.m_c2i].IsNull()) {
                     double tol2d = trim.m_tolerance[0] > 0.0
                                        ? trim.m_tolerance[0]
                                        : linear_tolerance;
-                    B.UpdateEdge(e_map[ei],
-                                 c2_map[trim.m_c2i],
-                                 f_map[fi],
-                                 tol2d);
+                    Handle(Geom2d_Curve) pc = c2_map[trim.m_c2i];
+                    if (trim.m_bRev3d)
+                        pc = pc->Reversed();
+                    B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
                     B.Range(e_map[ei], f_map[fi],
                             trim.Domain().Min(),
                             trim.Domain().Max());
@@ -403,12 +413,23 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
         int c3i = -1;
         if (!gc.IsNull()) {
-            // Convert to BSpline
+            // Convert to BSpline.  For analytical curves (Geom_Line,
+            // Geom_Circle, Geom_Ellipse, …) that are not bounded,
+            // wrap in a Geom_TrimmedCurve using the edge parameter range
+            // before calling GeomConvert so that the result is finite.
             Handle(Geom_BSplineCurve) bc =
                 Handle(Geom_BSplineCurve)::DownCast(gc);
             if (bc.IsNull()) {
                 try {
                     bc = GeomConvert::CurveToBSplineCurve(gc);
+                } catch (...) {}
+            }
+            if (bc.IsNull()) {
+                // Fallback: use the edge parameter range to bound the curve
+                try {
+                    Handle(Geom_TrimmedCurve) tc =
+                        new Geom_TrimmedCurve(gc, t0, t1);
+                    bc = GeomConvert::CurveToBSplineCurve(tc);
                 } catch (...) {}
             }
             if (!bc.IsNull()) {
@@ -421,10 +442,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
         }
 
-        // Determine start/end vertex indices
+        // Determine start/end vertex indices.
+        // Force FORWARD orientation on the edge copy so that
+        // TopExp_Explorer(edge, VERTEX) always gives vi[0] first and vi[1]
+        // second, regardless of how the edge is oriented in the parent shape.
+        // (For ON_BrepToOCCT-created edges both vertices are stored FORWARD;
+        // for native OCCT edges the start vertex is FORWARD and the end is
+        // REVERSED.  Both cases work with a FORWARD-forced copy.)
         int vi0 = -1, vi1 = -1;
         {
-            TopExp_Explorer vex(edge, TopAbs_VERTEX);
+            TopoDS_Edge fwd_edge = edge;
+            fwd_edge.Orientation(TopAbs_FORWARD);
+            TopExp_Explorer vex(fwd_edge, TopAbs_VERTEX);
             if (vex.More()) {
                 Standard_Address vk = vex.Current().TShape().get();
                 auto it = vertex_map.find(vk);
@@ -478,6 +507,19 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     bs = GeomConvert::SurfaceToBSplineSurface(gs);
                 } catch (...) {}
             }
+            if (bs.IsNull()) {
+                // Fallback for unbounded analytical surfaces
+                // (Geom_Plane, Geom_ConicalSurface, etc.):
+                // restrict to the face's UV parameter domain first.
+                try {
+                    double u1, u2, v1, v2;
+                    BRepTools::UVBounds(face, u1, u2, v1, v2);
+                    Handle(Geom_RectangularTrimmedSurface) ts =
+                        new Geom_RectangularTrimmedSurface(
+                            gs, u1, u2, v1, v2);
+                    bs = GeomConvert::SurfaceToBSplineSurface(ts);
+                } catch (...) {}
+            }
             if (!bs.IsNull()) {
                 ON_NurbsSurface* ns = new ON_NurbsSurface();
                 if (OCCTSurfaceToON(bs, *ns)) {
@@ -527,11 +569,21 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
                 int c2i = -1;
                 if (!gc2.IsNull()) {
+                    // Convert 2D pcurve to B-spline.  For analytical curves
+                    // (Geom2d_Line, Geom2d_Circle, etc.) that are unbounded,
+                    // wrap in a Geom2d_TrimmedCurve using the pcurve domain.
                     Handle(Geom2d_BSplineCurve) bc2 =
                         Handle(Geom2d_BSplineCurve)::DownCast(gc2);
                     if (bc2.IsNull()) {
                         try {
                             bc2 = Geom2dConvert::CurveToBSplineCurve(gc2);
+                        } catch (...) {}
+                    }
+                    if (bc2.IsNull()) {
+                        try {
+                            Handle(Geom2d_TrimmedCurve) tc2 =
+                                new Geom2d_TrimmedCurve(gc2, pc_t0, pc_t1);
+                            bc2 = Geom2dConvert::CurveToBSplineCurve(tc2);
                         } catch (...) {}
                     }
                     if (!bc2.IsNull()) {
@@ -561,9 +613,30 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 for (int m = 0; m < km2; ++m)
                                     nc->m_knot[ki2++] = kv2;
                             }
-                            if (nc->IsValid())
+                            if (nc->IsValid()) {
+                                // OCCT convention: pcurves are stored in the
+                                // edge direction (edge.vi[0] → vi[1]).  For
+                                // REVERSED (non-seam) edges the openNURBS trim
+                                // direction is opposite, so the pcurve must be
+                                // reversed to go from trim-start to trim-end.
+                                // Seam edges are exempt: OCCT stores a
+                                // separate pcurve for each traversal direction
+                                // via the double-pcurve UpdateEdge overload,
+                                // so the returned pcurve is already oriented
+                                // in the trim direction.
+                                bool need_rev =
+                                    (edge.Orientation() == TopAbs_REVERSED) &&
+                                    !BRep_Tool::IsClosed(edge, face);
+                                if (need_rev) {
+                                    // Reverse() negates the knots so the
+                                    // domain becomes [-t1, -t0].  Restore the
+                                    // original parameter range [pc_t0, pc_t1]
+                                    // so that SetProxyCurveDomain succeeds.
+                                    nc->Reverse();
+                                    nc->SetDomain(pc_t0, pc_t1);
+                                }
                                 c2i = brep.AddTrimCurve(nc);
-                            else {
+                            } else {
                                 delete nc;
                             }
                         } else {
@@ -617,10 +690,86 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     brep.NewTrim(brep.m_E[ei], bRev3d, ol, c2i);
                 trim.m_tolerance[0] = BRep_Tool::Tolerance(edge);
                 trim.m_tolerance[1] = trim.m_tolerance[0];
-                if (c2i >= 0)
+                if (c2i >= 0) {
+                    // The pcurve has already been reversed (if needed) in the
+                    // loop above, so it always goes from trim-start to trim-end.
+                    // SetProxyCurveDomain requires an increasing interval.
                     trim.SetProxyCurveDomain(ON_Interval(pc_t0, pc_t1));
+                }
                 // Note: trim.m_type is set automatically by NewTrim
                 // (boundary→seam→mated) — do NOT override it here.
+            }
+
+            // ---------------------------------------------------------------
+            // Reorder loop trims for UV sequential connectivity.
+            // TopExp_Explorer does not guarantee wire-traversal order for
+            // native OCCT shapes.  Sort the loop's trim list so that each
+            // trim's UV end-point matches the next trim's UV start-point.
+            // We skip this for loops that contain singular or seam trims,
+            // because openNURBS is lenient about UV continuity at those
+            // junctions and sorting might break valid arrangements created
+            // by ON_BrepToOCCT.
+            // ---------------------------------------------------------------
+            {
+                bool has_special = false;
+                for (int k = 0; k < ol.m_ti.Count(); ++k) {
+                    const ON_BrepTrim& t = brep.m_T[ol.m_ti[k]];
+                    if (t.m_type == ON_BrepTrim::singular ||
+                        t.m_type == ON_BrepTrim::seam) {
+                        has_special = true;
+                        break;
+                    }
+                }
+
+                if (!has_special && ol.m_ti.Count() > 1) {
+                    // Build UV start/end table for all trims in this loop
+                    int n = ol.m_ti.Count();
+                    std::vector<ON_2dPoint> uv_start(n), uv_end(n);
+                    for (int k = 0; k < n; ++k) {
+                        const ON_BrepTrim& t = brep.m_T[ol.m_ti[k]];
+                        const ON_Curve* c2 = t.ProxyCurve();
+                        if (c2) {
+                            ON_Interval dom = t.ProxyCurveDomain();
+                            ON_3dPoint s = c2->PointAt(dom.Min());
+                            ON_3dPoint e = c2->PointAt(dom.Max());
+                            uv_start[k] = ON_2dPoint(s.x, s.y);
+                            uv_end[k]   = ON_2dPoint(e.x, e.y);
+                        }
+                    }
+
+                    // Greedy chain sort: follow end→start connectivity
+                    const double kUVTol = 1e-4;
+                    std::vector<int> sorted;
+                    std::vector<bool> used(n, false);
+                    sorted.push_back(0);
+                    used[0] = true;
+
+                    for (int iter = 1; iter < n; ++iter) {
+                        ON_2dPoint prev_end = uv_end[sorted.back()];
+                        int best = -1;
+                        double best_d = 1e30;
+                        for (int j = 0; j < n; ++j) {
+                            if (used[j]) continue;
+                            double dx = uv_start[j].x - prev_end.x;
+                            double dy = uv_start[j].y - prev_end.y;
+                            double d  = std::sqrt(dx*dx + dy*dy);
+                            if (d < best_d) { best_d = d; best = j; }
+                        }
+                        if (best >= 0) {
+                            sorted.push_back(best);
+                            used[best] = true;
+                        }
+                    }
+
+                    // Apply the sorted order if it found all trims
+                    if ((int)sorted.size() == n) {
+                        ON_SimpleArray<int> new_ti(n);
+                        for (int k = 0; k < n; ++k)
+                            new_ti.Append(ol.m_ti[sorted[k]]);
+                        for (int k = 0; k < n; ++k)
+                            ol.m_ti[k] = new_ti[k];
+                    }
+                }
             }
 
             // Fix up loop type based on orientation
