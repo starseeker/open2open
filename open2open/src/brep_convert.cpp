@@ -870,6 +870,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             ON_NurbsCurve::Cast(brep.m_C2[c2i]);
                         if (!nc2 || nc2->m_cv_count < 1) continue;
 
+                        bool modified = false;
+
                         // Strategy 1: period gap — translate all poles.
                         const double kRelTol = 1e-3;
                         double shift_u = 0.0, shift_v = 0.0;
@@ -892,11 +894,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 cv[0] += shift_u;
                                 cv[1] += shift_v;
                             }
-                            tk1.SetProxyCurveDomain(
-                                tk1.ProxyCurveDomain());
-                            tk1.m_pbox.Destroy();  // force pbox recompute
-                            // Re-evaluate after the translation so that
+                            modified = true;
+                            // Re-evaluate after translation so that
                             // strategy 2 below sees the updated gap.
+                            tk1.SetProxyCurveDomain(tk1.ProxyCurveDomain());
                             pe = tk.PointAtEnd();
                             ps = tk1.PointAtStart();
                             dx = ps.x - pe.x;
@@ -905,23 +906,33 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
                         // Strategy 2: snap the first pole of tk1's pcurve
                         // to tk's UV endpoint to eliminate floating-point
-                        // residual gaps.  Only applied if the gap is smaller
-                        // than the surface domain size (avoids snapping a
-                        // genuine topological mismatch).
+                        // residual gaps.  Only applied when the gap is
+                        // smaller than 5% of the surface domain (avoids
+                        // snapping a genuine topological mismatch).
                         if (fabs(dx) > 1e-14 || fabs(dy) > 1e-14) {
                             const double domain_sz =
-                                std::max(uperiod, vperiod);
+                                std::max(uperiod > 0.0 ? uperiod : (u1-u0),
+                                         vperiod > 0.0 ? vperiod : (v1-v0));
                             const double snap_limit =
-                                std::max(0.1, 0.1 * domain_sz);
-                            if (fabs(dx) < snap_limit &&
+                                0.05 * domain_sz;
+                            if (snap_limit > 0.0 &&
+                                fabs(dx) < snap_limit &&
                                 fabs(dy) < snap_limit) {
                                 double* cv0 = nc2->CV(0);
                                 cv0[0] = pe.x;
                                 cv0[1] = pe.y;
+                                modified = true;
                                 tk1.SetProxyCurveDomain(
                                     tk1.ProxyCurveDomain());
-                                tk1.m_pbox.Destroy();  // force pbox recompute
                             }
+                        }
+
+                        // Invalidate cached bounding boxes once after
+                        // either modification so SetTolerancesBoxesAndFlags
+                        // recomputes them from the updated curve.
+                        if (modified) {
+                            tk1.m_pbox.Destroy();
+                            ol.m_pbox.Destroy();
                         }
                     }
                 }
