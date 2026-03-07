@@ -310,6 +310,19 @@ int main()
     {
         ++total;
         std::unique_ptr<ON_Brep> b(ON_BrepQuadSphere(ON_3dPoint(0,0,0), 1.5));
+        // ON_BrepQuadSphere may leave edge/trim tolerances as ON_UNSET_VALUE.
+        // Repair any invalid tolerances before the validity check.
+        if (b) {
+            for (int i = 0; i < b->m_E.Count(); ++i)
+                if (!ON_IsValid(b->m_E[i].m_tolerance) ||
+                    b->m_E[i].m_tolerance < 0.0)
+                    b->m_E[i].m_tolerance = kLinTol;
+            for (int i = 0; i < b->m_T.Count(); ++i)
+                for (int j = 0; j < 2; ++j)
+                    if (!ON_IsValid(b->m_T[i].m_tolerance[j]) ||
+                        b->m_T[i].m_tolerance[j] < 0.0)
+                        b->m_T[i].m_tolerance[j] = kLinTol;
+        }
         if (TestBrepRT(b.get(), "quad sphere (6 faces)")) ++passed;
     }
 
@@ -420,24 +433,28 @@ int main()
         if (!ok || !rt.IsValid()) {
             std::printf("FAIL [sphere face accuracy]: round-trip failed\n");
         } else {
-            const ON_Surface* os = orig->m_F[0].SurfaceOf();
-            const ON_Surface* rs =  rt.m_F[0].SurfaceOf();
+            // Measure geometric accuracy: how far is each sampled point on
+            // the round-trip surface from the ideal unit sphere?
+            // This is insensitive to UV reparametrisation (the original
+            // ON_BrepSphere uses an analytical sphere surface, while the
+            // round-trip produces a rational NURBS surface; both are exact
+            // sphere representations but may map the same UV to different
+            // 3D points).
+            const ON_Surface* rs = rt.m_F[0].SurfaceOf();
             double max_err = 0.0;
-            if (os && rs) {
-                ON_Interval ou=os->Domain(0), ov=os->Domain(1);
+            if (rs) {
                 ON_Interval ru=rs->Domain(0), rv=rs->Domain(1);
-                const int N = 8;
+                const int N = 10;
                 for (int i = 1; i < N-1; ++i) {  // skip poles
                     for (int j = 0; j < N; ++j) {
-                        double u0 = ou.Min() + ou.Length() * i / (N-1);
-                        double v0 = ov.Min() + ov.Length() * j / (N-1);
                         double u1 = ru.Min() + ru.Length() * i / (N-1);
                         double v1 = rv.Min() + rv.Length() * j / (N-1);
-                        ON_3dPoint p0, p1;
-                        if (!os->EvPoint(u0, v0, p0)) continue;
+                        ON_3dPoint p1;
                         if (!rs->EvPoint(u1, v1, p1)) continue;
-                        double d = p0.DistanceTo(p1);
-                        if (d > max_err) max_err = d;
+                        // Distance from point to ideal sphere = |dist - radius|
+                        double dist = sphere.Center().DistanceTo(p1);
+                        double err = std::fabs(dist - sphere.radius);
+                        if (err > max_err) max_err = err;
                     }
                 }
             }
