@@ -1,10 +1,10 @@
-Start testing: Mar 07 19:22 UTC
+Start testing: Mar 07 19:46 UTC
 ----------------------------------------------------------
 1/6 Testing: test_curves
 1/6 Test: test_curves
 Command: "/home/runner/work/open2open/open2open/build/tests/test_curves"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_curves" start time: Mar 07 19:22 UTC
+"test_curves" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 PASS [non-rational cubic B-spline] (max round-trip error = 0.000e+00)
@@ -14,10 +14,10 @@ PASS [uniform cubic B-spline] (max round-trip error = 0.000e+00)
 
 Result: 4 / 4 tests passed
 <end of output>
-Test time =   0.00 sec
+Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"test_curves" end time: Mar 07 19:22 UTC
+"test_curves" end time: Mar 07 19:46 UTC
 "test_curves" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -25,7 +25,7 @@ Test Passed.
 2/6 Test: test_surfaces
 Command: "/home/runner/work/open2open/open2open/build/tests/test_surfaces"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_surfaces" start time: Mar 07 19:22 UTC
+"test_surfaces" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 PASS [bicubic non-rational patch] (max round-trip error = 0.000e+00)
@@ -37,7 +37,7 @@ Result: 3 / 3 tests passed
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"test_surfaces" end time: Mar 07 19:22 UTC
+"test_surfaces" end time: Mar 07 19:46 UTC
 "test_surfaces" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -45,7 +45,7 @@ Test Passed.
 3/6 Test: test_brep
 Command: "/home/runner/work/open2open/open2open/build/tests/test_brep"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_brep" start time: Mar 07 19:22 UTC
+"test_brep" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 PASS [box (ON_BrepBox)]: 6 faces, 12 edges, 8 vertices
@@ -60,7 +60,7 @@ Result: 4 / 4 tests passed
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"test_brep" end time: Mar 07 19:22 UTC
+"test_brep" end time: Mar 07 19:46 UTC
 "test_brep" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -68,7 +68,7 @@ Test Passed.
 4/6 Test: test_curves_complex
 Command: "/home/runner/work/open2open/open2open/build/tests/test_curves_complex"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_curves_complex" start time: Mar 07 19:22 UTC
+"test_curves_complex" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 PASS [full NURBS circle (9 CVs)] (max round-trip error = 0.000e+00)
@@ -82,7 +82,7 @@ Result: 5 / 5 tests passed
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"test_curves_complex" end time: Mar 07 19:22 UTC
+"test_curves_complex" end time: Mar 07 19:46 UTC
 "test_curves_complex" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -90,7 +90,7 @@ Test Passed.
 5/6 Test: test_surfaces_complex
 Command: "/home/runner/work/open2open/open2open/build/tests/test_surfaces_complex"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_surfaces_complex" start time: Mar 07 19:22 UTC
+"test_surfaces_complex" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 PASS [biquintic patch (deg 5×5)] (max round-trip error = 0.000e+00)
@@ -105,7 +105,7 @@ Result: 6 / 6 tests passed
 Test time =   0.00 sec
 ----------------------------------------------------------
 Test Passed.
-"test_surfaces_complex" end time: Mar 07 19:22 UTC
+"test_surfaces_complex" end time: Mar 07 19:46 UTC
 "test_surfaces_complex" time elapsed: 00:00:00
 ----------------------------------------------------------
 
@@ -113,7 +113,7 @@ Test Passed.
 6/6 Test: test_brep_complex
 Command: "/home/runner/work/open2open/open2open/build/tests/test_brep_complex"
 Directory: /home/runner/work/open2open/open2open/build/tests
-"test_brep_complex" start time: Mar 07 19:22 UTC
+"test_brep_complex" start time: Mar 07 19:46 UTC
 Output:
 ----------------------------------------------------------
 WARN [cone with cap]: BRepCheck_Analyzer reports invalid shape
@@ -142,8 +142,8 @@ Result: 14 / 14 tests passed
 Test time =   0.01 sec
 ----------------------------------------------------------
 Test Passed.
-"test_brep_complex" end time: Mar 07 19:22 UTC
+"test_brep_complex" end time: Mar 07 19:46 UTC
 "test_brep_complex" time elapsed: 00:00:00
 ----------------------------------------------------------
 
-End testing: Mar 07 19:22 UTC
+End testing: Mar 07 19:46 UTC

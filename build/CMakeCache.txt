@@ -14,6 +14,19 @@
 # EXTERNAL cache entries
 ########################
 
+//Select using c++ standard.
+BUILD_CPP_STANDARD:STRING=C++17
+
+BUILD_LIBRARY_TYPE:STRING=Shared
+
+//Select profile for compiler and linker.
+BUILD_OPT_PROFILE:STRING=Default
+
+BUILD_SHARED_LIBRARY_NAME_POSTFIX:STRING=
+
+//Use vcpkg for 3rdparty libraries.
+BUILD_USE_VCPKG:BOOL=OFF
+
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
 
@@ -230,8 +243,20 @@ CMAKE_TAPI:FILEPATH=CMAKE_TAPI-NOTFOUND
 // Studio IDE projects all commands are done without /nologo.
 CMAKE_VERBOSE_MAKEFILE:BOOL=FALSE
 
+//Value Computed by CMake
+OCCT_BINARY_DIR:STATIC=/home/runner/work/open2open/open2open/build/OCCT
+
+//Value Computed by CMake
+OCCT_IS_TOP_LEVEL:STATIC=OFF
+
+//Value Computed by CMake
+OCCT_SOURCE_DIR:STATIC=/home/runner/work/open2open/open2open/OCCT-7_9_3
+
 //The directory containing a CMake configuration file for OpenCASCADE.
 OpenCASCADE_DIR:PATH=/usr/lib/x86_64-linux-gnu/cmake/opencascade
+
+//Select using memory manager tool.
+USE_MMGR_TYPE:STRING=NATIVE
 
 //Value Computed by CMake
 android_uuid_BINARY_DIR:STATIC=/home/runner/work/open2open/open2open/build/opennurbs/android_uuid
@@ -283,6 +308,12 @@ zlib_SOURCE_DIR:STATIC=/home/runner/work/open2open/open2open/opennurbs-8.24.2528
 # INTERNAL cache entries
 ########################
 
+//STRINGS property for variable: BUILD_CPP_STANDARD
+BUILD_CPP_STANDARD-STRINGS:INTERNAL=C++17;C++20;C++23
+//STRINGS property for variable: BUILD_LIBRARY_TYPE
+BUILD_LIBRARY_TYPE-STRINGS:INTERNAL=Shared;Static
+//STRINGS property for variable: BUILD_OPT_PROFILE
+BUILD_OPT_PROFILE-STRINGS:INTERNAL=Default;Production
 //ADVANCED property for variable: CMAKE_ADDR2LINE
 CMAKE_ADDR2LINE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_AR
@@ -299,6 +330,7 @@ CMAKE_CACHE_PATCH_VERSION:INTERNAL=6
 CMAKE_COLOR_MAKEFILE-ADVANCED:INTERNAL=1
 //Path to CMake executable.
 CMAKE_COMMAND:INTERNAL=/usr/local/bin/cmake
+CMAKE_CONFIGURATION_TYPES:INTERNAL=Release;Debug;RelWithDebInfo
 //Path to cpack program executable.
 CMAKE_CPACK_COMMAND:INTERNAL=/usr/local/bin/cpack
 //Path to ctest program executable.
@@ -430,6 +462,8 @@ CMAKE_TAPI-ADVANCED:INTERNAL=1
 CMAKE_UNAME:INTERNAL=/usr/bin/uname
 //ADVANCED property for variable: CMAKE_VERBOSE_MAKEFILE
 CMAKE_VERBOSE_MAKEFILE-ADVANCED:INTERNAL=1
+//STRINGS property for variable: USE_MMGR_TYPE
+USE_MMGR_TYPE-STRINGS:INTERNAL=NATIVE;FLEXIBLE;TBB;JEMALLOC
 //linker supports push/pop state
 _CMAKE_CXX_LINKER_PUSHPOP_STATE_SUPPORTED:INTERNAL=TRUE
 //linker supports push/pop state

@@ -1,7 +1,7 @@
-test_curves 2 0.00192651
-test_surfaces 2 0.00176013
-test_brep 2 0.00363327
-test_curves_complex 2 0.00165798
-test_surfaces_complex 2 0.0018189
-test_brep_complex 2 0.00574235
+test_curves 3 0.00203277
+test_surfaces 3 0.00144036
+test_brep 3 0.00295201
+test_curves_complex 3 0.00136623
+test_surfaces_complex 3 0.00151051
+test_brep_complex 3 0.0046374
 ---
