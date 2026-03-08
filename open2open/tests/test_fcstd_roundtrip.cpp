@@ -214,15 +214,66 @@ static const uint8_t kResultPassed  = 1;
 static const uint8_t kResultSkipped = 2;
 
 // ---------------------------------------------------------------------------
+// Pre-scan a BRP file for extreme numeric token lengths that would cause
+// strtod/scanf to hang.
+//
+// The OpenCASCADE BRP text format stores edge parameter ranges as floating-
+// point decimal strings.  FreeCAD emits datum-line/axis shapes whose edges
+// have parameter ranges like ±2×10^97, which are represented as 100-digit
+// decimal literals.  GNU libc's strtod uses an algorithm that takes
+// approximately O(n^2) time for n-digit strings, causing BRepTools::Read to
+// stall for minutes on such files.
+//
+// We scan the raw file bytes for any numeric token (contiguous ASCII digits,
+// dots, and sign/exponent characters) whose digit-plus-dot run exceeds
+// kMaxTokenDigits.  Any such token indicates unbounded datum geometry; the
+// shape can be safely skipped before BRepTools::Read is ever called.
+// ---------------------------------------------------------------------------
+static const int kMaxTokenDigits = 30; // legitimate BRP numbers have ≤ ~20 sig digits
+
+static bool BrpHasExtremeNumbers(const std::string& path)
+{
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+
+    int  digits = 0;
+    bool extreme = false;
+    int  ch;
+    while ((ch = std::fgetc(f)) != EOF) {
+        if (ch >= '0' && ch <= '9') {
+            ++digits;
+            if (digits > kMaxTokenDigits) { extreme = true; break; }
+        } else if (ch == '.' || ch == '-' || ch == '+') {
+            // do not reset digit count for sign/decimal point in a number
+        } else {
+            digits = 0; // non-numeric character — reset
+        }
+    }
+    std::fclose(f);
+    return extreme;
+}
+
+// ---------------------------------------------------------------------------
 // Test one *.brp file in a forked child with a per-shape timeout.
-// BRP files with near-infinite edge parameter ranges (datum lines) can cause
-// BRepTools::Read to loop; the timeout prevents the suite from hanging.
+// BRP files with near-infinite edge parameter ranges (datum lines) first go
+// through BrpHasExtremeNumbers(); if extreme values are detected the shape is
+// skipped immediately without calling BRepTools::Read, avoiding the strtod
+// hang.  The fork+timeout provides a safety net for any other pathological
+// input not caught by the pre-scan.
 // ---------------------------------------------------------------------------
 static ShapeResult TestBrpFile(const std::string& brp_path,
                                 const std::string& brp_name)
 {
     ShapeResult res;
     res.brp_name = brp_name;
+
+    // Fast pre-scan: skip shapes with extreme numeric values that would cause
+    // BRepTools::Read (specifically, GNU libc strtod) to hang.
+    if (BrpHasExtremeNumbers(brp_path)) {
+        res.skipped = true;
+        res.reason  = "extreme edge parameter range (datum geometry, skipped)";
+        return res;
+    }
 
     // Create a pipe so the child can send the ShapeResult back to the parent.
     int pipefd[2];
