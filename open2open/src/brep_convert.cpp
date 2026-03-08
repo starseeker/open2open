@@ -2040,45 +2040,42 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
         double scale = (span_s > 1e-14) ? (span_e / span_s) : 1.0;
 
-        // Guard: if the span ratio is extreme (>> 1 or << 1), the C1 snap
-        // would displace CV[n-2] or CV[1] by a huge amount, distorting the
-        // pcurve severely and causing BRepCheck_UnorientableShape in the
-        // round-trip OCCT shape.  Skip the snap in such cases.
-        if (scale > 10.0 || scale < 0.1 || scale != scale) continue;
+        // Guard: if the span ratio is extreme (>> 1 or << 1), the 2D pcurve
+        // C1 snap would displace CV[n-2] or CV[1] by a huge amount, distorting
+        // the pcurve severely and causing BRepCheck_UnorientableShape in the
+        // round-trip OCCT shape.  Skip only the 2D snap in such cases; the
+        // 3D edge snap and bRev3d flip below still run.
+        const bool do_2d_snap = !(scale > 10.0 || scale < 0.1 || scale != scale);
 
-        ON_2dPoint cv0  = get_cv2d(0);
-        ON_2dPoint cv1  = get_cv2d(1);
-        ON_2dPoint cvn1 = get_cv2d(nCV-1);
-        ON_2dPoint cvn2 = get_cv2d(nCV-2);
+        if (do_2d_snap) {
+            ON_2dPoint cv0  = get_cv2d(0);
+            ON_2dPoint cv1  = get_cv2d(1);
+            ON_2dPoint cvn1 = get_cv2d(nCV-1);
+            ON_2dPoint cvn2 = get_cv2d(nCV-2);
 
-        if (d1 < 0.0) {
-            // End tangent bad: snap CV[n-2] to enforce T_end = T_start
-            // T_start direction in 2D: (cv1 - cv0) / span_s
-            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
-            // C1 closure: (cvn1 - cvn2_new) / span_e = (cv1 - cv0) / span_s
-            ON_2dPoint cvn2_new;
-            cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
-            cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
-            set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
-        } else {
-            // Start tangent bad: snap CV[1] to enforce T_start = T_end
-            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
-            // C1 closure: (cv1_new - cv0) / span_s = (cvn1 - cvn2) / span_e
-            ON_2dPoint cv1_new;
-            cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
-            cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
-            set_cv2d(1, cv1_new, get_cv_weight(1));
+            if (d1 < 0.0) {
+                // End tangent bad: snap CV[n-2] to enforce T_end = T_start
+                ON_2dPoint cvn2_new;
+                cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
+                cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
+                set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
+            } else {
+                // Start tangent bad: snap CV[1] to enforce T_start = T_end
+                ON_2dPoint cv1_new;
+                cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
+                cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
+                set_cv2d(1, cv1_new, get_cv_weight(1));
+            }
         }
 
-        // After the 2D pcurve snap, recheck.  If d1 is still bad and the
-        // 3D edge itself has a C1 kink at domain[1] (tangent reverses at
-        // the close of the closed curve), snap the 3D edge curve's CV[n-2]
-        // to enforce C1 closure.  Only apply when d0 is good (the kink is
-        // at the end), and the edge is used only by closed trims so the
-        // 3D curve modification cannot break non-closed trims.
+        // After the 2D pcurve snap (if applied), recheck.  If d1 is still bad
+        // (or the 2D snap was skipped due to scale guard), also try the 3D
+        // edge curve: snap CV[n-2] to remove a C1 kink at the seam, then
+        // re-evaluate and flip bRev3d if the flip gives a better result.
         {
             auto [pd0, pd1] = compute_checks(trim);
-            if (pd1 < 0.0) {
+            // Try to snap the 3D edge when either endpoint check fails
+            if (pd0 < 0.0 || pd1 < 0.0) {
                 ON_NurbsCurve* ec = ON_NurbsCurve::Cast(
                     brep.m_C3[brep.m_E[trim.m_ei].m_c3i]);
                 if (ec && ec->Degree() >= 1 && ec->CVCount() >= 3) {
@@ -2091,7 +2088,16 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     if (ekc >= edeg + 1)
                         esp_e = ec->m_knot[ekc-1] - ec->m_knot[ekc-1-edeg];
                     double escale = (esp_s > 1e-14) ? (esp_e / esp_s) : 1.0;
-                    if (escale > 0.1 && escale < 10.0) {
+                    // Widen the escale guard: even if span ratio is up to 100,
+                    // the snap can be worthwhile when the kink is near-180°.
+                    // The snap just moves one CV slightly; a large span ratio
+                    // means the CV moves proportionally more but the 3D kink
+                    // fix is still useful.  Only skip if escale is degenerate
+                    // (NaN/Inf/zero span).
+                    bool escale_ok = (esp_s > 1e-14) &&
+                                     (escale == escale) && // not NaN
+                                     (escale > 1e-6) && (escale < 1e6);
+                    if (escale_ok) {
                         auto eget = [&](int i) -> ON_3dPoint {
                             ON_4dPoint h; ec->GetCV(i, h);
                             double w = (h.w != 0.0) ? h.w : 1.0;
@@ -2103,17 +2109,86 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         };
                         ON_3dPoint ep0 = eget(0), ep1 = eget(1);
                         ON_3dPoint epn1 = eget(enc-1), epn2 = eget(enc-2);
-                        // Snap CV[n-2] so end tangent = start tangent
-                        ON_3dPoint epn2_new(
-                            epn1.x - (ep1.x - ep0.x) * escale,
-                            epn1.y - (ep1.y - ep0.y) * escale,
-                            epn1.z - (ep1.z - ep0.z) * escale);
-                        double ew2 = ew(enc-2);
-                        ec->SetCV(enc-2, ON_4dPoint(
-                            epn2_new.x * ew2,
-                            epn2_new.y * ew2,
-                            epn2_new.z * ew2,
-                            ew2));
+                        if (pd1 < 0.0) {
+                            // End tangent bad: snap CV[n-2] so end tan = start tan
+                            ON_3dPoint epn2_new(
+                                epn1.x - (ep1.x - ep0.x) * escale,
+                                epn1.y - (ep1.y - ep0.y) * escale,
+                                epn1.z - (ep1.z - ep0.z) * escale);
+                            double ew2 = ew(enc-2);
+                            ec->SetCV(enc-2, ON_4dPoint(
+                                epn2_new.x * ew2,
+                                epn2_new.y * ew2,
+                                epn2_new.z * ew2,
+                                ew2));
+                        } else {
+                            // Start tangent bad: snap CV[1] so start tan = end tan
+                            double inv_sc = (escale > 1e-14) ? (1.0/escale) : 1.0;
+                            ON_3dPoint ep1_new(
+                                ep0.x + (epn1.x - epn2.x) * inv_sc,
+                                ep0.y + (epn1.y - epn2.y) * inv_sc,
+                                ep0.z + (epn1.z - epn2.z) * inv_sc);
+                            double ew1 = ew(1);
+                            ec->SetCV(1, ON_4dPoint(
+                                ep1_new.x * ew1,
+                                ep1_new.y * ew1,
+                                ep1_new.z * ew1,
+                                ew1));
+                        }
+                    }
+                }
+
+                // After the 3D edge snap removes the C1 kink, re-evaluate the
+                // tangent checks.  If bRev3d is wrong, the kink may have been
+                // the only thing making one of the checks pass; once the kink is
+                // gone both checks become clearly negative under the wrong flag.
+                // Flip bRev3d if the min check improves under the flipped flag.
+                {
+                    trim.m_bRev3d = !trim.m_bRev3d;
+                    auto [fd0, fd1] = compute_checks(trim);
+                    if (std::min(fd0, fd1) > std::min(pd0, pd1)) {
+                        // Flipped orientation is better; keep it.
+                        // Also re-snap CV[n-2] of the 2D pcurve now that bRev3d
+                        // is corrected (the tangent reference direction flipped).
+                        if (trim.m_c2i >= 0 && trim.m_c2i < brep.m_C2.Count()) {
+                            ON_NurbsCurve* nc2 = ON_NurbsCurve::Cast(
+                                brep.m_C2[trim.m_c2i]);
+                            if (nc2 && nc2->CVCount() >= 3) {
+                                const int nc = nc2->CVCount();
+                                const int deg2 = nc2->Degree();
+                                const int kc2  = nc2->KnotCount();
+                                double ss = 0.0, se = 0.0;
+                                if (kc2 > deg2)
+                                    ss = nc2->m_knot[deg2] - nc2->m_knot[0];
+                                if (kc2 >= deg2 + 1)
+                                    se = nc2->m_knot[kc2-1] - nc2->m_knot[kc2-1-deg2];
+                                double sc2 = (ss > 1e-14) ? (se / ss) : 1.0;
+                                if (sc2 > 0.1 && sc2 < 10.0) {
+                                    auto g2 = [&](int i) -> ON_2dPoint {
+                                        ON_4dPoint h; nc2->GetCV(i, h);
+                                        double w = (h.w != 0.0) ? h.w : 1.0;
+                                        return ON_2dPoint(h.x/w, h.y/w);
+                                    };
+                                    auto gw2 = [&](int i) -> double {
+                                        ON_4dPoint h; nc2->GetCV(i, h);
+                                        return (h.w != 0.0) ? h.w : 1.0;
+                                    };
+                                    auto s2 = [&](int i, const ON_2dPoint& p, double w) {
+                                        nc2->SetCV(i, ON_4dPoint(p.x*w, p.y*w, 0.0, w));
+                                    };
+                                    ON_2dPoint p0 = g2(0), p1 = g2(1);
+                                    ON_2dPoint pn1 = g2(nc-1);
+                                    // snap end tangent to start tangent
+                                    ON_2dPoint pn2_new;
+                                    pn2_new.x = pn1.x - (p1.x - p0.x) * sc2;
+                                    pn2_new.y = pn1.y - (p1.y - p0.y) * sc2;
+                                    s2(nc-2, pn2_new, gw2(nc-2));
+                                }
+                            }
+                        }
+                    } else {
+                        // Flipped is not better; restore.
+                        trim.m_bRev3d = !trim.m_bRev3d;
                     }
                 }
             }
