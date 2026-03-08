@@ -402,6 +402,90 @@ static bool EndsWithCI(const std::string& s, const char* suffix)
 }
 
 // ---------------------------------------------------------------------------
+// Detect and parse the "FreeCAD dump" format used by older FreeCAD files
+// (e.g. from https://github.com/fmorgner/freecad-models).
+//
+// Format: a concatenated sequence of entries.  Each entry is:
+//   <size>|<size>|<type>|<filename>\n<size bytes of content>
+// with optional leading newlines between entries.  The content is the raw file
+// data (for *.brp files, a OCCT BREP with a leading '\n').
+//
+// Returns true if the file appears to be in this format (starts with a decimal
+// number followed by '|'), false if it is a standard ZIP-based FCStd.
+// ---------------------------------------------------------------------------
+static bool IsFCDumpFormat(const std::string& path)
+{
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    // A ZIP file starts with PK\x03\x04; a FreeCAD dump starts with digits
+    unsigned char hdr[4] = {0,0,0,0};
+    (void)std::fread(hdr, 1, 4, f);
+    std::fclose(f);
+    if (hdr[0] == 'P' && hdr[1] == 'K') return false; // ZIP
+    return hdr[0] >= '0' && hdr[0] <= '9';             // decimal size
+}
+
+// Extract all *.brp entries from a FreeCAD dump file to a temp directory.
+// Returns false if the file could not be parsed.
+static bool ExtractFCDump(const std::string& path, const std::string& out_dir)
+{
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    std::fseek(f, 0, SEEK_END);
+    long fsize = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 64L * 1024 * 1024) { std::fclose(f); return false; }
+
+    std::vector<char> buf((size_t)fsize);
+    if ((long)std::fread(buf.data(), 1, (size_t)fsize, f) != fsize) {
+        std::fclose(f); return false;
+    }
+    std::fclose(f);
+
+    size_t pos = 0;
+    bool any_brp = false;
+    while (pos < buf.size()) {
+        // Skip leading newlines
+        while (pos < buf.size() && buf[pos] == '\n') ++pos;
+        if (pos >= buf.size()) break;
+
+        // Find the end of the header line
+        size_t nl = pos;
+        while (nl < buf.size() && buf[nl] != '\n') ++nl;
+        if (nl >= buf.size()) break;
+
+        std::string header(buf.data() + pos, nl - pos);
+        // Parse: size|size|type|filename
+        size_t p0 = header.find('|');
+        if (p0 == std::string::npos) break;
+        size_t p3 = header.rfind('|');
+        if (p3 == p0) break;
+
+        long entry_size = 0;
+        try { entry_size = std::stol(header.substr(0, p0)); }
+        catch (...) { break; }
+
+        std::string fname = header.substr(p3 + 1);
+        pos = nl + 1;
+
+        if (pos + (size_t)entry_size > buf.size()) break;
+
+        if (EndsWithCI(fname, ".brp") && entry_size > 0) {
+            std::string out_path = out_dir + "/" + fname;
+            FILE* out = std::fopen(out_path.c_str(), "wb");
+            if (out) {
+                (void)std::fwrite(buf.data() + pos, 1, (size_t)entry_size, out);
+                std::fclose(out);
+                any_brp = true;
+            }
+        }
+        pos += (size_t)entry_size;
+    }
+    return any_brp;
+}
+
+// ---------------------------------------------------------------------------
 // Process one .FCStd file: extract, test each .brp, clean up.
 // ---------------------------------------------------------------------------
 static FileResult TestFCStdFile(const std::string& fcstd_path)
@@ -418,10 +502,21 @@ static FileResult TestFCStdFile(const std::string& fcstd_path)
     }
     std::string tmp_str(tmp_dir);
 
-    // Extract the ZIP archive
-    std::string cmd = "unzip -q \"" + fcstd_path + "\" -d \"" + tmp_str
-                      + "\" 2>/dev/null";
-    {
+    // Extract the archive — support both:
+    //   • standard ZIP-based .FCStd (FreeCAD >= 0.18)
+    //   • "FreeCAD dump" format (older format, e.g. fmorgner/freecad-models):
+    //     concatenated entries with "size|size|type|filename\n<data>" headers
+    if (IsFCDumpFormat(fcstd_path)) {
+        if (!ExtractFCDump(fcstd_path, tmp_str)) {
+            std::string rm_cmd = "rm -rf \"" + tmp_str + "\"";
+            RunCmd(rm_cmd);
+            res.error = "FCDump extraction failed (no .brp entries found)";
+            return res;
+        }
+    } else {
+        // Standard ZIP
+        std::string cmd = "unzip -q \"" + fcstd_path + "\" -d \"" + tmp_str
+                          + "\" 2>/dev/null";
         int rc = std::system(cmd.c_str());
         if (rc != 0) {
             std::string rm_cmd = "rm -rf \"" + tmp_str + "\"";

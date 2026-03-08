@@ -1166,6 +1166,31 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                     nc->m_knot[ki2++] = kv2;
                             }
                             if (nc->IsValid()) {
+                                // Sync pc_t0/pc_t1 to the actual B-spline domain.
+                                //
+                                // Geom2dConvert::CurveToBSplineCurve normalizes the
+                                // output domain to [0,1] for many curve types (lines,
+                                // circles, trimmed non-BSplines).  If the OCCT pcurve
+                                // parameter range pc_t0/pc_t1 differs from nc->Domain(),
+                                // SetProxyCurve would evaluate PointAtEnd() at an
+                                // intermediate parameter of the [0,1] curve rather than
+                                // at cv[last], giving a wrong trim endpoint.
+                                //
+                                // After this sync, proxy_dom = nc->Domain() so
+                                // PointAtEnd() = curve(nc_dom.Max()) = cv[last] = the
+                                // correct geometric endpoint of the edge.
+                                //
+                                // The m_c3i reparameterization below may further adjust
+                                // nc's knots for period-shifted seam pcurves; pc_t0/pc_t1
+                                // are updated there as well.
+                                {
+                                    ON_Interval nc_dom_init = nc->Domain();
+                                    if (nc_dom_init.IsValid()) {
+                                        pc_t0 = nc_dom_init.Min();
+                                        pc_t1 = nc_dom_init.Max();
+                                    }
+                                }
+
                                 // Remap the pcurve's knot domain to match the
                                 // 3D edge domain so SameRange=true is preserved
                                 // in the round-trip.  In the original OCCT B-Rep

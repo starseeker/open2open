@@ -1,3 +1,6 @@
 [submodule "FreeCAD-Examples"]
 	path = FreeCAD-Examples
 	url = https://github.com/FreeCAD/Examples.git
+[submodule "freecad-models"]
+	path = freecad-models
+	url = https://github.com/fmorgner/freecad-models.git

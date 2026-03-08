@@ -71,3 +71,13 @@ target_link_libraries(test_fcstd_roundtrip PRIVATE open2open)
 add_test(NAME test_fcstd_roundtrip
          COMMAND test_fcstd_roundtrip "${_fcstd_dir}")
 
+
+# Additional FCStd test using freecad-models submodule (if checked out).
+# freecad-models uses the older FreeCAD "dump" format (concatenated entries
+# with size|size|type|filename\n headers) rather than ZIP; test_fcstd_roundtrip
+# detects and parses this format automatically.
+set(_freecad_models_dir "${CMAKE_SOURCE_DIR}/../freecad-models")
+if(EXISTS "${_freecad_models_dir}/README.rst")
+    add_test(NAME test_fcstd_freecad_models
+             COMMAND test_fcstd_roundtrip "${_freecad_models_dir}")
+endif()
