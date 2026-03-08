@@ -15,6 +15,9 @@
 //      d. Validate the round-tripped shape with BRepCheck_Analyzer.
 //      e. Compare surface area (and volume for solids) before and after the
 //         round-trip to detect silent geometry distortion.
+//      Each shape test runs in a forked child process with a 30-second
+//      timeout, so pathological shapes (e.g. datum lines with near-infinite
+//      parameter ranges) cannot hang the test suite.
 //   3. Clean up the temporary directory.
 //
 // Usage:
@@ -42,6 +45,15 @@
 #include <cstring>
 #include <string>
 #include <vector>
+
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+// Per-shape timeout in seconds.  Protects against BRP files with near-infinite
+// parameter ranges (e.g. FreeCAD datum lines/axes) that cause BRepTools::Read
+// or the conversion pipeline to loop indefinitely.
+static const int kShapeTimeoutSecs = 30;
 
 // ---------------------------------------------------------------------------
 // Compute surface area of a shape.  Returns 0.0 if the shape has no faces.
@@ -84,6 +96,16 @@ static bool RoundTripShape(const TopoDS_Shape& shape, std::string& reason)
         TopExp_Explorer fex(shape, TopAbs_FACE);
         if (!fex.More()) {
             reason = "input shape has no faces (skipped)";
+            return false;
+        }
+    }
+
+    // Skip unbounded faces (datum planes, reference geometry) — a face with no
+    // bounding edges cannot be represented as a valid ON_Brep B-Rep.
+    {
+        TopExp_Explorer eex(shape, TopAbs_EDGE);
+        if (!eex.More()) {
+            reason = "input shape has no edges (datum/reference geometry, skipped)";
             return false;
         }
     }
@@ -178,13 +200,23 @@ static bool RoundTripShape(const TopoDS_Shape& shape, std::string& reason)
 // ---------------------------------------------------------------------------
 struct ShapeResult {
     std::string brp_name;   // filename inside archive, e.g. "PartShape3.brp"
-    bool passed  = false;
-    bool skipped = false;   // no faces — not a B-Rep shape, not a failure
+    bool passed    = false;
+    bool skipped   = false; // no faces or no edges — not a bounded B-Rep, not a failure
+    bool timed_out = false; // exceeded kShapeTimeoutSecs — recorded as failure
     std::string reason;
 };
 
 // ---------------------------------------------------------------------------
-// Test one *.brp file that has been extracted.
+// Wire protocol constants for fork→parent pipe communication.
+// ---------------------------------------------------------------------------
+// Result byte layout written by child: [passed:u8][skipped:u8][rlen:u32][reason:rlen bytes]
+static const uint8_t kResultPassed  = 1;
+static const uint8_t kResultSkipped = 2;
+
+// ---------------------------------------------------------------------------
+// Test one *.brp file in a forked child with a per-shape timeout.
+// BRP files with near-infinite edge parameter ranges (datum lines) can cause
+// BRepTools::Read to loop; the timeout prevents the suite from hanging.
 // ---------------------------------------------------------------------------
 static ShapeResult TestBrpFile(const std::string& brp_path,
                                 const std::string& brp_name)
@@ -192,26 +224,99 @@ static ShapeResult TestBrpFile(const std::string& brp_path,
     ShapeResult res;
     res.brp_name = brp_name;
 
-    TopoDS_Shape shape;
-    BRep_Builder builder;
-    if (!BRepTools::Read(shape, brp_path.c_str(), builder)) {
-        res.reason = "BRepTools::Read failed";
+    // Create a pipe so the child can send the ShapeResult back to the parent.
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        res.reason = "pipe() failed";
         return res;
     }
 
-    std::string reason;
-    bool ok = RoundTripShape(shape, reason);
-
-    // Distinguish skip (no faces) from actual failure
-    if (!ok && reason.find("no faces") != std::string::npos &&
-        reason.find("skipped") != std::string::npos) {
-        res.skipped = true;
-        res.reason  = reason;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        res.reason = "fork() failed";
         return res;
     }
 
-    res.passed = ok;
-    res.reason = reason;
+    if (pid == 0) {
+        // ---- Child process ----
+        close(pipefd[0]); // close read end
+
+        // Do the actual shape test
+        TopoDS_Shape shape;
+        BRep_Builder builder;
+        bool passed  = false;
+        bool skipped = false;
+        std::string reason;
+
+        if (!BRepTools::Read(shape, brp_path.c_str(), builder)) {
+            reason = "BRepTools::Read failed";
+        } else {
+            bool ok = RoundTripShape(shape, reason);
+            if (!ok && reason.find("skipped") != std::string::npos) {
+                skipped = true;
+            } else {
+                passed = ok;
+            }
+        }
+
+        // Write result to pipe
+        uint8_t flags = (passed ? kResultPassed : 0) | (skipped ? kResultSkipped : 0);
+        uint32_t rlen = (uint32_t)reason.size();
+        ssize_t nw;
+        nw = write(pipefd[1], &flags, sizeof(flags)); (void)nw;
+        nw = write(pipefd[1], &rlen,  sizeof(rlen));  (void)nw;
+        if (rlen > 0) { nw = write(pipefd[1], reason.c_str(), rlen); (void)nw; }
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    // ---- Parent process ----
+    close(pipefd[1]); // close write end
+
+    // Wait for child with kShapeTimeoutSecs timeout (poll every 50 ms).
+    const int kPollMs  = 50;
+    const int kMaxIter = (kShapeTimeoutSecs * 1000) / kPollMs;
+
+    int status = 0;
+    bool child_done = false;
+    for (int i = 0; i < kMaxIter; ++i) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) { child_done = true; break; }
+        struct timespec ts { 0, kPollMs * 1000000L };
+        nanosleep(&ts, nullptr);
+    }
+
+    if (!child_done) {
+        // Timeout — kill child and collect it
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        close(pipefd[0]);
+        res.timed_out = true;
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "timed out after %ds (unbounded geometry?)",
+                      kShapeTimeoutSecs);
+        res.reason = buf;
+        return res;
+    }
+
+    // Read result from pipe
+    uint8_t  flags = 0;
+    uint32_t rlen  = 0;
+    if (read(pipefd[0], &flags, sizeof(flags)) == (ssize_t)sizeof(flags) &&
+        read(pipefd[0], &rlen,  sizeof(rlen))  == (ssize_t)sizeof(rlen)) {
+        res.passed  = (flags & kResultPassed)  != 0;
+        res.skipped = (flags & kResultSkipped) != 0;
+        if (rlen > 0 && rlen < 4096) {
+            res.reason.resize(rlen);
+            ssize_t nr = read(pipefd[0], &res.reason[0], rlen);
+            if (nr < (ssize_t)rlen) res.reason.resize(nr > 0 ? (size_t)nr : 0);
+        }
+    } else {
+        res.reason = "could not read result from child";
+    }
+    close(pipefd[0]);
     return res;
 }
 
@@ -369,6 +474,7 @@ int main(int argc, char* argv[])
     int total_shapes = 0;
     int pass_shapes  = 0;
     int skip_shapes  = 0;
+    int timeout_shapes = 0;
 
     for (const auto& f : files) {
         ++total_files;
@@ -391,14 +497,19 @@ int main(int argc, char* argv[])
             continue;
         }
 
-        int file_pass = 0;
-        int file_skip = 0;
-        int file_fail = 0;
+        int file_pass    = 0;
+        int file_skip    = 0;
+        int file_fail    = 0;
+        int file_timeout = 0;
         for (const auto& s : r.shapes) {
             ++total_shapes;
             if (s.skipped) {
                 ++skip_shapes;
                 ++file_skip;
+            } else if (s.timed_out) {
+                ++timeout_shapes;
+                ++file_timeout;
+                ++file_fail;
             } else if (s.passed) {
                 ++pass_shapes;
                 ++file_pass;
@@ -410,11 +521,11 @@ int main(int argc, char* argv[])
         int testable = (int)r.shapes.size() - file_skip;
         if (file_fail == 0) {
             ++files_pass;
-            std::printf("PASS [%s]: %d/%d shapes ok, %d skipped (no faces)\n",
+            std::printf("PASS [%s]: %d/%d shapes ok, %d skipped (no faces/edges)\n",
                         label.c_str(), file_pass, testable, file_skip);
         } else {
             ++files_fail;
-            std::printf("FAIL [%s]: %d/%d shapes ok, %d skipped (no faces)\n",
+            std::printf("FAIL [%s]: %d/%d shapes ok, %d skipped (no faces/edges)\n",
                         label.c_str(), file_pass, testable, file_skip);
             for (const auto& s : r.shapes) {
                 if (!s.passed && !s.skipped) {
@@ -423,14 +534,15 @@ int main(int argc, char* argv[])
                 }
             }
         }
+        std::fflush(stdout);
     }
 
     int testable_shapes = total_shapes - skip_shapes;
     std::printf("\n=== Summary ===\n");
     std::printf("Files:  %d total, %d passed, %d failed\n",
                 total_files, files_pass, files_fail);
-    std::printf("Shapes: %d/%d passed, %d skipped (no faces)\n",
-                pass_shapes, testable_shapes, skip_shapes);
+    std::printf("Shapes: %d/%d passed, %d skipped (no faces/edges), %d timed out\n",
+                pass_shapes, testable_shapes, skip_shapes, timeout_shapes);
 
     return (files_fail == 0) ? 0 : 1;
 }
