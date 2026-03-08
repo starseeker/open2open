@@ -178,6 +178,17 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             TopoDS_Vertex vend = v_map[e.m_vi[1]];
             vend.Orientation(TopAbs_REVERSED);
             B.Add(e_map[i], vend);
+        } else if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size() &&
+                   e.m_vi[1] == e.m_vi[0]) {
+            // Closed edge (same start/end vertex): OCCT requires the vertex
+            // to appear with REVERSED orientation as well so that
+            // BRepTools_WireExplorer and BRep_Tool::IsClosed() recognize
+            // the edge as properly closed.  Without this, inner 1-edge wires
+            // (e.g. circular holes) cannot be traversed and their pcurves
+            // are invisible to BRepCheck_Face::ClassifyWires().
+            TopoDS_Vertex vclosed = v_map[e.m_vi[0]];
+            vclosed.Orientation(TopAbs_REVERSED);
+            B.Add(e_map[i], vclosed);
         }
         if (e.m_tolerance != ON_UNSET_VALUE)
             B.UpdateEdge(e_map[i], e.m_tolerance);
