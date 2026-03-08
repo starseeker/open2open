@@ -577,8 +577,17 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     }
 
     if (parts.size() == 1) {
-        try { BRepLib::SameParameter(parts[0], linear_tolerance,
-                                     Standard_False); } catch (...) {}
+        // BRepLib::SameParameter fixes the SameParameter flag on each edge:
+        // the flag must reflect whether the 3D curve and pcurve(s) are
+        // arc-length identical.  A round-trip converter cannot guarantee
+        // this; the call here detects and corrects any incorrect flags.
+        // Degenerate edges (no 3D curve, missing pcurve) can throw
+        // Standard_OutOfRange — catch and ignore since SameParameter=false
+        // is the safe/conservative default for such edges.
+        try {
+            BRepLib::SameParameter(parts[0], linear_tolerance,
+                                   Standard_False);
+        } catch (...) {}
         return parts[0];
     }
 
@@ -587,8 +596,10 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     B.MakeCompound(compound);
     for (const auto& p : parts)
         B.Add(compound, p);
-    try { BRepLib::SameParameter(compound, linear_tolerance,
-                                  Standard_False); } catch (...) {}
+    // See comment above; same rationale applies for the compound case.
+    try {
+        BRepLib::SameParameter(compound, linear_tolerance, Standard_False);
+    } catch (...) {}
     return compound;
 }
 
