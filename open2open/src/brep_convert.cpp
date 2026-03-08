@@ -154,6 +154,10 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // Step 3 — create edges (3-D curve + vertices + tolerance)
     // ------------------------------------------------------------------
     std::vector<TopoDS_Edge> e_map(brep.m_E.Count());
+    // Remember the 3D domain of each edge so we can detect SameRange=false
+    // situations when attaching pcurves.
+    std::vector<std::pair<double,double>> e3d_domain(brep.m_E.Count(),
+                                                      {0.0, 0.0});
     for (int i = 0; i < brep.m_E.Count(); ++i) {
         const ON_BrepEdge& e = brep.m_E[i];
         B.MakeEdge(e_map[i]);
@@ -164,7 +168,9 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             double t1 = e.Domain().Max();
             B.UpdateEdge(e_map[i], c3_map[e.m_c3i], linear_tolerance);
             B.Range(e_map[i], t0, t1, /*only3d=*/Standard_True);
+            e3d_domain[i] = {t0, t1};
         }
+
         if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size()) {
             // Start vertex: FORWARD orientation (standard OCCT convention)
             TopoDS_Vertex vstart = v_map[e.m_vi[0]];
@@ -334,6 +340,17 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                 }
                 B.UpdateEdge(e_map[ei], C1, C2, f_map[fi], sp.tol);
                 B.Range(e_map[ei], f_map[fi], sp.t0, sp.t1);
+                // If seam pcurve domain differs from 3D edge domain,
+                // mark SameRange=false and SameParameter=false.
+                {
+                    const double kRangeTol = 1e-10;
+                    const auto& ed = e3d_domain[ei];
+                    if (std::fabs(sp.t0 - ed.first)  > kRangeTol ||
+                        std::fabs(sp.t1 - ed.second) > kRangeTol) {
+                        B.SameRange(e_map[ei], Standard_False);
+                        B.SameParameter(e_map[ei], Standard_False);
+                    }
+                }
                 seam_c2_applied.insert(ei);
             }
         }
@@ -419,9 +436,21 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     if (trim.m_bRev3d)
                         pc = pc->Reversed();
                     B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
-                    B.Range(e_map[ei], f_map[fi],
-                            trim.Domain().Min(),
-                            trim.Domain().Max());
+                    double pd_min = trim.Domain().Min();
+                    double pd_max = trim.Domain().Max();
+                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
+                    // If the pcurve domain differs from the 3D edge domain,
+                    // the edge has SameRange=false in the original shape.
+                    // We must propagate this: SameRange=false also implies
+                    // SameParameter=false (otherwise BRepCheck fires
+                    // InvalidSameParameterFlag).
+                    const double kRangeTol = 1e-10;
+                    const auto& ed = e3d_domain[ei];
+                    if (std::fabs(pd_min - ed.first)  > kRangeTol ||
+                        std::fabs(pd_max - ed.second) > kRangeTol) {
+                        B.SameRange(e_map[ei], Standard_False);
+                        B.SameParameter(e_map[ei], Standard_False);
+                    }
                 }
 
                 // Edge orientation: m_bRev3d means trim direction is
@@ -1003,6 +1032,37 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                     nc->m_knot[ki2++] = kv2;
                             }
                             if (nc->IsValid()) {
+                                // Remap the pcurve's knot domain to match the
+                                // 3D edge domain so SameRange=true is preserved
+                                // in the round-trip.  In the original OCCT B-Rep
+                                // every edge with a 3D curve has SameRange=true
+                                // (pcurve parameter domain == 3D curve domain).
+                                // The conversion may produce a pcurve with a
+                                // different domain (e.g. period-shifted by ±2π),
+                                // which would require SameRange=false and trigger
+                                // BRepCheck_InvalidSameRangeFlag on reconstruction.
+                                if (ei >= 0 && ei < brep.m_E.Count() &&
+                                    brep.m_E[ei].m_c3i >= 0) {
+                                    ON_Interval edge_dom = brep.m_E[ei].Domain();
+                                    ON_Interval nc_dom   = nc->Domain();
+                                    if (edge_dom.IsValid() && nc_dom.IsValid() &&
+                                        edge_dom.Length() > 0 && nc_dom.Length() > 0) {
+                                        double old0 = nc_dom.Min(), old1 = nc_dom.Max();
+                                        double new0 = edge_dom.Min(), new1 = edge_dom.Max();
+                                        const double kTol = 1e-10;
+                                        if (fabs(old0 - new0) > kTol ||
+                                            fabs(old1 - new1) > kTol) {
+                                            double scale = (new1 - new0) /
+                                                           (old1 - old0);
+                                            for (int k = 0; k < nc->KnotCount(); ++k)
+                                                nc->m_knot[k] = new0 +
+                                                    (nc->m_knot[k] - old0) * scale;
+                                            pc_t0 = new0;
+                                            pc_t1 = new1;
+                                        }
+                                    }
+                                }
+
                                 // OCCT stores all pcurves in the FORWARD edge
                                 // direction, regardless of the edge orientation.
                                 // For REVERSED edges, the openNURBS trim direction
