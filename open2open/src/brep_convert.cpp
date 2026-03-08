@@ -1407,7 +1407,21 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // Get the ON_NurbsCurve for this trim's pcurve
         if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
         ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
-        if (!nc || nc->Degree() < 1 || nc->CVCount() < 3) continue;
+        if (!nc || nc->Degree() < 1) continue;
+
+        // If the pcurve is linear (degree 1, 2 CVs) elevate it to degree 2
+        // so that we have an interior CV to apply the C1 snap below.
+        if (nc->CVCount() < 3) {
+            if (nc->IncreaseDegree(2) && nc->CVCount() >= 3) {
+                // Rebuild pbox for the trim after elevation.
+                trim.m_pbox = nc->BoundingBox();
+                trim.m_pbox.m_min.z = 0.0;
+                trim.m_pbox.m_max.z = 0.0;
+            } else {
+                continue;  // elevation failed — skip
+            }
+        }
+        if (nc->CVCount() < 3) continue;
 
         // We need at least CV[0], CV[1], CV[n-2], CV[n-1] to be accessible
         const int nCV = nc->CVCount();
@@ -1472,6 +1486,54 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
             cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
             set_cv2d(1, cv1_new, get_cv_weight(1));
+        }
+
+        // After the 2D pcurve snap, recheck.  If d1 is still bad and the
+        // 3D edge itself has a C1 kink at domain[1] (tangent reverses at
+        // the close of the closed curve), snap the 3D edge curve's CV[n-2]
+        // to enforce C1 closure.  Only apply when d0 is good (the kink is
+        // at the end), and the edge is used only by closed trims so the
+        // 3D curve modification cannot break non-closed trims.
+        {
+            auto [pd0, pd1] = compute_checks(trim);
+            if (pd1 < 0.0) {
+                ON_NurbsCurve* ec = ON_NurbsCurve::Cast(
+                    brep.m_C3[brep.m_E[trim.m_ei].m_c3i]);
+                if (ec && ec->Degree() >= 1 && ec->CVCount() >= 3) {
+                    const int enc  = ec->CVCount();
+                    const int edeg = ec->Degree();
+                    const int ekc  = ec->KnotCount();
+                    double esp_s = 0.0, esp_e = 0.0;
+                    if (ekc > edeg)
+                        esp_s = ec->m_knot[edeg] - ec->m_knot[0];
+                    if (ekc >= edeg + 1)
+                        esp_e = ec->m_knot[ekc-1] - ec->m_knot[ekc-1-edeg];
+                    double escale = (esp_s > 1e-14) ? (esp_e / esp_s) : 1.0;
+                    if (escale > 0.1 && escale < 10.0) {
+                        auto eget = [&](int i) -> ON_3dPoint {
+                            ON_4dPoint h; ec->GetCV(i, h);
+                            double w = (h.w != 0.0) ? h.w : 1.0;
+                            return ON_3dPoint(h.x/w, h.y/w, h.z/w);
+                        };
+                        auto ew = [&](int i) -> double {
+                            ON_4dPoint h; ec->GetCV(i, h);
+                            return (h.w != 0.0) ? h.w : 1.0;
+                        };
+                        ON_3dPoint ep0 = eget(0), ep1 = eget(1);
+                        ON_3dPoint epn1 = eget(enc-1), epn2 = eget(enc-2);
+                        // Snap CV[n-2] so end tangent = start tangent
+                        ON_3dPoint epn2_new(
+                            epn1.x - (ep1.x - ep0.x) * escale,
+                            epn1.y - (ep1.y - ep0.y) * escale,
+                            epn1.z - (ep1.z - ep0.z) * escale);
+                        double ew2 = ew(enc-2);
+                        ec->SetCV(enc-2, ON_3dPoint(
+                            epn2_new.x * ew2,
+                            epn2_new.y * ew2,
+                            epn2_new.z * ew2));
+                    }
+                }
+            }
         }
     }
 
