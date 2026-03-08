@@ -889,8 +889,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 gp_Pnt2d p2 = bc2->Pole(k);
                                 double w2   = rat2 ? bc2->Weight(k) : 1.0;
                                 nc->SetCV(k - 1,
-                                          ON_3dPoint(p2.X() * w2,
+                                          ON_4dPoint(p2.X() * w2,
                                                      p2.Y() * w2,
+                                                     0.0,
                                                      w2));
                             }
                             // Strip one phantom knot from each end (same
@@ -1451,7 +1452,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             return (h.w != 0.0) ? h.w : 1.0;
         };
         auto set_cv2d = [&](int i, const ON_2dPoint& p, double w) {
-            nc->SetCV(i, ON_3dPoint(p.x * w, p.y * w, w));
+            nc->SetCV(i, ON_4dPoint(p.x * w, p.y * w, 0.0, w));
         };
 
         // First interior knot span at start: m_knot[deg] - m_knot[0]
@@ -1538,10 +1539,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             epn1.y - (ep1.y - ep0.y) * escale,
                             epn1.z - (ep1.z - ep0.z) * escale);
                         double ew2 = ew(enc-2);
-                        ec->SetCV(enc-2, ON_3dPoint(
+                        ec->SetCV(enc-2, ON_4dPoint(
                             epn2_new.x * ew2,
                             epn2_new.y * ew2,
-                            epn2_new.z * ew2));
+                            epn2_new.z * ew2,
+                            ew2));
                     }
                 }
             }
