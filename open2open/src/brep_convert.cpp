@@ -930,8 +930,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             if (!bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
                 // surfaces that GeomConvert still left periodic).
-                if (bs->IsUPeriodic()) bs->SetUNotPeriodic();
-                if (bs->IsVPeriodic()) bs->SetVNotPeriodic();
+                // BSplCLib::Unperiodize computes scale = 1/(knot_last - knot_first).
+                // For degenerate periodic surfaces (collapsed knot span), this
+                // produces a zero denominator, triggering SIGFPE which cannot be
+                // caught by C++ try-catch.  Guard: only unperiodize when the
+                // knot span is non-zero.
+                if (bs->IsUPeriodic() && bs->NbUKnots() >= 2 &&
+                    bs->UKnot(bs->NbUKnots()) - bs->UKnot(1) > 1e-15)
+                    bs->SetUNotPeriodic();
+                if (bs->IsVPeriodic() && bs->NbVKnots() >= 2 &&
+                    bs->VKnot(bs->NbVKnots()) - bs->VKnot(1) > 1e-15)
+                    bs->SetVNotPeriodic();
                 ON_NurbsSurface* ns = new ON_NurbsSurface();
                 if (OCCTSurfaceToON(bs, *ns)) {
                     // If the converted surface's UV domain doesn't match the
@@ -1501,7 +1510,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     brep.SetTolerancesBoxesAndFlags(/*bLazy=*/true);
 
     // ---------------------------------------------------------------------------
-    // Post-processing pass: repair seam trim m_iso corruption.
+    // Post-processing pass: repair seam/singular trim m_iso corruption.
     //
     // The UV-gap snap occasionally sets CV[0] of a seam pcurve to the
     // floating-point endpoint of the preceding trim (e.g. U=2.8e-9 instead
@@ -1511,16 +1520,23 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     // not_iso for the seam trim and failing the ON_Brep::IsValid() check
     // "seam trim m_iso is not N/E/W/S_iso".
     //
-    // Fix: for any seam trim whose m_iso is still not_iso after
-    // SetTolerancesBoxesAndFlags, check whether all of the pcurve's CVs
-    // share a nearly-constant U or V value (within 1e-4 of the maximum
-    // CV extent in that direction).  If so, snap all CVs to the exact
-    // iso value (the mean of all CV coordinates in the constant direction)
-    // and call SetTrimIsoFlags again to update m_iso.
+    // Similarly, singular trims (degenerate poles) on B-spline surfaces can
+    // have SetTrimIsoFlags() silently return not_iso even when the pcurve CVs
+    // lie exactly on a surface boundary.  The ON_NurbsSurface::IsIsoparametric
+    // implementation uses a tight absolute tolerance (~1e-12) that can fail for
+    // large domain values (e.g. V_max = 28.6515).
+    //
+    // Fix for both: for any seam or singular trim whose m_iso is still not_iso,
+    // check whether all CVs share a nearly-constant U or V value (within 1e-4
+    // of the maximum CV extent in that direction).  If so, snap to the nearest
+    // surface domain boundary and call SetTrimIsoFlags again.  If it still
+    // returns not_iso, compute the iso type directly from the snapped CV values
+    // and the surface domain.
     // ---------------------------------------------------------------------------
     for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
         ON_BrepTrim& trim = brep.m_T[ti];
-        if (trim.m_type != ON_BrepTrim::seam) continue;
+        if (trim.m_type != ON_BrepTrim::seam &&
+            trim.m_type != ON_BrepTrim::singular) continue;
         if (trim.m_iso != ON_Surface::not_iso) continue;  // already iso
 
         if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
@@ -1593,6 +1609,43 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
         // Recompute the iso flag and parameter bounding box for this trim.
         brep.SetTrimIsoFlags(trim);
+
+        // Fallback: if SetTrimIsoFlags still returns not_iso (can happen for
+        // B-spline surfaces with large domain values where the absolute
+        // tolerance in ON_NurbsSurface::IsIsoparametric is too tight),
+        // compute the iso type directly from the snapped CV values and the
+        // known surface domain boundaries.
+        if (trim.m_iso == ON_Surface::not_iso) {
+            const int li2   = trim.m_li;
+            const int fi2   = (li2 >= 0 && li2 < brep.m_L.Count())
+                                  ? brep.m_L[li2].m_fi : -1;
+            const ON_Surface* srf2 = (fi2 >= 0 && fi2 < brep.m_F.Count())
+                                         ? brep.m_F[fi2].SurfaceOf() : nullptr;
+            if (srf2 && nc->CVCount() > 0) {
+                double su0=0, su1=0, sv0=0, sv1=0;
+                srf2->GetDomain(0, &su0, &su1);
+                srf2->GetDomain(1, &sv0, &sv1);
+                const double kBndTol = 1e-4;
+                if (snap_u) {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
+                    if (w0 == 0.0) w0 = 1.0;
+                    double u0 = cv0[0] / w0;
+                    if      (fabs(u0 - su0) <= kBndTol) trim.m_iso = ON_Surface::W_iso;
+                    else if (fabs(u0 - su1) <= kBndTol) trim.m_iso = ON_Surface::E_iso;
+                    else                                 trim.m_iso = ON_Surface::x_iso;
+                } else {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
+                    if (w0 == 0.0) w0 = 1.0;
+                    double v0 = cv0[1] / w0;
+                    if      (fabs(v0 - sv0) <= kBndTol) trim.m_iso = ON_Surface::S_iso;
+                    else if (fabs(v0 - sv1) <= kBndTol) trim.m_iso = ON_Surface::N_iso;
+                    else                                 trim.m_iso = ON_Surface::y_iso;
+                }
+            }
+        }
+
         // Rebuild m_pbox from the (now-corrected) pcurve.
         {
             const ON_Curve* c2 = brep.m_C2[trim.m_c2i];
