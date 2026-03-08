@@ -741,8 +741,26 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         of.m_bRev = (face.Orientation() == TopAbs_REVERSED);
 
         // -- Iterate wires → loops
+        // openNURBS requires face.m_li[0] to be the outer loop.  Use
+        // BRepTools::OuterWire() to identify the outer wire, then
+        // iterate wires in outer-first order so the outer loop lands at
+        // face.m_li[0].
+        {
+        TopoDS_Wire face_outer_wire = BRepTools::OuterWire(face);
+
+        // Collect wires, outer wire first.
+        std::vector<TopoDS_Wire> face_wires;
+        if (!face_outer_wire.IsNull())
+            face_wires.push_back(face_outer_wire);
         for (TopExp_Explorer wex(face, TopAbs_WIRE); wex.More(); wex.Next()) {
-            const TopoDS_Wire& wire = TopoDS::Wire(wex.Current());
+            const TopoDS_Wire& w = TopoDS::Wire(wex.Current());
+            if (face_outer_wire.IsNull() || !w.IsSame(face_outer_wire))
+                face_wires.push_back(w);
+        }
+
+        for (const TopoDS_Wire& wire : face_wires) {
+            // First entry is outer; all others are inner holes.
+            const bool wire_is_outer = (&wire == &face_wires[0]);
 
             ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
 
@@ -1090,11 +1108,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 }
             }
 
-            // Fix up loop type based on orientation
-            ol.m_type = (ol.m_loop_index == of.m_li[0])
-                            ? ON_BrepLoop::outer
-                            : ON_BrepLoop::inner;
+            // Fix up loop type based on outer-wire detection above.
+            ol.m_type = wire_is_outer ? ON_BrepLoop::outer
+                                      : ON_BrepLoop::inner;
         }
+        } // end face_wires scope
     }
 
     brep.SetTolerancesBoxesAndFlags(/*bLazy=*/true);
