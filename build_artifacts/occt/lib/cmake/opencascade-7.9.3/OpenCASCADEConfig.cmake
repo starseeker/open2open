@@ -48,16 +48,18 @@ set (OpenCASCADE_CXX_FLAGS    " -fexceptions -fPIC -Wall -Wextra")
 set (OpenCASCADE_LINKER_FLAGS   "")
 
 # List of available OpenCASCADE modules.
-set (OpenCASCADE_MODULES FoundationClasses;ModelingData;ModelingAlgorithms;DETools)
+set (OpenCASCADE_MODULES FoundationClasses;ModelingData;ModelingAlgorithms;ApplicationFramework;DataExchange;DETools)
 
 # List of available OpenCASCADE libraries for each module
 set (OpenCASCADE_FoundationClasses_LIBRARIES TKernel;TKMath)
 set (OpenCASCADE_ModelingData_LIBRARIES TKG2d;TKG3d;TKGeomBase;TKBRep)
 set (OpenCASCADE_ModelingAlgorithms_LIBRARIES TKGeomAlgo;TKTopAlgo;TKPrim;TKBO;TKShHealing;TKBool;TKHLR;TKFillet;TKOffset;TKFeat;TKMesh;TKXMesh)
+set (OpenCASCADE_ApplicationFramework_LIBRARIES TKCDF;TKLCAF;TKCAF;TKBinL;TKXmlL;TKBin;TKXml;TKStdL;TKStd;TKTObj;TKBinTObj;TKXmlTObj;TKVCAF)
+set (OpenCASCADE_DataExchange_LIBRARIES TKDE;TKXSBase;TKDESTEP;TKXCAF;TKDECascade;TKBinXCAF;TKXmlXCAF;TKService;TKV3d)
 set (OpenCASCADE_DETools_LIBRARIES TKExpress)
 
 # List of available OpenCASCADE libraries.
-set (OpenCASCADE_LIBRARIES TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKBRep;TKGeomAlgo;TKTopAlgo;TKPrim;TKBO;TKShHealing;TKBool;TKHLR;TKFillet;TKOffset;TKFeat;TKMesh;TKXMesh;TKExpress)
+set (OpenCASCADE_LIBRARIES TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKBRep;TKGeomAlgo;TKTopAlgo;TKPrim;TKBO;TKShHealing;TKBool;TKHLR;TKFillet;TKOffset;TKFeat;TKMesh;TKXMesh;TKCDF;TKLCAF;TKCAF;TKBinL;TKXmlL;TKBin;TKXml;TKStdL;TKStd;TKTObj;TKBinTObj;TKXmlTObj;TKVCAF;TKDE;TKXSBase;TKDESTEP;TKXCAF;TKDECascade;TKBinXCAF;TKXmlXCAF;TKService;TKV3d;TKExpress)
 
 # OpenCASCADE global configuration options.
 set (OpenCASCADE_COMPILER          "gcc")

@@ -81,3 +81,42 @@ if(EXISTS "${_freecad_models_dir}/README.rst")
     add_test(NAME test_fcstd_freecad_models
              COMMAND test_fcstd_roundtrip "${_freecad_models_dir}")
 endif()
+
+# Round-trip tests for STEP files.
+# Reads each .stp/.step file found recursively using STEPControl_Reader,
+# extracts B-Rep shapes, and runs the full OCCTToON_Brep → ON_BrepToOCCT
+# round-trip with BRepCheck_Analyzer + area/volume validation.
+#
+# STEP support requires DataExchange toolkits from build_artifacts/occt.
+# The STEP_LINK_LIBS list mirrors OpenCASCADE_DataExchange_LIBRARIES plus
+# the ApplicationFramework persistence libs they depend on.
+set(_STEP_LINK_LIBS
+    TKDESTEP TKXSBase TKDE TKDECascade
+    TKXCAF
+    TKCDF TKLCAF TKCAF
+    TKBinL TKXmlL TKBin TKXml TKStdL TKStd
+    TKTObj TKBinTObj TKXmlTObj TKVCAF
+    TKBinXCAF TKXmlXCAF
+    TKService TKV3d
+    TKExpress
+)
+
+add_executable(test_step_roundtrip test_step_roundtrip.cpp)
+target_link_libraries(test_step_roundtrip PRIVATE open2open ${_STEP_LINK_LIBS})
+
+# Default STEP test directory: STEP_Models submodules (if checked out),
+# falling back to any .stp/.step files in OCCT-7_9_3/data.
+set(_step_models_dir "${CMAKE_SOURCE_DIR}/../STEP_Models")
+set(_step_fallback_dir "${CMAKE_SOURCE_DIR}/../OCCT-7_9_3/data")
+
+# Prefer checked-out submodule dirs
+if(EXISTS "${_step_models_dir}/Curta-Type-I-3x")
+    set(_step_dir "${_step_models_dir}")
+elseif(IS_DIRECTORY "${_step_models_dir}")
+    set(_step_dir "${_step_models_dir}")
+else()
+    set(_step_dir "${_step_fallback_dir}")
+endif()
+
+add_test(NAME test_step_roundtrip
+         COMMAND test_step_roundtrip "${_step_dir}")
