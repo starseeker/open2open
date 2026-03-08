@@ -715,14 +715,14 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
             if (!tv0.IsNull()) {
                 try {
-                    double vp = BRep_Tool::Parameter(tv0, edge);
-                    if (std::isfinite(vp)) edge_t0 = vp;
+                    double vertex_param = BRep_Tool::Parameter(tv0, edge);
+                    if (std::isfinite(vertex_param)) edge_t0 = vertex_param;
                 } catch (...) {}
             }
             if (!tv1.IsNull()) {
                 try {
-                    double vp = BRep_Tool::Parameter(tv1, edge);
-                    if (std::isfinite(vp)) edge_t1 = vp;
+                    double vertex_param = BRep_Tool::Parameter(tv1, edge);
+                    if (std::isfinite(vertex_param)) edge_t1 = vertex_param;
                 } catch (...) {}
             }
             // For REVERSED edges BRep_Tool::Parameter(tv0) = t_end > t_start.
@@ -757,14 +757,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // equal to the trimmed range without relying on reparameterization
             // via SetProxyCurveDomain (whose Domain() getter still returns the
             // wider NC domain, causing vertex mismatches in ON_BrepToOCCT).
+            // A small tolerance is used to allow for floating-point rounding
+            // when comparing the edge range against the BSpline domain bounds.
+            static constexpr double kEdgeParamTol = 1e-9;
             Handle(Geom_BSplineCurve) bc;
             if (!topoClosedEdge) {
                 bc = Handle(Geom_BSplineCurve)::DownCast(gc);
                 // Trim the BSpline if its natural domain is wider than the
                 // vertex parameter range.
                 if (!bc.IsNull() &&
-                    (fabs(edge_t0 - bc->FirstParameter()) > 1e-9 ||
-                     fabs(edge_t1 - bc->LastParameter())  > 1e-9)) {
+                    (fabs(edge_t0 - bc->FirstParameter()) > kEdgeParamTol ||
+                     fabs(edge_t1 - bc->LastParameter())  > kEdgeParamTol)) {
                     try {
                         Handle(Geom_TrimmedCurve) tc =
                             new Geom_TrimmedCurve(bc, edge_t0, edge_t1);
