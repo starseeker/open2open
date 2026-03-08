@@ -1118,6 +1118,158 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     brep.SetTolerancesBoxesAndFlags(/*bLazy=*/true);
 
     // ---------------------------------------------------------------------------
+    // Post-processing pass: repair seam trim m_iso corruption.
+    //
+    // The UV-gap snap occasionally sets CV[0] of a seam pcurve to the
+    // floating-point endpoint of the preceding trim (e.g. U=2.8e-9 instead
+    // of exactly U=0).  This tiny error is geometrically negligible but
+    // causes ON_Surface::IsIsoparametric() to return not_iso (the surface
+    // parameter tolerance is ~1e-15), making SetTrimIsoFlags set m_iso =
+    // not_iso for the seam trim and failing the ON_Brep::IsValid() check
+    // "seam trim m_iso is not N/E/W/S_iso".
+    //
+    // Fix: for any seam trim whose m_iso is still not_iso after
+    // SetTolerancesBoxesAndFlags, check whether all of the pcurve's CVs
+    // share a nearly-constant U or V value (within 1e-4 of the maximum
+    // CV extent in that direction).  If so, snap all CVs to the exact
+    // iso value (the mean of all CV coordinates in the constant direction)
+    // and call SetTrimIsoFlags again to update m_iso.
+    // ---------------------------------------------------------------------------
+    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+        ON_BrepTrim& trim = brep.m_T[ti];
+        if (trim.m_type != ON_BrepTrim::seam) continue;
+        if (trim.m_iso != ON_Surface::not_iso) continue;  // already iso
+
+        if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
+        ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
+        if (!nc || nc->CVCount() < 1 || nc->m_dim < 2) continue;
+
+        const int nCV = nc->CVCount();
+        const bool rat = nc->IsRational();
+
+        // Compute min/max U and V across all CVs
+        double uMin = 1e300, uMax = -1e300;
+        double vMin = 1e300, vMax = -1e300;
+        for (int p = 0; p < nCV; ++p) {
+            const double* cv = nc->CV(p);
+            double w = rat ? cv[nc->m_dim] : 1.0;
+            if (w == 0.0) w = 1.0;
+            double u = cv[0] / w, v = cv[1] / w;
+            if (u < uMin) uMin = u; if (u > uMax) uMax = u;
+            if (v < vMin) vMin = v; if (v > vMax) vMax = v;
+        }
+
+        const double kIsoTol = 1e-4;
+        bool snap_u = (uMax - uMin) <= kIsoTol;
+        bool snap_v = (vMax - vMin) <= kIsoTol;
+
+        if (!snap_u && !snap_v) continue;  // not iso-like — skip
+
+        // Snap to exact iso: snap to the nearest surface domain
+        // boundary (if the iso value is within 1e-4 of a boundary) or
+        // to the mean otherwise (interior iso curves).
+        {
+            const int li = trim.m_li;
+            const int fi = (li >= 0 && li < brep.m_L.Count())
+                               ? brep.m_L[li].m_fi : -1;
+            const ON_Surface* srf = (fi >= 0 && fi < brep.m_F.Count())
+                                        ? brep.m_F[fi].SurfaceOf() : nullptr;
+            double su0=0, su1=0, sv0=0, sv1=0;
+            if (srf) {
+                srf->GetDomain(0, &su0, &su1);
+                srf->GetDomain(1, &sv0, &sv1);
+            }
+
+            auto snap_to_boundary = [](double val, double d0, double d1,
+                                        double tol) -> double {
+                if (fabs(val - d0) <= tol) return d0;
+                if (fabs(val - d1) <= tol) return d1;
+                return val;  // interior
+            };
+
+            if (snap_u) {
+                double u_iso = 0.5 * (uMin + uMax);
+                if (srf) u_iso = snap_to_boundary(u_iso, su0, su1, 1e-4);
+                for (int p = 0; p < nCV; ++p) {
+                    double* cv = nc->CV(p);
+                    double w = rat ? cv[nc->m_dim] : 1.0;
+                    if (w == 0.0) w = 1.0;
+                    cv[0] = u_iso * w;
+                }
+            } else {
+                double v_iso = 0.5 * (vMin + vMax);
+                if (srf) v_iso = snap_to_boundary(v_iso, sv0, sv1, 1e-4);
+                for (int p = 0; p < nCV; ++p) {
+                    double* cv = nc->CV(p);
+                    double w = rat ? cv[nc->m_dim] : 1.0;
+                    if (w == 0.0) w = 1.0;
+                    cv[1] = v_iso * w;
+                }
+            }
+        }
+
+        // Recompute the iso flag and parameter bounding box for this trim.
+        brep.SetTrimIsoFlags(trim);
+        // Rebuild m_pbox from the (now-corrected) pcurve.
+        {
+            const ON_Curve* c2 = brep.m_C2[trim.m_c2i];
+            if (c2) {
+                trim.m_pbox = c2->BoundingBox();
+                trim.m_pbox.m_min.z = 0.0;
+                trim.m_pbox.m_max.z = 0.0;
+            }
+        }
+
+        // After snapping this seam pcurve to exact iso, close the
+        // junction gap by snapping the LAST CV of the preceding trim
+        // ONLY in the iso (constant) direction.  The non-constant
+        // direction is left untouched to avoid corrupting the
+        // preceding trim's geometry.
+        //
+        // Exception: skip if the preceding trim is itself a seam trim
+        // (it will be or has been handled by its own pass).
+        {
+            ON_3dPoint pt_start = trim.PointAtStart();
+            const int li2 = trim.m_li;
+            if (li2 >= 0 && li2 < brep.m_L.Count()) {
+                const ON_BrepLoop& lp2 = brep.m_L[li2];
+                for (int k = 0; k < lp2.m_ti.Count(); ++k) {
+                    if (lp2.m_ti[k] != ti) continue;
+                    int prev_k = (k + lp2.m_ti.Count() - 1)
+                                     % lp2.m_ti.Count();
+                    ON_BrepTrim& prev_t =
+                        brep.m_T[lp2.m_ti[prev_k]];
+                    // Don't modify another seam trim.
+                    if (prev_t.m_type == ON_BrepTrim::seam) break;
+                    int prev_c2i = prev_t.m_c2i;
+                    if (prev_c2i < 0
+                            || prev_c2i >= brep.m_C2.Count()) break;
+                    ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
+                        brep.m_C2[prev_c2i]);
+                    if (!pnc || pnc->CVCount() < 1) break;
+                    const int last = pnc->CVCount() - 1;
+                    double* cvL = pnc->CV(last);
+                    double wL = pnc->IsRational()
+                                    ? cvL[pnc->m_dim] : 1.0;
+                    if (wL == 0.0) wL = 1.0;
+                    // Only snap in the ISO (constant) coordinate.
+                    if (snap_u)
+                        cvL[0] = pt_start.x * wL;
+                    else
+                        cvL[1] = pt_start.y * wL;
+                    const ON_Curve* pc2 = brep.m_C2[prev_c2i];
+                    if (pc2) {
+                        prev_t.m_pbox = pc2->BoundingBox();
+                        prev_t.m_pbox.m_min.z = 0.0;
+                        prev_t.m_pbox.m_max.z = 0.0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Post-processing pass: fix edge tolerances so that ON_Brep::IsValid() passes
     // the "distance from trim endpoint to 3d edge" check.
     //
@@ -1236,6 +1388,21 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // noise).  Genuine kink failures have d ≈ -0.05 to -0.2.
         const double kSnapThreshold = -0.02;
         if (d0 >= kSnapThreshold && d1 >= kSnapThreshold) continue;
+
+        // If BOTH d0 and d1 are strongly negative the m_bRev3d flag itself
+        // is wrong (edge and pcurve go in fully opposite directions).  Flip
+        // m_bRev3d and recheck before trying the CV tangent snap.
+        // This fix is applied independently of the pcurve degree.
+        {
+            double ad0 = d0, ad1 = d1;
+            if (ad0 < -0.5 && ad1 < -0.5) {
+                trim.m_bRev3d = !trim.m_bRev3d;
+                auto [nd0, nd1] = compute_checks(trim);
+                if (nd0 >= kSnapThreshold && nd1 >= kSnapThreshold) continue;
+                // Still failing after flip — restore and fall through to snap.
+                trim.m_bRev3d = !trim.m_bRev3d;
+            }
+        }
 
         // Get the ON_NurbsCurve for this trim's pcurve
         if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
