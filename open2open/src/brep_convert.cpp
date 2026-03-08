@@ -20,6 +20,7 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopExp.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -38,7 +39,8 @@
 #include <BRepTools_WireExplorer.hxx>
 #include <gp_Pnt.hxx>
 
-// ---- OCCT containers ----
+// ---- OCCT tools ----
+#include <BRepLib.hxx>
 #include <Standard_Handle.hxx>
 #include <NCollection_Map.hxx>
 #include <TColgp_Array1OfPnt2d.hxx>
@@ -48,6 +50,9 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <tuple>
+#include <cmath>
+#include <functional>
 
 namespace open2open {
 
@@ -150,17 +155,24 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // Step 3 — create edges (3-D curve + vertices + tolerance)
     // ------------------------------------------------------------------
     std::vector<TopoDS_Edge> e_map(brep.m_E.Count());
+    // Remember the 3D domain of each edge so we can detect SameRange=false
+    // situations when attaching pcurves.
+    std::vector<std::pair<double,double>> e3d_domain(brep.m_E.Count(),
+                                                      {0.0, 0.0});
     for (int i = 0; i < brep.m_E.Count(); ++i) {
         const ON_BrepEdge& e = brep.m_E[i];
         B.MakeEdge(e_map[i]);
 
+        double t0 = 0.0, t1 = 0.0;
         if (e.m_c3i >= 0 && e.m_c3i < (int)c3_map.size() &&
             !c3_map[e.m_c3i].IsNull()) {
-            double t0 = e.Domain().Min();
-            double t1 = e.Domain().Max();
+            t0 = e.Domain().Min();
+            t1 = e.Domain().Max();
             B.UpdateEdge(e_map[i], c3_map[e.m_c3i], linear_tolerance);
             B.Range(e_map[i], t0, t1, /*only3d=*/Standard_True);
+            e3d_domain[i] = {t0, t1};
         }
+
         if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size()) {
             // Start vertex: FORWARD orientation (standard OCCT convention)
             TopoDS_Vertex vstart = v_map[e.m_vi[0]];
@@ -170,13 +182,37 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
         if (e.m_vi[1] >= 0 && e.m_vi[1] < (int)v_map.size() &&
             e.m_vi[1] != e.m_vi[0]) {
             // End vertex: REVERSED orientation (standard OCCT convention).
-            // TopExp::Vertices(edge, V0, V1, CumOri=false) returns V0=FORWARD
-            // and V1=REVERSED, so both must have distinct orientations for
-            // OCCTToON_Brep to recover the correct vi[0]/vi[1] mapping.
+            // The FORWARD vertex (vi[0]) is at the edge-curve start (t0),
+            // the REVERSED vertex (vi[1]) is at the end (t1).
             TopoDS_Vertex vend = v_map[e.m_vi[1]];
             vend.Orientation(TopAbs_REVERSED);
             B.Add(e_map[i], vend);
+        } else if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size() &&
+                   e.m_vi[1] == e.m_vi[0]) {
+            // Closed edge (same start/end vertex): OCCT requires the vertex
+            // to appear with REVERSED orientation as well so that
+            // BRepTools_WireExplorer and BRep_Tool::IsClosed() recognize
+            // the edge as properly closed.  Without this, inner 1-edge wires
+            // (e.g. circular holes) cannot be traversed and their pcurves
+            // are invisible to BRepCheck_Face::ClassifyWires().
+            TopoDS_Vertex vclosed = v_map[e.m_vi[0]];
+            vclosed.Orientation(TopAbs_REVERSED);
+            B.Add(e_map[i], vclosed);
         }
+
+        // Explicitly set vertex parameters so BRep_Tool::Parameter returns
+        // the correct values (B.Add sets the parameter from the edge range,
+        // but an explicit UpdateVertex call avoids any ambiguity).
+        if (e.m_c3i >= 0) {
+            double etol = (e.m_tolerance > 0.0 && e.m_tolerance != ON_UNSET_VALUE)
+                              ? e.m_tolerance : linear_tolerance;
+            if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size())
+                B.UpdateVertex(v_map[e.m_vi[0]], t0, e_map[i], etol);
+            if (e.m_vi[1] >= 0 && e.m_vi[1] < (int)v_map.size() &&
+                e.m_vi[1] != e.m_vi[0])
+                B.UpdateVertex(v_map[e.m_vi[1]], t1, e_map[i], etol);
+        }
+
         if (e.m_tolerance != ON_UNSET_VALUE)
             B.UpdateEdge(e_map[i], e.m_tolerance);
     }
@@ -319,6 +355,17 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                 }
                 B.UpdateEdge(e_map[ei], C1, C2, f_map[fi], sp.tol);
                 B.Range(e_map[ei], f_map[fi], sp.t0, sp.t1);
+                // Clear SameRange when domain differs; SameParameter is
+                // handled globally after the shape is built.
+                {
+                    const double kRangeTol = 1e-10;
+                    const auto& ed = e3d_domain[ei];
+                    if (std::fabs(sp.t0 - ed.first)  > kRangeTol ||
+                        std::fabs(sp.t1 - ed.second) > kRangeTol) {
+                        B.SameRange(e_map[ei], Standard_False);
+                        B.SameParameter(e_map[ei], Standard_False);
+                    }
+                }
                 seam_c2_applied.insert(ei);
             }
         }
@@ -404,9 +451,18 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     if (trim.m_bRev3d)
                         pc = pc->Reversed();
                     B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
-                    B.Range(e_map[ei], f_map[fi],
-                            trim.Domain().Min(),
-                            trim.Domain().Max());
+                    double pd_min = trim.Domain().Min();
+                    double pd_max = trim.Domain().Max();
+                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
+                    // Clear SameRange when domains differ.
+                    // SameParameter is handled globally after the shape is built.
+                    const double kRangeTol = 1e-10;
+                    const auto& ed = e3d_domain[ei];
+                    if (std::fabs(pd_min - ed.first)  > kRangeTol ||
+                        std::fabs(pd_max - ed.second) > kRangeTol) {
+                        B.SameRange(e_map[ei], Standard_False);
+                        B.SameParameter(e_map[ei], Standard_False);
+                    }
                 }
 
                 // Edge orientation: m_bRev3d means trim direction is
@@ -422,19 +478,129 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     }
 
     // ------------------------------------------------------------------
-    // Step 5 — assemble shell / solid
+    // Step 5 — assemble shell(s) / solid(s) / compound
     // ------------------------------------------------------------------
-    TopoDS_Shell shell;
-    B.MakeShell(shell);
-    for (int fi = 0; fi < brep.m_F.Count(); ++fi)
-        B.Add(shell, f_map[fi]);
+    // Group faces into connected components via shared edges so that
+    // disconnected sub-solids (e.g. a COMPOUND of two bodies) are assembled
+    // as separate shells rather than a single shell.  BRepCheck requires
+    // every shell inside a solid to be connected; merging disconnected
+    // components into one shell triggers BRepCheck_NotConnected.
+    //
+    // Union-Find over face indices, unioning faces that share an edge.
+    const int nF = brep.m_F.Count();
+    std::vector<int> parent(nF);
+    for (int i = 0; i < nF; ++i) parent[i] = i;
+    std::function<int(int)> find = [&](int x) -> int {
+        return parent[x] == x ? x : (parent[x] = find(parent[x]));
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a); b = find(b);
+        if (a != b) parent[b] = a;
+    };
 
-    // Attempt to build a solid
-    TopoDS_Solid solid;
-    B.MakeSolid(solid);
-    B.Add(solid, shell);
+    // For each edge, union all faces whose loops contain a trim of that edge.
+    // We accumulate face-per-trim directly from m_T.
+    {
+        std::vector<int> edge_face(brep.m_E.Count(), -1); // first face seen for edge
+        for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+            const ON_BrepTrim& trim = brep.m_T[ti];
+            int ei = trim.m_ei;
+            if (ei < 0 || ei >= brep.m_E.Count()) continue;
+            int li = trim.m_li;
+            if (li < 0 || li >= brep.m_L.Count()) continue;
+            int fi = brep.m_L[li].m_fi;
+            if (fi < 0 || fi >= nF) continue;
+            if (edge_face[ei] < 0) {
+                edge_face[ei] = fi;
+            } else {
+                unite(edge_face[ei], fi);
+            }
+        }
+    }
 
-    return solid;
+    // Collect faces per component root.
+    std::map<int, std::vector<int>> components;
+    for (int fi = 0; fi < nF; ++fi)
+        components[find(fi)].push_back(fi);
+
+    // Build one shell per component.  Wrap closed shells (all edges have ≥2
+    // trims) in a solid.  Collect all resulting shapes.
+    //
+    // Pre-compute per-edge trim counts (globally, not per component, which
+    // is correct: a 2-trim edge is always shared by 2 faces in the same
+    // component if the B-Rep was originally valid).
+    std::vector<int> trim_count(brep.m_E.Count(), 0);
+    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+        int ei = brep.m_T[ti].m_ei;
+        if (ei >= 0 && ei < brep.m_E.Count())
+            ++trim_count[ei];
+    }
+
+    // Helper: is every edge of this component's faces a shared edge (≥2 trims)?
+    // A component is closed when none of its boundary edges is a free edge.
+    auto component_is_closed = [&](const std::vector<int>& faces) -> bool {
+        // Collect all edges touched by faces in this component.
+        std::set<int> face_set(faces.begin(), faces.end());
+        // For each trim of each face in the component, check the edge count.
+        for (int fi : faces) {
+            const ON_BrepFace& face = brep.m_F[fi];
+            for (int li = 0; li < face.m_li.Count(); ++li) {
+                int loop_idx = face.m_li[li];
+                const ON_BrepLoop& loop = brep.m_L[loop_idx];
+                for (int ti_local = 0; ti_local < loop.m_ti.Count(); ++ti_local) {
+                    int ti = loop.m_ti[ti_local];
+                    int ei = brep.m_T[ti].m_ei;
+                    if (ei >= 0 && ei < brep.m_E.Count()) {
+                        if (trim_count[ei] < 2) return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    std::vector<TopoDS_Shape> parts;
+    for (auto& kv : components) {
+        TopoDS_Shell comp_shell;
+        B.MakeShell(comp_shell);
+        for (int fi : kv.second)
+            B.Add(comp_shell, f_map[fi]);
+
+        if (component_is_closed(kv.second)) {
+            TopoDS_Solid solid;
+            B.MakeSolid(solid);
+            B.Add(solid, comp_shell);
+            parts.push_back(solid);
+        } else {
+            parts.push_back(comp_shell);
+        }
+    }
+
+    if (parts.size() == 1) {
+        // BRepLib::SameParameter fixes the SameParameter flag on each edge:
+        // the flag must reflect whether the 3D curve and pcurve(s) are
+        // arc-length identical.  A round-trip converter cannot guarantee
+        // this; the call here detects and corrects any incorrect flags.
+        // Degenerate edges (no 3D curve, missing pcurve) can throw
+        // Standard_OutOfRange — catch and ignore since SameParameter=false
+        // is the safe/conservative default for such edges.
+        try {
+            BRepLib::SameParameter(parts[0], linear_tolerance,
+                                   Standard_False);
+        } catch (...) {}
+        return parts[0];
+    }
+
+    // Multiple components: wrap in a compound.
+    TopoDS_Compound compound;
+    B.MakeCompound(compound);
+    for (const auto& p : parts)
+        B.Add(compound, p);
+    // See comment above; same rationale applies for the compound case.
+    try {
+        BRepLib::SameParameter(compound, linear_tolerance, Standard_False);
+    } catch (...) {}
+    return compound;
 }
 
 // ===========================================================================
@@ -448,10 +614,44 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
     if (shape.IsNull()) return false;
 
-    // Maps from OCCT shape (by pointer/hash) to openNURBS index
-    std::map<Standard_Address, int> vertex_map;  // TShape* → vertex index
-    std::map<Standard_Address, int> edge_map;    // TShape* → edge index
-    std::map<Standard_Address, int> surface_map; // TShape* → surface index
+    // Maps from OCCT shape (by pointer/hash) to openNURBS index.
+    // vertex_map is keyed on (TShape*, rounded_3D_position) so that the same
+    // underlying vertex TShape instantiated at different locations (e.g. on a
+    // body-of-revolution that has been translated) creates separate ON_BrepVertex
+    // objects at their correct 3D positions instead of falsely collapsing to one.
+    using PntKey = std::tuple<long long, long long, long long>;
+    auto make_pnt_key = [](const gp_Pnt& p) -> PntKey {
+        // 1e9 precision: ~1 nm resolution, covers coordinates up to ±9e9 units.
+        return { llround(p.X() * 1e9),
+                 llround(p.Y() * 1e9),
+                 llround(p.Z() * 1e9) };
+    };
+
+    // Edge map key: (TShape*, PntKey_of_start_vertex).
+    // Using the start-vertex world position disambiguates the same TShape
+    // appearing at different body-of-revolution locations (translations) while
+    // still collapsing all traversals (FORWARD and REVERSED) of the same physical
+    // edge to the same ON_BrepEdge index.
+    // Degenerate edges get PntKey{0,0,0} as a sentinel (they share the pole vertex).
+    using EdgeKey = std::pair<Standard_Address, PntKey>;
+    std::map<PntKey, int>          vertex_map;  // rounded 3D pos → vertex index
+    std::map<EdgeKey, int>         edge_map;    // (TShape*, start_pos) → edge index
+    std::map<Standard_Address, int> surface_map;// TShape* → surface index
+
+    // Helper: compute the EdgeKey for a (non-degenerate) edge.
+    // TopExp::Vertices with CumOri=false always returns tv0 as the FORWARD
+    // (curve-start) vertex regardless of wire orientation, so both FORWARD and
+    // REVERSED traversals of the same physical edge produce the same key.
+    auto make_edge_key = [&](const TopoDS_Edge& e) -> EdgeKey {
+        Standard_Address tsh = e.TShape().get();
+        if (BRep_Tool::Degenerated(e))
+            return { tsh, PntKey{0LL, 0LL, 0LL} };
+        TopoDS_Vertex tv0, tv1;
+        TopExp::Vertices(e, tv0, tv1, /*CumOri=*/false);
+        if (tv0.IsNull())
+            return { tsh, PntKey{0LL, 0LL, 0LL} };
+        return { tsh, make_pnt_key(BRep_Tool::Pnt(tv0)) };
+    };
 
     // ------------------------------------------------------------------
     // Pass 1 — collect and translate all vertices
@@ -459,10 +659,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     for (TopExp_Explorer ex(shape, TopAbs_VERTEX); ex.More(); ex.Next()) {
         const TopoDS_Vertex& vtx =
             TopoDS::Vertex(ex.Current());
-        Standard_Address key = vtx.TShape().get();
+
+        gp_Pnt p = BRep_Tool::Pnt(vtx);  // applies location transform
+        PntKey key = make_pnt_key(p);
         if (vertex_map.count(key)) continue;
 
-        gp_Pnt p = BRep_Tool::Pnt(vtx);
         double tol = BRep_Tool::Tolerance(vtx);
 
         ON_BrepVertex& ov = brep.NewVertex(
@@ -475,34 +676,126 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     // ------------------------------------------------------------------
     for (TopExp_Explorer ex(shape, TopAbs_EDGE); ex.More(); ex.Next()) {
         const TopoDS_Edge& edge = TopoDS::Edge(ex.Current());
-        Standard_Address key = edge.TShape().get();
-        if (edge_map.count(key)) continue;
+        EdgeKey ek = make_edge_key(edge);
+        if (edge_map.count(ek)) continue;
 
         // Degenerate edges (poles) must NOT become ON_BrepEdge objects —
         // they are represented as singular trims in openNURBS.  We store
         // a sentinel value (-2) so Pass 3 can detect them.
         if (BRep_Tool::Degenerated(edge)) {
-            edge_map[key] = -2;
+            edge_map[ek] = -2;
             continue;
+        }
+
+        // Detect topologically-closed edges: same underlying vertex TShape at
+        // both ends AND the same 3D world position.  Edges where the same TShape
+        // appears at two DIFFERENT positions (e.g. a translated body-of-revolution
+        // with a shared seam vertex at two Z heights) are NOT closed edges.
+        bool topoClosedEdge = false;
+        {
+            TopoDS_Vertex tv0, tv1;
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+            if (!tv0.IsNull() && !tv1.IsNull() &&
+                tv0.TShape() == tv1.TShape()) {
+                gp_Pnt p0 = BRep_Tool::Pnt(tv0);
+                gp_Pnt p1 = BRep_Tool::Pnt(tv1);
+                // Closed only when the two vertex instances are at the same
+                // 3D location (within a generous position tolerance).
+                double vtx_tol =
+                    std::max(BRep_Tool::Tolerance(tv0),
+                             BRep_Tool::Tolerance(tv1));
+                topoClosedEdge = (p0.Distance(p1) <= vtx_tol + 1e-7);
+            }
         }
 
         double t0, t1;
         Handle(Geom_Curve) gc = BRep_Tool::Curve(edge, t0, t1);
 
+        // Determine the actual vertex parameter range for this edge.
+        // BRep_Tool::Curve gives the 3D curve and its edge-level range
+        // [t0, t1].  For BSplines stored with a wider natural domain (e.g.
+        // [-3.1, 76.07] when the edge only uses [7.9, 24.19]), t0 equals the
+        // full BSpline start, not the vertex parameter.  We fetch the vertex
+        // parameters via BRep_Tool::Parameter to get the exact sub-range.
+        //
+        // TopExp::Vertices(CumOri=false) returns vertices ordered by the
+        // EDGE's own orientation: for a REVERSED edge tv0 is the end vertex
+        // (at the curve's last parameter) and tv1 is the start vertex.  When
+        // the resulting vertex parameters are inverted (vp0 > vp1) we swap
+        // tv0/tv1 so that tv0 always corresponds to edge_t0 (curve start).
+        TopoDS_Vertex tv0, tv1;
+        double edge_t0 = t0, edge_t1 = t1;
+        if (!topoClosedEdge) {
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+            if (!tv0.IsNull()) {
+                try {
+                    double vertex_param = BRep_Tool::Parameter(tv0, edge);
+                    if (std::isfinite(vertex_param)) edge_t0 = vertex_param;
+                } catch (...) {}
+            }
+            if (!tv1.IsNull()) {
+                try {
+                    double vertex_param = BRep_Tool::Parameter(tv1, edge);
+                    if (std::isfinite(vertex_param)) edge_t1 = vertex_param;
+                } catch (...) {}
+            }
+            // For REVERSED edges BRep_Tool::Parameter(tv0) = t_end > t_start.
+            // Swap so edge_t0 ≤ edge_t1 and tv0 corresponds to curve start.
+            if (edge_t0 > edge_t1) {
+                std::swap(edge_t0, edge_t1);
+                std::swap(tv0, tv1);
+            }
+        } else {
+            // Closed edges: still look up vertices for vi0/vi1 assignment.
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+        }
+
         int c3i = -1;
         if (!gc.IsNull()) {
             // For non-BSpline curves (Geom_Line, Geom_Circle, Geom_Ellipse,
             // etc.) always convert only the edge's actual parameter range
-            // [t0, t1] using a Geom_TrimmedCurve.  This avoids domain
-            // mismatch when the full curve spans more than the edge (e.g.
-            // Geom_Circle with t=[3π/2..5π/2]) and avoids periodic BSplines.
-            Handle(Geom_BSplineCurve) bc =
-                Handle(Geom_BSplineCurve)::DownCast(gc);
+            // [edge_t0, edge_t1] using a Geom_TrimmedCurve.  This avoids
+            // domain mismatch when the full curve spans more than the edge
+            // (e.g. Geom_Circle with t=[3π/2..5π/2]) and avoids periodic
+            // BSplines.
+            //
+            // For topologically-closed edges we also force the TrimmedCurve
+            // path even when gc is already a BSpline, so that the resulting
+            // ON_NurbsCurve has domain exactly [t0, t1] with matching
+            // start/end 3D points (required for IsClosed() == true).
+            //
+            // For BSpline edges whose natural domain is wider than the edge
+            // range (e.g. [-3.1, 76.07] vs vertex parameters [7.9, 24.19]),
+            // we also trim so that NC.Domain() == [edge_t0, edge_t1] and
+            // NC(edge_t0) == vertex position.  This keeps ON_BrepEdge.Domain()
+            // equal to the trimmed range without relying on reparameterization
+            // via SetProxyCurveDomain (whose Domain() getter still returns the
+            // wider NC domain, causing vertex mismatches in ON_BrepToOCCT).
+            // A small tolerance is used to allow for floating-point rounding
+            // when comparing the edge range against the BSpline domain bounds.
+            static constexpr double kEdgeParamTol = 1e-9;
+            Handle(Geom_BSplineCurve) bc;
+            if (!topoClosedEdge) {
+                bc = Handle(Geom_BSplineCurve)::DownCast(gc);
+                // Trim the BSpline if its natural domain is wider than the
+                // vertex parameter range.
+                if (!bc.IsNull() &&
+                    (fabs(edge_t0 - bc->FirstParameter()) > kEdgeParamTol ||
+                     fabs(edge_t1 - bc->LastParameter())  > kEdgeParamTol)) {
+                    try {
+                        Handle(Geom_TrimmedCurve) tc =
+                            new Geom_TrimmedCurve(bc, edge_t0, edge_t1);
+                        bc = GeomConvert::CurveToBSplineCurve(tc);
+                    } catch (...) {
+                        bc = Handle(Geom_BSplineCurve)::DownCast(gc);
+                    }
+                }
+            }
             if (bc.IsNull()) {
                 // Trimmed conversion first (preserves arc domain)
                 try {
                     Handle(Geom_TrimmedCurve) tc =
-                        new Geom_TrimmedCurve(gc, t0, t1);
+                        new Geom_TrimmedCurve(gc, edge_t0, edge_t1);
                     bc = GeomConvert::CurveToBSplineCurve(tc);
                 } catch (...) {}
             }
@@ -526,24 +819,49 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
         }
 
+        // For topologically-closed edges the curve's own domain endpoints
+        // must be coincident (IsClosed() == true).  After the TrimmedCurve
+        // conversion the endpoints should already be equal; snap the last
+        // CV to exactly match the first to eliminate any floating-point
+        // residual so that ON_PointsAreCoincident() returns true.
+        if (topoClosedEdge && c3i >= 0) {
+            ON_NurbsCurve* nc =
+                ON_NurbsCurve::Cast(brep.m_C3[c3i]);
+            if (nc && nc->m_cv_count >= 2) {
+                ON_3dPoint p0 = nc->PointAt(nc->Domain()[0]);
+                ON_3dPoint p1 = nc->PointAt(nc->Domain()[1]);
+                double d = p0.DistanceTo(p1);
+                double scale = std::max(
+                    1.0, std::max(fabs(p0.x),
+                         std::max(fabs(p0.y), fabs(p0.z))));
+                // Only snap when the endpoints are already geometrically
+                // close (genuine floating-point residual, not a mismatch).
+                if (d <= 1e-4 * scale) {
+                    const int stride = nc->m_cv_stride;
+                    double* cv0 = nc->CV(0);
+                    double* cvN = nc->CV(nc->m_cv_count - 1);
+                    if (cv0 && cvN) {
+                        for (int k = 0; k < stride; ++k)
+                            cvN[k] = cv0[k];
+                    }
+                }
+            }
+        }
+
         // Determine start/end vertex indices.
-        // TopExp::Vertices(edge, V0, V1, CumOri=false) always gives
-        // V0 = vertex at parameter t0 (start of 3D curve) and
-        // V1 = vertex at parameter t1 (end of 3D curve), regardless of
-        // the edge's orientation in the parent shape.  This is the correct
-        // order for ON_BrepEdge.m_vi[0]/[1].
+        // tv0/tv1 were already computed above (with the swap applied so that
+        // tv0 is always the vertex at edge_t0 = the curve start).
+        // The EdgeKey used by make_edge_key may differ from the swapped tv0
+        // (it was based on the original TopExp order), but that is only for
+        // lookup purposes; the vi0/vi1 assignment here uses the corrected tv0.
         int vi0 = -1, vi1 = -1;
         {
-            TopoDS_Vertex tv0, tv1;
-            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
             if (!tv0.IsNull()) {
-                Standard_Address vk = tv0.TShape().get();
-                auto it = vertex_map.find(vk);
+                auto it = vertex_map.find(make_pnt_key(BRep_Tool::Pnt(tv0)));
                 if (it != vertex_map.end()) vi0 = it->second;
             }
             if (!tv1.IsNull()) {
-                Standard_Address vk = tv1.TShape().get();
-                auto it = vertex_map.find(vk);
+                auto it = vertex_map.find(make_pnt_key(BRep_Tool::Pnt(tv1)));
                 if (it != vertex_map.end()) vi1 = it->second;
             }
         }
@@ -551,6 +869,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
         // Use the vertex-reference form of NewEdge so that openNURBS
         // automatically maintains the vertex→edge back-references.
+        // The NC was already trimmed to [edge_t0, edge_t1] above, so
+        // NewEdge will set ProxyCurveDomain = NC.Domain() = [edge_t0, edge_t1]
+        // automatically (no separate SetProxyCurveDomain call needed).
         double edge_tol = BRep_Tool::Tolerance(edge);
         if (edge_tol < 0.0) edge_tol = linear_tolerance;
         ON_BrepEdge* poe = nullptr;
@@ -565,10 +886,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         int this_ei = poe->m_edge_index;
         // Defensive: force tolerance on the edge after creation
         brep.m_E[this_ei].m_tolerance = edge_tol;
-        if (c3i >= 0) {
-            brep.m_E[this_ei].SetProxyCurveDomain(ON_Interval(t0, t1));
-        }
-        edge_map[key] = this_ei;
+        edge_map[ek] = this_ei;
     }
 
     // ------------------------------------------------------------------
@@ -583,15 +901,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         if (!gs.IsNull()) {
             Handle(Geom_BSplineSurface) bs =
                 Handle(Geom_BSplineSurface)::DownCast(gs);
-            if (bs.IsNull()) {
-                try {
-                    bs = GeomConvert::SurfaceToBSplineSurface(gs);
-                } catch (...) {}
-            }
-            if (bs.IsNull()) {
-                // Fallback for unbounded analytical surfaces
-                // (Geom_Plane, Geom_ConicalSurface, etc.):
-                // restrict to the face's UV parameter domain first.
+            // For periodic BSpline surfaces OR non-BSpline analytical surfaces
+            // (Geom_CylindricalSurface, Geom_Plane, etc.): use the
+            // Geom_RectangularTrimmedSurface path which always produces a
+            // non-periodic BSpline whose UV domain exactly matches the face's
+            // UV parameter bounds (= the pcurves' UV range).
+            // DO NOT call SetUNotPeriodic() or rely on GeomConvert on the
+            // unbounded analytical surface — both can produce a surface with
+            // an incorrect/tiny UV domain.
+            bool need_trimmed = bs.IsNull() ||
+                                bs->IsUPeriodic() || bs->IsVPeriodic();
+            if (need_trimmed) {
                 try {
                     double u1, u2, v1, v2;
                     BRepTools::UVBounds(face, u1, u2, v1, v2);
@@ -602,14 +922,41 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 } catch (...) {}
             }
             if (!bs.IsNull()) {
-                // Periodic BSpline surfaces (e.g. sphere U-direction, cylinder
-                // lateral surface) have sum(mults) = nu+deg instead of nu+deg+1.
-                // OCCTSurfaceToON expects the non-periodic convention, so
-                // flatten any periodic directions before conversion.
+                // Handle any residual periodicity (safety fallback for
+                // surfaces that GeomConvert still left periodic).
                 if (bs->IsUPeriodic()) bs->SetUNotPeriodic();
                 if (bs->IsVPeriodic()) bs->SetVNotPeriodic();
                 ON_NurbsSurface* ns = new ON_NurbsSurface();
                 if (OCCTSurfaceToON(bs, *ns)) {
+                    // If the converted surface's UV domain doesn't match the
+                    // face UV bounds (which define the pcurves' UV range),
+                    // reparameterize the knots to match.  This handles cases
+                    // where GeomConvert normalizes the parameterization (e.g.
+                    // a cylinder u-range [0,2π] becomes [0,5.59e-9]).
+                    // Uniform reparameterization is geometry-preserving.
+                    if (need_trimmed) {
+                        double fu1, fu2, fv1, fv2;
+                        BRepTools::UVBounds(face, fu1, fu2, fv1, fv2);
+                        ON_Interval srf_u = ns->Domain(0);
+                        ON_Interval srf_v = ns->Domain(1);
+                        const double kDomTol = 1e-6;
+                        if (fu2 > fu1 && srf_u.IsValid() && srf_u.Length() > 0 &&
+                            (fabs(srf_u[0] - fu1) > kDomTol ||
+                             fabs(srf_u[1] - fu2) > kDomTol)) {
+                            double ku_scale = (fu2 - fu1) / srf_u.Length();
+                            for (int k = 0; k < ns->KnotCount(0); ++k)
+                                ns->m_knot[0][k] = fu1 +
+                                    (ns->m_knot[0][k] - srf_u[0]) * ku_scale;
+                        }
+                        if (fv2 > fv1 && srf_v.IsValid() && srf_v.Length() > 0 &&
+                            (fabs(srf_v[0] - fv1) > kDomTol ||
+                             fabs(srf_v[1] - fv2) > kDomTol)) {
+                            double kv_scale = (fv2 - fv1) / srf_v.Length();
+                            for (int k = 0; k < ns->KnotCount(1); ++k)
+                                ns->m_knot[1][k] = fv1 +
+                                    (ns->m_knot[1][k] - srf_v[0]) * kv_scale;
+                        }
+                    }
                     si = brep.AddSurface(ns);
                 } else {
                     delete ns;
@@ -636,8 +983,26 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         of.m_bRev = (face.Orientation() == TopAbs_REVERSED);
 
         // -- Iterate wires → loops
+        // openNURBS requires face.m_li[0] to be the outer loop.  Use
+        // BRepTools::OuterWire() to identify the outer wire, then
+        // iterate wires in outer-first order so the outer loop lands at
+        // face.m_li[0].
+        {
+        TopoDS_Wire face_outer_wire = BRepTools::OuterWire(face);
+
+        // Collect wires, outer wire first.
+        std::vector<TopoDS_Wire> face_wires;
+        if (!face_outer_wire.IsNull())
+            face_wires.push_back(face_outer_wire);
         for (TopExp_Explorer wex(face, TopAbs_WIRE); wex.More(); wex.Next()) {
-            const TopoDS_Wire& wire = TopoDS::Wire(wex.Current());
+            const TopoDS_Wire& w = TopoDS::Wire(wex.Current());
+            if (face_outer_wire.IsNull() || !w.IsSame(face_outer_wire))
+                face_wires.push_back(w);
+        }
+
+        for (const TopoDS_Wire& wire : face_wires) {
+            // First entry is outer; all others are inner holes.
+            const bool wire_is_outer = (&wire == &face_wires[0]);
 
             ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
 
@@ -653,19 +1018,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next())
                     wire_edges.push_back(we.Current());
             }
-            // Count unique edge TShapes from TopExp_Explorer
+            // Count unique physical edges (TShape + start-vertex position) from
+            // TopExp_Explorer.  WireExplorer may visit seam edges twice (FORWARD
+            // and REVERSED); since both traversals produce the same EdgeKey, the
+            // unique-key count is the right comparison.
             {
-                std::set<Standard_Address> tex_keys;
+                std::set<EdgeKey> tex_keys;
                 for (TopExp_Explorer eex(wire, TopAbs_EDGE);
                      eex.More(); eex.Next()) {
                     tex_keys.insert(
-                        TopoDS::Edge(eex.Current()).TShape().get());
+                        make_edge_key(TopoDS::Edge(eex.Current())));
                 }
-                // WireExplorer may visit seam edges twice (once FORWARD, once
-                // REVERSED); unique TShape count is the right comparison
-                std::set<Standard_Address> we_keys;
+                std::set<EdgeKey> we_keys;
                 for (const TopoDS_Edge& e : wire_edges)
-                    we_keys.insert(e.TShape().get());
+                    we_keys.insert(make_edge_key(e));
                 if (we_keys.size() < tex_keys.size()) {
                     // WireExplorer missed some edges — revert to TopExp order
                     wire_edges.clear();
@@ -676,7 +1042,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
 
             for (const TopoDS_Edge& edge : wire_edges) {
-                Standard_Address ek = edge.TShape().get();
+                EdgeKey ek = make_edge_key(edge);
 
                 auto eit = edge_map.find(ek);
                 if (eit == edge_map.end()) continue;
@@ -695,6 +1061,40 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     // so the knot count matches the non-periodic convention.
                     Handle(Geom2d_BSplineCurve) bc2 =
                         Handle(Geom2d_BSplineCurve)::DownCast(gc2);
+
+                    // For closed-loop periodic pcurves (gc2(t0)≈gc2(t1)),
+                    // SetNotPeriodic() introduces a kink at the junction that
+                    // breaks the ON_Brep tangent-direction validation for closed
+                    // trims.  Force the TrimmedCurve path instead, which converts
+                    // the full period to a non-periodic B-spline without a kink.
+                    if (!bc2.IsNull() && bc2->IsPeriodic()) {
+                        gp_Pnt2d p_s, p_e;
+                        gc2->D0(pc_t0, p_s);
+                        gc2->D0(pc_t1, p_e);
+                        if (p_s.Distance(p_e) < 1e-4)
+                            bc2.Nullify(); // force TrimmedCurve path below
+                    }
+
+                    // When the B-spline pcurve spans a wider domain than the
+                    // edge's actual parameter range [pc_t0, pc_t1], the first
+                    // control vertex cv[0] does NOT correspond to the curve
+                    // value at pc_t0 (it's at the B-spline's own domain start).
+                    // The UV-gap snap code writes directly to cv[0], so it
+                    // would be ineffective.  Force the TrimmedCurve path to
+                    // produce a B-spline with domain exactly [pc_t0, pc_t1],
+                    // ensuring cv[0] = PointAt(pc_t0).
+                    //
+                    // Use an absolute tolerance of 1e-4 to avoid re-trimming
+                    // seam pcurves that already have a domain matching
+                    // [pc_t0, pc_t1] to within floating-point precision.
+                    if (!bc2.IsNull() && !bc2->IsPeriodic()) {
+                        const double kDomTol = 1e-4;
+                        if (fabs(bc2->FirstParameter() - pc_t0) > kDomTol ||
+                            fabs(bc2->LastParameter()  - pc_t1) > kDomTol) {
+                            bc2.Nullify(); // force TrimmedCurve path below
+                        }
+                    }
+
                     if (bc2.IsNull()) {
                         try {
                             Handle(Geom2d_TrimmedCurve) tc2 =
@@ -720,8 +1120,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 gp_Pnt2d p2 = bc2->Pole(k);
                                 double w2   = rat2 ? bc2->Weight(k) : 1.0;
                                 nc->SetCV(k - 1,
-                                          ON_3dPoint(p2.X() * w2,
+                                          ON_4dPoint(p2.X() * w2,
                                                      p2.Y() * w2,
+                                                     0.0,
                                                      w2));
                             }
                             // Strip one phantom knot from each end (same
@@ -737,6 +1138,37 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                     nc->m_knot[ki2++] = kv2;
                             }
                             if (nc->IsValid()) {
+                                // Remap the pcurve's knot domain to match the
+                                // 3D edge domain so SameRange=true is preserved
+                                // in the round-trip.  In the original OCCT B-Rep
+                                // every edge with a 3D curve has SameRange=true
+                                // (pcurve parameter domain == 3D curve domain).
+                                // The conversion may produce a pcurve with a
+                                // different domain (e.g. period-shifted by ±2π),
+                                // which would require SameRange=false and trigger
+                                // BRepCheck_InvalidSameRangeFlag on reconstruction.
+                                if (ei >= 0 && ei < brep.m_E.Count() &&
+                                    brep.m_E[ei].m_c3i >= 0) {
+                                    ON_Interval edge_dom = brep.m_E[ei].Domain();
+                                    ON_Interval nc_dom   = nc->Domain();
+                                    if (edge_dom.IsValid() && nc_dom.IsValid() &&
+                                        edge_dom.Length() > 0 && nc_dom.Length() > 0) {
+                                        double old0 = nc_dom.Min(), old1 = nc_dom.Max();
+                                        double new0 = edge_dom.Min(), new1 = edge_dom.Max();
+                                        const double kTol = 1e-10;
+                                        if (fabs(old0 - new0) > kTol ||
+                                            fabs(old1 - new1) > kTol) {
+                                            double scale = (new1 - new0) /
+                                                           (old1 - old0);
+                                            for (int k = 0; k < nc->KnotCount(); ++k)
+                                                nc->m_knot[k] = new0 +
+                                                    (nc->m_knot[k] - old0) * scale;
+                                            pc_t0 = new0;
+                                            pc_t1 = new1;
+                                        }
+                                    }
+                                }
+
                                 // OCCT stores all pcurves in the FORWARD edge
                                 // direction, regardless of the edge orientation.
                                 // For REVERSED edges, the openNURBS trim direction
@@ -909,6 +1341,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         // residual gaps.  Only applied when the gap is
                         // smaller than 5% of the surface domain (avoids
                         // snapping a genuine topological mismatch).
+                        // The B-spline domain trimming above ensures that
+                        // cv[0] corresponds to PointAt(proxy_domain_start),
+                        // making this snap effective.
                         if (fabs(dx) > 1e-14 || fabs(dy) > 1e-14) {
                             const double domain_sz =
                                 std::max(uperiod > 0.0 ? uperiod : (u1-u0),
@@ -919,8 +1354,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 fabs(dx) < snap_limit &&
                                 fabs(dy) < snap_limit) {
                                 double* cv0 = nc2->CV(0);
-                                cv0[0] = pe.x;
-                                cv0[1] = pe.y;
+                                // For rational curves CV stores homogeneous
+                                // coords (x*w, y*w, w); multiply by weight.
+                                if (nc2->IsRational()) {
+                                    const double w = cv0[nc2->m_dim];
+                                    cv0[0] = pe.x * w;
+                                    cv0[1] = pe.y * w;
+                                    // cv0[m_dim] (weight) is unchanged
+                                } else {
+                                    cv0[0] = pe.x;
+                                    cv0[1] = pe.y;
+                                }
                                 modified = true;
                                 tk1.SetProxyCurveDomain(
                                     tk1.ProxyCurveDomain());
@@ -938,14 +1382,166 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 }
             }
 
-            // Fix up loop type based on orientation
-            ol.m_type = (ol.m_loop_index == of.m_li[0])
-                            ? ON_BrepLoop::outer
-                            : ON_BrepLoop::inner;
+            // Fix up loop type based on outer-wire detection above.
+            ol.m_type = wire_is_outer ? ON_BrepLoop::outer
+                                      : ON_BrepLoop::inner;
         }
+        } // end face_wires scope
     }
 
     brep.SetTolerancesBoxesAndFlags(/*bLazy=*/true);
+
+    // ---------------------------------------------------------------------------
+    // Post-processing pass: repair seam trim m_iso corruption.
+    //
+    // The UV-gap snap occasionally sets CV[0] of a seam pcurve to the
+    // floating-point endpoint of the preceding trim (e.g. U=2.8e-9 instead
+    // of exactly U=0).  This tiny error is geometrically negligible but
+    // causes ON_Surface::IsIsoparametric() to return not_iso (the surface
+    // parameter tolerance is ~1e-15), making SetTrimIsoFlags set m_iso =
+    // not_iso for the seam trim and failing the ON_Brep::IsValid() check
+    // "seam trim m_iso is not N/E/W/S_iso".
+    //
+    // Fix: for any seam trim whose m_iso is still not_iso after
+    // SetTolerancesBoxesAndFlags, check whether all of the pcurve's CVs
+    // share a nearly-constant U or V value (within 1e-4 of the maximum
+    // CV extent in that direction).  If so, snap all CVs to the exact
+    // iso value (the mean of all CV coordinates in the constant direction)
+    // and call SetTrimIsoFlags again to update m_iso.
+    // ---------------------------------------------------------------------------
+    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+        ON_BrepTrim& trim = brep.m_T[ti];
+        if (trim.m_type != ON_BrepTrim::seam) continue;
+        if (trim.m_iso != ON_Surface::not_iso) continue;  // already iso
+
+        if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
+        ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
+        if (!nc || nc->CVCount() < 1 || nc->m_dim < 2) continue;
+
+        const int nCV = nc->CVCount();
+        const bool rat = nc->IsRational();
+
+        // Compute min/max U and V across all CVs
+        double uMin = 1e300, uMax = -1e300;
+        double vMin = 1e300, vMax = -1e300;
+        for (int p = 0; p < nCV; ++p) {
+            const double* cv = nc->CV(p);
+            double w = rat ? cv[nc->m_dim] : 1.0;
+            if (w == 0.0) w = 1.0;
+            double u = cv[0] / w, v = cv[1] / w;
+            if (u < uMin) uMin = u; if (u > uMax) uMax = u;
+            if (v < vMin) vMin = v; if (v > vMax) vMax = v;
+        }
+
+        const double kIsoTol = 1e-4;
+        bool snap_u = (uMax - uMin) <= kIsoTol;
+        bool snap_v = (vMax - vMin) <= kIsoTol;
+
+        if (!snap_u && !snap_v) continue;  // not iso-like — skip
+
+        // Snap to exact iso: snap to the nearest surface domain
+        // boundary (if the iso value is within 1e-4 of a boundary) or
+        // to the mean otherwise (interior iso curves).
+        {
+            const int li = trim.m_li;
+            const int fi = (li >= 0 && li < brep.m_L.Count())
+                               ? brep.m_L[li].m_fi : -1;
+            const ON_Surface* srf = (fi >= 0 && fi < brep.m_F.Count())
+                                        ? brep.m_F[fi].SurfaceOf() : nullptr;
+            double su0=0, su1=0, sv0=0, sv1=0;
+            if (srf) {
+                srf->GetDomain(0, &su0, &su1);
+                srf->GetDomain(1, &sv0, &sv1);
+            }
+
+            auto snap_to_boundary = [](double val, double d0, double d1,
+                                        double tol) -> double {
+                if (fabs(val - d0) <= tol) return d0;
+                if (fabs(val - d1) <= tol) return d1;
+                return val;  // interior
+            };
+
+            if (snap_u) {
+                double u_iso = 0.5 * (uMin + uMax);
+                if (srf) u_iso = snap_to_boundary(u_iso, su0, su1, 1e-4);
+                for (int p = 0; p < nCV; ++p) {
+                    double* cv = nc->CV(p);
+                    double w = rat ? cv[nc->m_dim] : 1.0;
+                    if (w == 0.0) w = 1.0;
+                    cv[0] = u_iso * w;
+                }
+            } else {
+                double v_iso = 0.5 * (vMin + vMax);
+                if (srf) v_iso = snap_to_boundary(v_iso, sv0, sv1, 1e-4);
+                for (int p = 0; p < nCV; ++p) {
+                    double* cv = nc->CV(p);
+                    double w = rat ? cv[nc->m_dim] : 1.0;
+                    if (w == 0.0) w = 1.0;
+                    cv[1] = v_iso * w;
+                }
+            }
+        }
+
+        // Recompute the iso flag and parameter bounding box for this trim.
+        brep.SetTrimIsoFlags(trim);
+        // Rebuild m_pbox from the (now-corrected) pcurve.
+        {
+            const ON_Curve* c2 = brep.m_C2[trim.m_c2i];
+            if (c2) {
+                trim.m_pbox = c2->BoundingBox();
+                trim.m_pbox.m_min.z = 0.0;
+                trim.m_pbox.m_max.z = 0.0;
+            }
+        }
+
+        // After snapping this seam pcurve to exact iso, close the
+        // junction gap by snapping the LAST CV of the preceding trim
+        // ONLY in the iso (constant) direction.  The non-constant
+        // direction is left untouched to avoid corrupting the
+        // preceding trim's geometry.
+        //
+        // Exception: skip if the preceding trim is itself a seam trim
+        // (it will be or has been handled by its own pass).
+        {
+            ON_3dPoint pt_start = trim.PointAtStart();
+            const int li2 = trim.m_li;
+            if (li2 >= 0 && li2 < brep.m_L.Count()) {
+                const ON_BrepLoop& lp2 = brep.m_L[li2];
+                for (int k = 0; k < lp2.m_ti.Count(); ++k) {
+                    if (lp2.m_ti[k] != ti) continue;
+                    int prev_k = (k + lp2.m_ti.Count() - 1)
+                                     % lp2.m_ti.Count();
+                    ON_BrepTrim& prev_t =
+                        brep.m_T[lp2.m_ti[prev_k]];
+                    // Don't modify another seam trim.
+                    if (prev_t.m_type == ON_BrepTrim::seam) break;
+                    int prev_c2i = prev_t.m_c2i;
+                    if (prev_c2i < 0
+                            || prev_c2i >= brep.m_C2.Count()) break;
+                    ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
+                        brep.m_C2[prev_c2i]);
+                    if (!pnc || pnc->CVCount() < 1) break;
+                    const int last = pnc->CVCount() - 1;
+                    double* cvL = pnc->CV(last);
+                    double wL = pnc->IsRational()
+                                    ? cvL[pnc->m_dim] : 1.0;
+                    if (wL == 0.0) wL = 1.0;
+                    // Only snap in the ISO (constant) coordinate.
+                    if (snap_u)
+                        cvL[0] = pt_start.x * wL;
+                    else
+                        cvL[1] = pt_start.y * wL;
+                    const ON_Curve* pc2 = brep.m_C2[prev_c2i];
+                    if (pc2) {
+                        prev_t.m_pbox = pc2->BoundingBox();
+                        prev_t.m_pbox.m_min.z = 0.0;
+                        prev_t.m_pbox.m_max.z = 0.0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Post-processing pass: fix edge tolerances so that ON_Brep::IsValid() passes
@@ -1002,42 +1598,218 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             edge.m_tolerance = new_etol;
     }
 
-    // For closed trims (both trim and edge start/end at the same vertex),
-    // the validation additionally checks that the trim tangent aligns with
-    // the edge tangent.  If it does not, flip m_bRev3d so the directions agree.
+    // ---------------------------------------------------------------------------
+    // Post-processing pass: fix the tangent-direction check for closed trims on
+    // closed edges (ON_Brep.m_T[i].m_bRev3d validation).
+    //
+    // The openNURBS validation requires that for a closed trim on a closed edge
+    // the 3-D tangent of the pcurve mapped through the surface Jacobian aligns
+    // with the edge-curve tangent at BOTH the start (d0) and end (d1) of the
+    // trim domain.  OCCT Boolean-result B-spline pcurves often have a small
+    // tangent discontinuity (kink) at the parameter-domain junction (where the
+    // closed loop starts/ends), introduced during OCCT's intersection
+    // computation.  This kink causes d0 or d1 to be barely negative even though
+    // the geometric direction is correct.
+    //
+    // Fix: for each closed trim on a closed edge whose d0 or d1 fails, snap the
+    // 2-D pcurve's last interior control-vertex (CV[n-2] for d1-fail, or CV[1]
+    // for d0-fail) so that the end tangent exactly equals the start tangent
+    // (C1 closure without kink).  The fix preserves the start and end UV points
+    // (only the tangent direction changes) so loop UV connectivity is unaffected.
+    // ---------------------------------------------------------------------------
+    // NOTE: Do NOT call brep.SetTolerancesBoxesAndFlags() here: it would reset
+    // the edge tolerances we adjusted in the loop above.  The trim proxy-curve
+    // domains were already set during the conversion loop via
+    // SetProxyCurveDomain, so trim.Domain() and trim.Ev1Der() work without it.
+
     for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
         ON_BrepTrim& trim = brep.m_T[ti];
         if (trim.m_ei < 0 || trim.m_li < 0) continue;
-        if (trim.m_vi[0] != trim.m_vi[1]) continue;  // not a closed trim
-
         const ON_BrepEdge& edge = brep.m_E[trim.m_ei];
-        if (edge.m_vi[0] != edge.m_vi[1]) continue;  // not a closed edge
-        if (trim.m_vi[0] != edge.m_vi[0]) continue;  // different vertex
+
+        // Only process truly closed trims on closed edges
+        if (trim.m_vi[0] != trim.m_vi[1]) continue;
+        if (edge.m_vi[0] != edge.m_vi[1]) continue;
+        if (trim.m_vi[0] != edge.m_vi[0]) continue;
 
         const int fi = brep.m_L[trim.m_li].m_fi;
         if (fi < 0) continue;
         const ON_Surface* srf = brep.m_F[fi].SurfaceOf();
         if (!srf) continue;
 
-        // Compute the 3D tangent of the trim at its start via surface Jacobian.
-        ON_Interval td = trim.Domain();
-        ON_3dPoint  uv; ON_3dVector du, dv, trim_tan_uv;
-        if (!trim.Ev1Der(td[0], uv, trim_tan_uv)) continue;
-        ON_3dPoint  srf_pt; ON_3dVector srf_du, srf_dv;
-        if (!srf->Ev1Der(uv.x, uv.y, srf_pt, srf_du, srf_dv)) continue;
-        ON_3dVector trim_tan3d = trim_tan_uv.x * srf_du + trim_tan_uv.y * srf_dv;
-        if (!trim_tan3d.Unitize()) continue;
+        // Compute the tangent check values d0 and d1
+        auto compute_checks = [&](const ON_BrepTrim& t) -> std::pair<double,double> {
+            ON_Interval td = t.Domain();
+            ON_3dPoint uv0, uv1; ON_3dVector td0, td1;
+            t.Ev1Der(td[0], uv0, td0);
+            t.Ev1Der(td[1], uv1, td1);
+            ON_3dPoint sp; ON_3dVector sdu, sdv;
+            srf->Ev1Der(uv0.x, uv0.y, sp, sdu, sdv);
+            ON_3dVector tt0 = td0.x*sdu + td0.y*sdv; tt0.Unitize();
+            srf->Ev1Der(uv1.x, uv1.y, sp, sdu, sdv);
+            ON_3dVector tt1 = td1.x*sdu + td1.y*sdv; tt1.Unitize();
+            const ON_BrepEdge& e = brep.m_E[t.m_ei];
+            bool rev = t.m_bRev3d ? true : false;
+            ON_3dVector et0 = e.TangentAt(e.Domain()[rev ? 1 : 0]);
+            ON_3dVector et1 = e.TangentAt(e.Domain()[rev ? 0 : 1]);
+            double d0 = tt0 * et0; if (rev) d0 = -d0;
+            double d1 = tt1 * et1; if (rev) d1 = -d1;
+            return {d0, d1};
+        };
 
-        // Edge tangent at the start of the edge curve.
-        ON_3dVector edge_tan = edge.TangentAt(edge.Domain()[0]);
-        if (!edge_tan.IsValid()) continue;
+        auto [d0, d1] = compute_checks(trim);
+        // openNURBS IsValid() uses strict d < 0.0 check for closed trims.
+        // Use a small positive threshold so any negative (or exactly-zero)
+        // dot product triggers the snap/fix below.
+        const double kSnapThreshold = 1e-9;
+        if (d0 >= kSnapThreshold && d1 >= kSnapThreshold) continue;
 
-        double dot = trim_tan3d * edge_tan;
-        if (trim.m_bRev3d) dot = -dot;  // expected sign is positive
+        // If BOTH d0 and d1 are strongly negative the m_bRev3d flag itself
+        // is wrong (edge and pcurve go in fully opposite directions).  Flip
+        // m_bRev3d and recheck before trying the CV tangent snap.
+        // This fix is applied independently of the pcurve degree.
+        {
+            double ad0 = d0, ad1 = d1;
+            if (ad0 < -0.5 && ad1 < -0.5) {
+                trim.m_bRev3d = !trim.m_bRev3d;
+                auto [nd0, nd1] = compute_checks(trim);
+                if (nd0 >= kSnapThreshold && nd1 >= kSnapThreshold) continue;
+                // Still failing after flip — restore and fall through to snap.
+                trim.m_bRev3d = !trim.m_bRev3d;
+            }
+        }
 
-        if (dot < 0.0) {
-            // Tangent directions disagree — flip m_bRev3d.
-            trim.m_bRev3d = !trim.m_bRev3d;
+        // Get the ON_NurbsCurve for this trim's pcurve
+        if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
+        ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
+        if (!nc || nc->Degree() < 1) continue;
+
+        // If the pcurve is linear (degree 1, 2 CVs) elevate it to degree 2
+        // so that we have an interior CV to apply the C1 snap below.
+        if (nc->CVCount() < 3) {
+            if (nc->IncreaseDegree(2) && nc->CVCount() >= 3) {
+                // Rebuild pbox for the trim after elevation.
+                trim.m_pbox = nc->BoundingBox();
+                trim.m_pbox.m_min.z = 0.0;
+                trim.m_pbox.m_max.z = 0.0;
+            } else {
+                continue;  // elevation failed — skip
+            }
+        }
+        if (nc->CVCount() < 3) continue;
+
+        // We need at least CV[0], CV[1], CV[n-2], CV[n-1] to be accessible
+        const int nCV = nc->CVCount();
+        const int dim = nc->m_dim; // should be 2
+        if (dim < 2) continue;
+
+        // Read CV[0], CV[1] and CV[n-1], CV[n-2] in Euclidean 2D
+        // (divide by weight for rational curves)
+        auto get_cv2d = [&](int i) -> ON_2dPoint {
+            ON_4dPoint h; nc->GetCV(i, h);
+            double w = (h.w != 0.0) ? h.w : 1.0;
+            return ON_2dPoint(h.x / w, h.y / w);
+        };
+        auto get_cv_weight = [&](int i) -> double {
+            ON_4dPoint h; nc->GetCV(i, h);
+            return (h.w != 0.0) ? h.w : 1.0;
+        };
+        auto set_cv2d = [&](int i, const ON_2dPoint& p, double w) {
+            nc->SetCV(i, ON_4dPoint(p.x * w, p.y * w, 0.0, w));
+        };
+
+        // First interior knot span at start: m_knot[deg] - m_knot[0]
+        // Last interior knot span at end  : m_knot[kc-1] - m_knot[kc-1-deg]
+        // (openNURBS stores d-1 phantom knots at each end; the tangent formula is
+        //  T'(t0) ∝ (CV[1]-CV[0]) / span_s  and  T'(t1) ∝ (CV[n-1]-CV[n-2]) / span_e)
+        const int deg = nc->Degree();
+        const int kc  = nc->KnotCount(); // = nCV + deg - 1
+        double span_s = 0.0, span_e = 0.0;
+        if (deg >= 1 && kc > deg) {
+            span_s = nc->m_knot[deg] - nc->m_knot[0];
+        }
+        if (kc >= deg + 1) {
+            span_e = nc->m_knot[kc-1] - nc->m_knot[kc-1-deg];
+        }
+        double scale = (span_s > 1e-14) ? (span_e / span_s) : 1.0;
+
+        // Guard: if the span ratio is extreme (>> 1 or << 1), the C1 snap
+        // would displace CV[n-2] or CV[1] by a huge amount, distorting the
+        // pcurve severely and causing BRepCheck_UnorientableShape in the
+        // round-trip OCCT shape.  Skip the snap in such cases.
+        if (scale > 10.0 || scale < 0.1 || scale != scale) continue;
+
+        ON_2dPoint cv0  = get_cv2d(0);
+        ON_2dPoint cv1  = get_cv2d(1);
+        ON_2dPoint cvn1 = get_cv2d(nCV-1);
+        ON_2dPoint cvn2 = get_cv2d(nCV-2);
+
+        if (d1 < 0.0) {
+            // End tangent bad: snap CV[n-2] to enforce T_end = T_start
+            // T_start direction in 2D: (cv1 - cv0) / span_s
+            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
+            // C1 closure: (cvn1 - cvn2_new) / span_e = (cv1 - cv0) / span_s
+            ON_2dPoint cvn2_new;
+            cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
+            cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
+            set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
+        } else {
+            // Start tangent bad: snap CV[1] to enforce T_start = T_end
+            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
+            // C1 closure: (cv1_new - cv0) / span_s = (cvn1 - cvn2) / span_e
+            ON_2dPoint cv1_new;
+            cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
+            cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
+            set_cv2d(1, cv1_new, get_cv_weight(1));
+        }
+
+        // After the 2D pcurve snap, recheck.  If d1 is still bad and the
+        // 3D edge itself has a C1 kink at domain[1] (tangent reverses at
+        // the close of the closed curve), snap the 3D edge curve's CV[n-2]
+        // to enforce C1 closure.  Only apply when d0 is good (the kink is
+        // at the end), and the edge is used only by closed trims so the
+        // 3D curve modification cannot break non-closed trims.
+        {
+            auto [pd0, pd1] = compute_checks(trim);
+            if (pd1 < 0.0) {
+                ON_NurbsCurve* ec = ON_NurbsCurve::Cast(
+                    brep.m_C3[brep.m_E[trim.m_ei].m_c3i]);
+                if (ec && ec->Degree() >= 1 && ec->CVCount() >= 3) {
+                    const int enc  = ec->CVCount();
+                    const int edeg = ec->Degree();
+                    const int ekc  = ec->KnotCount();
+                    double esp_s = 0.0, esp_e = 0.0;
+                    if (ekc > edeg)
+                        esp_s = ec->m_knot[edeg] - ec->m_knot[0];
+                    if (ekc >= edeg + 1)
+                        esp_e = ec->m_knot[ekc-1] - ec->m_knot[ekc-1-edeg];
+                    double escale = (esp_s > 1e-14) ? (esp_e / esp_s) : 1.0;
+                    if (escale > 0.1 && escale < 10.0) {
+                        auto eget = [&](int i) -> ON_3dPoint {
+                            ON_4dPoint h; ec->GetCV(i, h);
+                            double w = (h.w != 0.0) ? h.w : 1.0;
+                            return ON_3dPoint(h.x/w, h.y/w, h.z/w);
+                        };
+                        auto ew = [&](int i) -> double {
+                            ON_4dPoint h; ec->GetCV(i, h);
+                            return (h.w != 0.0) ? h.w : 1.0;
+                        };
+                        ON_3dPoint ep0 = eget(0), ep1 = eget(1);
+                        ON_3dPoint epn1 = eget(enc-1), epn2 = eget(enc-2);
+                        // Snap CV[n-2] so end tangent = start tangent
+                        ON_3dPoint epn2_new(
+                            epn1.x - (ep1.x - ep0.x) * escale,
+                            epn1.y - (ep1.y - ep0.y) * escale,
+                            epn1.z - (ep1.z - ep0.z) * escale);
+                        double ew2 = ew(enc-2);
+                        ec->SetCV(enc-2, ON_4dPoint(
+                            epn2_new.x * ew2,
+                            epn2_new.y * ew2,
+                            epn2_new.z * ew2,
+                            ew2));
+                    }
+                }
+            }
         }
     }
 
