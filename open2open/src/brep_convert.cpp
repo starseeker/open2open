@@ -1590,23 +1590,24 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 double su0s=0,su1s=0,sv0s=0,sv1s=0;
                 srf_s->GetDomain(0,&su0s,&su1s);
                 srf_s->GetDomain(1,&sv0s,&sv1s);
-                const double kBndTol2 = 1e-4;
-                // Check first and last CV for exact boundary membership.
-                auto at_bnd_u = [&](double u) {
-                    return fabs(u-su0s)<=kBndTol2 || fabs(u-su1s)<=kBndTol2;
+                // Tolerance for checking whether CV[0] lies on a surface boundary.
+                const double kSingularBoundaryTol = 1e-4;
+                // Helper: snap a value to the nearest domain boundary (or return val).
+                auto snap_axis = [&](double val, double bnd0, double bnd1) -> double {
+                    if (fabs(val-bnd0) <= kSingularBoundaryTol) return bnd0;
+                    if (fabs(val-bnd1) <= kSingularBoundaryTol) return bnd1;
+                    return val;
                 };
-                auto at_bnd_v = [&](double v) {
-                    return fabs(v-sv0s)<=kBndTol2 || fabs(v-sv1s)<=kBndTol2;
+                auto at_bnd = [&](double val, double bnd0, double bnd1) -> bool {
+                    return fabs(val-bnd0) <= kSingularBoundaryTol
+                        || fabs(val-bnd1) <= kSingularBoundaryTol;
                 };
                 const double* cv0 = nc->CV(0);
                 double w0 = rat ? cv0[nc->m_dim] : 1.0;
                 if (w0==0.0) w0=1.0;
-                if (at_bnd_v(cv0[1]/w0)) {
+                if (at_bnd(cv0[1]/w0, sv0s, sv1s)) {
                     // Anchor V to this boundary value and snap all CVs.
-                    double v_anchor = cv0[1]/w0;
-                    // Snap to exact boundary.
-                    if (fabs(v_anchor-sv0s)<=kBndTol2) v_anchor=sv0s;
-                    else if (fabs(v_anchor-sv1s)<=kBndTol2) v_anchor=sv1s;
+                    double v_anchor = snap_axis(cv0[1]/w0, sv0s, sv1s);
                     for (int p=0;p<nCV;++p) {
                         double* cv = nc->CV(p);
                         double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1615,10 +1616,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     }
                     snap_v = true;
                     vMin = vMax = v_anchor;
-                } else if (at_bnd_u(cv0[0]/w0)) {
-                    double u_anchor = cv0[0]/w0;
-                    if (fabs(u_anchor-su0s)<=kBndTol2) u_anchor=su0s;
-                    else if (fabs(u_anchor-su1s)<=kBndTol2) u_anchor=su1s;
+                } else if (at_bnd(cv0[0]/w0, su0s, su1s)) {
+                    double u_anchor = snap_axis(cv0[0]/w0, su0s, su1s);
                     for (int p=0;p<nCV;++p) {
                         double* cv = nc->CV(p);
                         double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1845,6 +1844,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             if (tki >= 0 && tki < brep.m_T.Count())
                 lp.m_pbox.Union(brep.m_T[tki].m_pbox);
         }
+        // Parameter-space bounding boxes are 2D (UV only); the z coordinate
+        // must be zero so that ON_BrepLoop::IsValid() accepts the pbox.
         lp.m_pbox.m_min.z = 0.0;
         lp.m_pbox.m_max.z = 0.0;
     }

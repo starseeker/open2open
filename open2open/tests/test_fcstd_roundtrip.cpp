@@ -309,8 +309,8 @@ static ShapeResult TestBrpFile(const std::string& brp_path,
         // were not serialised in the archive.  BRepTools::Read would return
         // false for them, which would unfairly count as a failure.
         {
-            struct stat st;
-            if (stat(brp_path.c_str(), &st) == 0 && st.st_size == 0) {
+            struct stat brp_stat;
+            if (stat(brp_path.c_str(), &brp_stat) == 0 && brp_stat.st_size == 0) {
                 skipped = true;
                 reason  = "skipped (empty BRP file)";
             }
