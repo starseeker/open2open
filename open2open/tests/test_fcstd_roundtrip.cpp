@@ -47,6 +47,7 @@
 #include <vector>
 
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -301,9 +302,20 @@ static ShapeResult TestBrpFile(const std::string& brp_path,
         bool skipped = false;
         std::string reason;
 
-        if (!BRepTools::Read(shape, brp_path.c_str(), builder)) {
+        // Skip empty BRP files (0 bytes) — these are placeholder shapes that
+        // were not serialised in the archive.  BRepTools::Read would return
+        // false for them, which would unfairly count as a failure.
+        {
+            struct stat st;
+            if (stat(brp_path.c_str(), &st) == 0 && st.st_size == 0) {
+                skipped = true;
+                reason  = "skipped (empty BRP file)";
+            }
+        }
+
+        if (!skipped && !BRepTools::Read(shape, brp_path.c_str(), builder)) {
             reason = "BRepTools::Read failed";
-        } else {
+        } else if (!skipped) {
             bool ok = RoundTripShape(shape, reason);
             if (!ok && reason.find("skipped") != std::string::npos) {
                 skipped = true;

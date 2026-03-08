@@ -1526,18 +1526,31 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     // implementation uses a tight absolute tolerance (~1e-12) that can fail for
     // large domain values (e.g. V_max = 28.6515).
     //
-    // Fix for both: for any seam or singular trim whose m_iso is still not_iso,
-    // check whether all CVs share a nearly-constant U or V value (within 1e-4
-    // of the maximum CV extent in that direction).  If so, snap to the nearest
-    // surface domain boundary and call SetTrimIsoFlags again.  If it still
-    // returns not_iso, compute the iso type directly from the snapped CV values
-    // and the surface domain.
+    // Also fixes the case where SetTrimIsoFlags correctly identifies a seam
+    // pcurve as x_iso or y_iso (interior U/V constant) but the validation
+    // requires N/E/W/S_iso (boundary) for seam trims.  For example, a cylinder
+    // seam at U=2π gets x_iso instead of E_iso.  We promote x_iso→W_iso/E_iso
+    // and y_iso→S_iso/N_iso for seam trims that are at a surface boundary.
+    //
+    // Fix for all cases: for any seam or singular trim whose m_iso is not_iso,
+    // x_iso, or y_iso, check whether all CVs share a nearly-constant U or V
+    // value (within 1e-4 of the maximum CV extent in that direction).  If so,
+    // snap to the nearest surface domain boundary and recompute.  If
+    // SetTrimIsoFlags still returns interior iso, compute boundary iso directly.
     // ---------------------------------------------------------------------------
     for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
         ON_BrepTrim& trim = brep.m_T[ti];
         if (trim.m_type != ON_BrepTrim::seam &&
             trim.m_type != ON_BrepTrim::singular) continue;
-        if (trim.m_iso != ON_Surface::not_iso) continue;  // already iso
+        // Skip trims that already have proper boundary iso.
+        // Seam trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2) are
+        // interior-only and invalid for seam trims.
+        const bool needs_repair =
+            (trim.m_iso == ON_Surface::not_iso) ||
+            (trim.m_type == ON_BrepTrim::seam &&
+             (trim.m_iso == ON_Surface::x_iso ||
+              trim.m_iso == ON_Surface::y_iso));
+        if (!needs_repair) continue;
 
         if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
         ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
@@ -1610,12 +1623,19 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // Recompute the iso flag and parameter bounding box for this trim.
         brep.SetTrimIsoFlags(trim);
 
-        // Fallback: if SetTrimIsoFlags still returns not_iso (can happen for
-        // B-spline surfaces with large domain values where the absolute
-        // tolerance in ON_NurbsSurface::IsIsoparametric is too tight),
-        // compute the iso type directly from the snapped CV values and the
-        // known surface domain boundaries.
-        if (trim.m_iso == ON_Surface::not_iso) {
+        // Fallback: if SetTrimIsoFlags still returns not_iso, x_iso, or y_iso
+        // for a seam trim (can happen because ON_NurbsSurface::IsIsoparametric
+        // uses a tight absolute tolerance, and because it cannot distinguish
+        // between boundary and interior iso curves), compute the correct
+        // boundary iso type directly from the snapped CV values and the surface
+        // domain.  x_iso / y_iso are only valid for non-seam interior curves;
+        // seam trims require W/E/S/N_iso.
+        const bool still_bad =
+            (trim.m_iso == ON_Surface::not_iso) ||
+            (trim.m_type == ON_BrepTrim::seam &&
+             (trim.m_iso == ON_Surface::x_iso ||
+              trim.m_iso == ON_Surface::y_iso));
+        if (still_bad) {
             const int li2   = trim.m_li;
             const int fi2   = (li2 >= 0 && li2 < brep.m_L.Count())
                                   ? brep.m_L[li2].m_fi : -1;
@@ -1657,52 +1677,114 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
 
         // After snapping this seam pcurve to exact iso, close the
-        // junction gap by snapping the LAST CV of the preceding trim
-        // ONLY in the iso (constant) direction.  The non-constant
-        // direction is left untouched to avoid corrupting the
-        // preceding trim's geometry.
+        // Close junction gaps on both sides of the seam trim:
         //
-        // Exception: skip if the preceding trim is itself a seam trim
-        // (it will be or has been handled by its own pass).
+        // 1. Snap the LAST CV of the preceding trim to match this seam
+        //    trim's first point (gap at the trim's START).
+        // 2. Snap the FIRST CV of the next trim to match this seam
+        //    trim's last point (gap at the trim's END).
+        //
+        // Only the iso (constant) coordinate is changed to avoid corrupting
+        // the non-iso geometry of the adjacent trim.
+        // Both snaps skip the case where the adjacent trim is itself a seam.
         {
             ON_3dPoint pt_start = trim.PointAtStart();
+            ON_3dPoint pt_end   = trim.PointAtEnd();
             const int li2 = trim.m_li;
             if (li2 >= 0 && li2 < brep.m_L.Count()) {
                 const ON_BrepLoop& lp2 = brep.m_L[li2];
                 for (int k = 0; k < lp2.m_ti.Count(); ++k) {
                     if (lp2.m_ti[k] != ti) continue;
-                    int prev_k = (k + lp2.m_ti.Count() - 1)
-                                     % lp2.m_ti.Count();
-                    ON_BrepTrim& prev_t =
-                        brep.m_T[lp2.m_ti[prev_k]];
-                    // Don't modify another seam trim.
-                    if (prev_t.m_type == ON_BrepTrim::seam) break;
-                    int prev_c2i = prev_t.m_c2i;
-                    if (prev_c2i < 0
-                            || prev_c2i >= brep.m_C2.Count()) break;
-                    ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
-                        brep.m_C2[prev_c2i]);
-                    if (!pnc || pnc->CVCount() < 1) break;
-                    const int last = pnc->CVCount() - 1;
-                    double* cvL = pnc->CV(last);
-                    double wL = pnc->IsRational()
-                                    ? cvL[pnc->m_dim] : 1.0;
-                    if (wL == 0.0) wL = 1.0;
-                    // Only snap in the ISO (constant) coordinate.
-                    if (snap_u)
-                        cvL[0] = pt_start.x * wL;
-                    else
-                        cvL[1] = pt_start.y * wL;
-                    const ON_Curve* pc2 = brep.m_C2[prev_c2i];
-                    if (pc2) {
-                        prev_t.m_pbox = pc2->BoundingBox();
-                        prev_t.m_pbox.m_min.z = 0.0;
-                        prev_t.m_pbox.m_max.z = 0.0;
+
+                    // ---- Snap preceding trim's last CV ----
+                    {
+                        int prev_k = (k + lp2.m_ti.Count() - 1)
+                                         % lp2.m_ti.Count();
+                        ON_BrepTrim& prev_t =
+                            brep.m_T[lp2.m_ti[prev_k]];
+                        if (prev_t.m_type != ON_BrepTrim::seam) {
+                            int prev_c2i = prev_t.m_c2i;
+                            if (prev_c2i >= 0
+                                    && prev_c2i < brep.m_C2.Count()) {
+                                ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
+                                    brep.m_C2[prev_c2i]);
+                                if (pnc && pnc->CVCount() >= 1) {
+                                    const int last = pnc->CVCount() - 1;
+                                    double* cvL = pnc->CV(last);
+                                    double wL = pnc->IsRational()
+                                                    ? cvL[pnc->m_dim] : 1.0;
+                                    if (wL == 0.0) wL = 1.0;
+                                    if (snap_u) cvL[0] = pt_start.x * wL;
+                                    else        cvL[1] = pt_start.y * wL;
+                                    prev_t.m_pbox = brep.m_C2[prev_c2i]->BoundingBox();
+                                    prev_t.m_pbox.m_min.z = 0.0;
+                                    prev_t.m_pbox.m_max.z = 0.0;
+                                }
+                            }
+                        }
                     }
+
+                    // ---- Snap next trim's first CV (only if already close) ----
+                    {
+                        int next_k = (k + 1) % lp2.m_ti.Count();
+                        ON_BrepTrim& next_t =
+                            brep.m_T[lp2.m_ti[next_k]];
+                        if (next_t.m_type != ON_BrepTrim::seam) {
+                            int next_c2i = next_t.m_c2i;
+                            if (next_c2i >= 0
+                                    && next_c2i < brep.m_C2.Count()) {
+                                ON_NurbsCurve* nnc = ON_NurbsCurve::Cast(
+                                    brep.m_C2[next_c2i]);
+                                if (nnc && nnc->CVCount() >= 1) {
+                                    double* cv0 = nnc->CV(0);
+                                    double w0 = nnc->IsRational()
+                                                    ? cv0[nnc->m_dim] : 1.0;
+                                    if (w0 == 0.0) w0 = 1.0;
+                                    // Only snap if the next trim's first CV
+                                    // is already close to the iso value we
+                                    // want (within 1e-3). This avoids
+                                    // corrupting trims on the opposite side
+                                    // of the seam (e.g. the U=0 trim when
+                                    // the seam is at U=2π).
+                                    bool snap_next = false;
+                                    if (snap_u) {
+                                        double cur_u = cv0[0] / w0;
+                                        snap_next = fabs(cur_u - pt_end.x) <= 1e-3;
+                                    } else {
+                                        double cur_v = cv0[1] / w0;
+                                        snap_next = fabs(cur_v - pt_end.y) <= 1e-3;
+                                    }
+                                    if (snap_next) {
+                                        if (snap_u) cv0[0] = pt_end.x * w0;
+                                        else        cv0[1] = pt_end.y * w0;
+                                        next_t.m_pbox = brep.m_C2[next_c2i]->BoundingBox();
+                                        next_t.m_pbox.m_min.z = 0.0;
+                                        next_t.m_pbox.m_max.z = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     break;
                 }
             }
         }
+    }
+
+    // Rebuild loop pboxes after seam/singular trim CV snapping.
+    // SetTolerancesBoxesAndFlags computed loop pboxes from the original CVs;
+    // our snapping may have moved a trim's pbox outside the loop's pbox.
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        ON_BrepLoop& lp = brep.m_L[li];
+        lp.m_pbox.Destroy();
+        for (int k = 0; k < lp.m_ti.Count(); ++k) {
+            int tki = lp.m_ti[k];
+            if (tki >= 0 && tki < brep.m_T.Count())
+                lp.m_pbox.Union(brep.m_T[tki].m_pbox);
+        }
+        lp.m_pbox.m_min.z = 0.0;
+        lp.m_pbox.m_max.z = 0.0;
     }
 
     // ---------------------------------------------------------------------------
