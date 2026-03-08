@@ -637,6 +637,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     std::map<PntKey, int>          vertex_map;  // rounded 3D pos → vertex index
     std::map<EdgeKey, int>         edge_map;    // (TShape*, start_pos) → edge index
     std::map<Standard_Address, int> surface_map;// TShape* → surface index
+    // Original OCCT surface periods, stored per surface index (si) so that the
+    // gap-snap code can apply period-shift corrections even when the converted
+    // ON_NurbsSurface does not report IsClosed() correctly (e.g. a cylinder face
+    // whose BSpline representation spans slightly more than one period).
+    std::map<int, double> surface_uperiod; // si → OCCT U period (0 = non-periodic)
+    std::map<int, double> surface_vperiod; // si → OCCT V period (0 = non-periodic)
 
     // Helper: compute the EdgeKey for a (non-degenerate) edge.
     // TopExp::Vertices with CumOri=false always returns tv0 as the FORWARD
@@ -965,8 +971,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
             // Cache by shape pointer so seam surfaces are shared
             Standard_Address sk = face.TShape().get();
-            if (!surface_map.count(sk) && si >= 0)
+            if (!surface_map.count(sk) && si >= 0) {
                 surface_map[sk] = si;
+                // Record the original OCCT surface's period so the gap-snap
+                // code can apply period-shift corrections even when the
+                // converted ON_NurbsSurface's IsClosed() returns false.
+                if (!gs.IsNull()) {
+                    surface_uperiod[si] =
+                        gs->IsUPeriodic() ? gs->UPeriod() : 0.0;
+                    surface_vperiod[si] =
+                        gs->IsVPeriodic() ? gs->VPeriod() : 0.0;
+                }
+            }
         }
 
         // Check if the surface pointer was already added
@@ -1004,8 +1020,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // First entry is outer; all others are inner holes.
             const bool wire_is_outer = (&wire == &face_wires[0]);
 
-            ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
-
             // Collect edges in the correct wire traversal order.
             // BRepTools_WireExplorer follows the wire's connectivity (handles
             // seam and degenerate edges in native OCCT shapes correctly).
@@ -1014,9 +1028,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // that case fall back to TopExp_Explorer which is order-agnostic
             // but visits all edges.
             std::vector<TopoDS_Edge> wire_edges;
+            bool wire_explorer_found_edges = false;
             {
-                for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next())
+                for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
                     wire_edges.push_back(we.Current());
+                    wire_explorer_found_edges = true;
+                }
             }
             // Count unique physical edges (TShape + start-vertex position) from
             // TopExp_Explorer.  WireExplorer may visit seam edges twice (FORWARD
@@ -1032,6 +1049,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 std::set<EdgeKey> we_keys;
                 for (const TopoDS_Edge& e : wire_edges)
                     we_keys.insert(make_edge_key(e));
+
+                // If BRepTools_WireExplorer found nothing but TopExp found
+                // edges, this is an open (slit/dangling) wire.  ON_Brep
+                // requires all loops to be closed; skip these wires.  They
+                // appear in FreeCAD files as reference geometry or partition
+                // seams and do not bound a surface region.
+                if (!wire_explorer_found_edges && !tex_keys.empty())
+                    continue;
+
                 if (we_keys.size() < tex_keys.size()) {
                     // WireExplorer missed some edges — revert to TopExp order
                     wire_edges.clear();
@@ -1040,6 +1066,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         wire_edges.push_back(TopoDS::Edge(eex.Current()));
                 }
             }
+
+            ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
 
             for (const TopoDS_Edge& edge : wire_edges) {
                 EdgeKey ek = make_edge_key(edge);
@@ -1308,6 +1336,23 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     const bool cls_u = srf->IsClosed(0);
                     const bool cls_v = srf->IsClosed(1);
 
+                    // Also fetch the original OCCT surface period (recorded
+                    // during surface conversion).  When the converted
+                    // ON_NurbsSurface does not report IsClosed() correctly —
+                    // e.g. a cylinder face whose BSpline was trimmed to a UV
+                    // range slightly wider than one period, causing IsClosed(0)
+                    // = false even though the underlying geometry closes — use
+                    // the stored OCCT period to allow period-shift detection.
+                    const int si_for_gap = (fi >= 0 && fi < brep.m_F.Count())
+                                             ? brep.m_F[fi].SurfaceIndexOf()
+                                             : -1;
+                    auto up_it = surface_uperiod.find(si_for_gap);
+                    auto vp_it = surface_vperiod.find(si_for_gap);
+                    const double occt_uperiod =
+                        (up_it != surface_uperiod.end()) ? up_it->second : 0.0;
+                    const double occt_vperiod =
+                        (vp_it != surface_vperiod.end()) ? vp_it->second : 0.0;
+
                     const int nc = ol.m_ti.Count();
                     for (int k = 0; k < nc; ++k) {
                         ON_BrepTrim& tk  = brep.m_T[ol.m_ti[k]];
@@ -1331,17 +1376,30 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         bool modified = false;
 
                         // Strategy 1: period gap — translate all poles.
+                        // Check using both the ON_Surface domain width (cls_u /
+                        // uperiod) and the original OCCT surface period stored
+                        // during conversion.  The OCCT period catches cylinders
+                        // whose BSpline spans slightly more than one period,
+                        // causing IsClosed(0) = false.
                         const double kRelTol = 1e-3;
                         double shift_u = 0.0, shift_v = 0.0;
-                        if (cls_u && uperiod > 0.0 &&
-                            fabs(fabs(dx) - uperiod) <
-                                kRelTol * uperiod &&
-                            fabs(dy) < kRelTol * uperiod) {
+                        // U period: prefer OCCT period if available, fall back
+                        // to domain width when surface reports IsClosed.
+                        const double eff_uperiod = (occt_uperiod > 0.0)
+                                                       ? occt_uperiod
+                                                       : (cls_u ? uperiod : 0.0);
+                        const double eff_vperiod = (occt_vperiod > 0.0)
+                                                       ? occt_vperiod
+                                                       : (cls_v ? vperiod : 0.0);
+                        if (eff_uperiod > 0.0 &&
+                            fabs(fabs(dx) - eff_uperiod) <
+                                kRelTol * eff_uperiod &&
+                            fabs(dy) < kRelTol * eff_uperiod) {
                             shift_u = -dx;
-                        } else if (cls_v && vperiod > 0.0 &&
-                                   fabs(fabs(dy) - vperiod) <
-                                       kRelTol * vperiod &&
-                                   fabs(dx) < kRelTol * vperiod) {
+                        } else if (eff_vperiod > 0.0 &&
+                                   fabs(fabs(dy) - eff_vperiod) <
+                                       kRelTol * eff_vperiod &&
+                                   fabs(dx) < kRelTol * eff_vperiod) {
                             shift_v = -dy;
                         }
 
