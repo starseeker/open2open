@@ -1543,11 +1543,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         if (trim.m_type != ON_BrepTrim::seam &&
             trim.m_type != ON_BrepTrim::singular) continue;
         // Skip trims that already have proper boundary iso.
-        // Seam trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2) are
-        // interior-only and invalid for seam trims.
+        // Seam and singular trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2)
+        // are interior-only and invalid for seam and singular trims.
         const bool needs_repair =
             (trim.m_iso == ON_Surface::not_iso) ||
-            (trim.m_type == ON_BrepTrim::seam &&
+            ((trim.m_type == ON_BrepTrim::seam ||
+              trim.m_type == ON_BrepTrim::singular) &&
              (trim.m_iso == ON_Surface::x_iso ||
               trim.m_iso == ON_Surface::y_iso));
         if (!needs_repair) continue;
@@ -1580,52 +1581,148 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // After B-spline conversion the degenerate locus may not be perfectly
         // iso, but if ANY CV is at a surface boundary we can infer the
         // correct iso line and snap all CVs to it.
-        if (!snap_u && !snap_v && trim.m_type == ON_BrepTrim::singular) {
+        //
+        // For singular trims we also use domain-relative tolerances: 1e-4
+        // absolute is too tight for large B-spline surfaces (domain ≫ 1).
+        // We also allow a greedy "pick smallest-variation axis" approach when
+        // even the domain-relative check fails, since openNURBS requires
+        // singular trims to have W/E/N/S_iso (boundary iso), not not_iso.
+        if (trim.m_type == ON_BrepTrim::singular) {
             const int li_s  = trim.m_li;
             const int fi_s  = (li_s >= 0 && li_s < brep.m_L.Count())
                                   ? brep.m_L[li_s].m_fi : -1;
             const ON_Surface* srf_s = (fi_s >= 0 && fi_s < brep.m_F.Count())
                                           ? brep.m_F[fi_s].SurfaceOf() : nullptr;
-            if (srf_s) {
+            if (srf_s && (!snap_u || !snap_v)) {
                 double su0s=0,su1s=0,sv0s=0,sv1s=0;
                 srf_s->GetDomain(0,&su0s,&su1s);
                 srf_s->GetDomain(1,&sv0s,&sv1s);
-                // Tolerance for checking whether CV[0] lies on a surface boundary.
-                const double kSingularBoundaryTol = 1e-4;
-                // Helper: snap a value to the nearest domain boundary (or return val).
-                auto snap_axis = [&](double val, double bnd0, double bnd1) -> double {
-                    if (fabs(val-bnd0) <= kSingularBoundaryTol) return bnd0;
-                    if (fabs(val-bnd1) <= kSingularBoundaryTol) return bnd1;
-                    return val;
-                };
-                auto at_bnd = [&](double val, double bnd0, double bnd1) -> bool {
-                    return fabs(val-bnd0) <= kSingularBoundaryTol
-                        || fabs(val-bnd1) <= kSingularBoundaryTol;
-                };
-                const double* cv0 = nc->CV(0);
-                double w0 = rat ? cv0[nc->m_dim] : 1.0;
-                if (w0==0.0) w0=1.0;
-                if (at_bnd(cv0[1]/w0, sv0s, sv1s)) {
-                    // Anchor V to this boundary value and snap all CVs.
-                    double v_anchor = snap_axis(cv0[1]/w0, sv0s, sv1s);
-                    for (int p=0;p<nCV;++p) {
-                        double* cv = nc->CV(p);
-                        double w = rat ? cv[nc->m_dim] : 1.0;
-                        if (w==0.0) w=1.0;
-                        cv[1] = v_anchor * w;
+                const double uDom = su1s - su0s;
+                const double vDom = sv1s - sv0s;
+                // Relative tolerance: 1% of domain, or absolute 1e-4, whichever
+                // is larger.  Singular trims can have small numerical drift in
+                // the "iso" axis after B-spline conversion.
+                const double kRelFrac = 0.01;
+                const double uRelTol = (uDom > 0) ? std::max(kIsoTol, kRelFrac * uDom) : kIsoTol;
+                const double vRelTol = (vDom > 0) ? std::max(kIsoTol, kRelFrac * vDom) : kIsoTol;
+
+                if (!snap_u && (uMax - uMin) <= uRelTol) snap_u = true;
+                if (!snap_v && (vMax - vMin) <= vRelTol) snap_v = true;
+
+                // If still neither, try to match CVs to a surface boundary
+                // with the larger tolerance, scanning all CVs (not just CV[0]).
+                if (!snap_u && !snap_v) {
+                    double uMean = 0.5*(uMin+uMax), vMean = 0.5*(vMin+vMax);
+                    auto near_bnd = [](double val, double b0, double b1,
+                                       double tol) -> bool {
+                        return fabs(val-b0) <= tol || fabs(val-b1) <= tol;
+                    };
+                    auto snap_to_nearest = [](double val, double b0,
+                                               double b1) -> double {
+                        return (fabs(val-b0) <= fabs(val-b1)) ? b0 : b1;
+                    };
+                    const double kBndRelTol = 0.05; // 5% of domain
+                    const double uBndTol = (uDom > 0) ? std::max(kIsoTol, kBndRelTol * uDom) : kIsoTol;
+                    const double vBndTol = (vDom > 0) ? std::max(kIsoTol, kBndRelTol * vDom) : kIsoTol;
+                    if (near_bnd(vMean, sv0s, sv1s, vBndTol)) {
+                        double v_anchor = snap_to_nearest(vMean, sv0s, sv1s);
+                        for (int p = 0; p < nCV; ++p) {
+                            double* cv = nc->CV(p);
+                            double w = rat ? cv[nc->m_dim] : 1.0;
+                            if (w==0.0) w=1.0;
+                            cv[1] = v_anchor * w;
+                        }
+                        snap_v = true;
+                        vMin = vMax = v_anchor;
+                    } else if (near_bnd(uMean, su0s, su1s, uBndTol)) {
+                        double u_anchor = snap_to_nearest(uMean, su0s, su1s);
+                        for (int p = 0; p < nCV; ++p) {
+                            double* cv = nc->CV(p);
+                            double w = rat ? cv[nc->m_dim] : 1.0;
+                            if (w==0.0) w=1.0;
+                            cv[0] = u_anchor * w;
+                        }
+                        snap_u = true;
+                        uMin = uMax = u_anchor;
+                    } else if (uDom > 0 && vDom > 0) {
+                        // Last resort: pick the axis with smallest relative
+                        // variation and snap to the nearest boundary.  Since
+                        // openNURBS requires singular trims to be boundary-iso,
+                        // this is always the right direction to try.
+                        double uRelVar = (uMax - uMin) / uDom;
+                        double vRelVar = (vMax - vMin) / vDom;
+                        if (vRelVar <= uRelVar) {
+                            double v_anchor = snap_to_nearest(vMean, sv0s, sv1s);
+                            for (int p = 0; p < nCV; ++p) {
+                                double* cv = nc->CV(p);
+                                double w = rat ? cv[nc->m_dim] : 1.0;
+                                if (w==0.0) w=1.0;
+                                cv[1] = v_anchor * w;
+                            }
+                            snap_v = true;
+                            vMin = vMax = v_anchor;
+                        } else {
+                            double u_anchor = snap_to_nearest(uMean, su0s, su1s);
+                            for (int p = 0; p < nCV; ++p) {
+                                double* cv = nc->CV(p);
+                                double w = rat ? cv[nc->m_dim] : 1.0;
+                                if (w==0.0) w=1.0;
+                                cv[0] = u_anchor * w;
+                            }
+                            snap_u = true;
+                            uMin = uMax = u_anchor;
+                        }
                     }
-                    snap_v = true;
-                    vMin = vMax = v_anchor;
-                } else if (at_bnd(cv0[0]/w0, su0s, su1s)) {
-                    double u_anchor = snap_axis(cv0[0]/w0, su0s, su1s);
-                    for (int p=0;p<nCV;++p) {
-                        double* cv = nc->CV(p);
-                        double w = rat ? cv[nc->m_dim] : 1.0;
-                        if (w==0.0) w=1.0;
-                        cv[0] = u_anchor * w;
+                }
+
+                // Legacy: check CV[0] against boundaries with relative tol.
+                // (This was the original approach; the new code above supersedes
+                // it for the not-yet-snapped axes, but the snap above already
+                // updates snap_u/snap_v so this block is only reached for
+                // the other axis if needed.)
+                if (!snap_v) {
+                    auto at_bnd_v = [&](double val) -> bool {
+                        return fabs(val-sv0s) <= vRelTol || fabs(val-sv1s) <= vRelTol;
+                    };
+                    auto snap_bnd_v = [&](double val) -> double {
+                        return (fabs(val-sv0s) <= fabs(val-sv1s)) ? sv0s : sv1s;
+                    };
+                    const double* cv0 = nc->CV(0);
+                    double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                    if (w0==0.0) w0=1.0;
+                    if (at_bnd_v(cv0[1]/w0)) {
+                        double v_anchor = snap_bnd_v(cv0[1]/w0);
+                        for (int p=0;p<nCV;++p) {
+                            double* cv = nc->CV(p);
+                            double w = rat ? cv[nc->m_dim] : 1.0;
+                            if (w==0.0) w=1.0;
+                            cv[1] = v_anchor * w;
+                        }
+                        snap_v = true;
+                        vMin = vMax = v_anchor;
                     }
-                    snap_u = true;
-                    uMin = uMax = u_anchor;
+                }
+                if (!snap_u) {
+                    auto at_bnd_u = [&](double val) -> bool {
+                        return fabs(val-su0s) <= uRelTol || fabs(val-su1s) <= uRelTol;
+                    };
+                    auto snap_bnd_u = [&](double val) -> double {
+                        return (fabs(val-su0s) <= fabs(val-su1s)) ? su0s : su1s;
+                    };
+                    const double* cv0 = nc->CV(0);
+                    double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                    if (w0==0.0) w0=1.0;
+                    if (at_bnd_u(cv0[0]/w0)) {
+                        double u_anchor = snap_bnd_u(cv0[0]/w0);
+                        for (int p=0;p<nCV;++p) {
+                            double* cv = nc->CV(p);
+                            double w = rat ? cv[nc->m_dim] : 1.0;
+                            if (w==0.0) w=1.0;
+                            cv[0] = u_anchor * w;
+                        }
+                        snap_u = true;
+                        uMin = uMax = u_anchor;
+                    }
                 }
             }
         }
@@ -1653,10 +1750,28 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (fabs(val - d1) <= tol) return d1;
                 return val;  // interior
             };
+            // For singular trims, ALWAYS snap to the nearest surface boundary.
+            // openNURBS requires singular trims to have W/E/N/S_iso.  If the
+            // singularity is at an interior parameter (e.g. due to B-spline
+            // conversion changing the parameterization), we must force it to
+            // the nearest boundary.  The adjacent trim endpoints are corrected
+            // by the junction-gap repair pass that follows below.
+            auto snap_to_nearest = [](double val, double d0, double d1) -> double {
+                return (fabs(val-d0) <= fabs(val-d1)) ? d0 : d1;
+            };
+            const bool is_singular = (trim.m_type == ON_BrepTrim::singular);
 
             if (snap_u) {
                 double u_iso = 0.5 * (uMin + uMax);
-                if (srf) u_iso = snap_to_boundary(u_iso, su0, su1, 1e-4);
+                if (srf) {
+                    const double bndTol = std::max(1e-4, 0.01*(su1-su0));
+                    double u_snapped = snap_to_boundary(u_iso, su0, su1, bndTol);
+                    if (u_snapped == u_iso && is_singular) {
+                        // Interior U: force to nearest boundary
+                        u_snapped = snap_to_nearest(u_iso, su0, su1);
+                    }
+                    u_iso = u_snapped;
+                }
                 for (int p = 0; p < nCV; ++p) {
                     double* cv = nc->CV(p);
                     double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1665,7 +1780,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 }
             } else {
                 double v_iso = 0.5 * (vMin + vMax);
-                if (srf) v_iso = snap_to_boundary(v_iso, sv0, sv1, 1e-4);
+                if (srf) {
+                    const double bndTol = std::max(1e-4, 0.01*(sv1-sv0));
+                    double v_snapped = snap_to_boundary(v_iso, sv0, sv1, bndTol);
+                    if (v_snapped == v_iso && is_singular) {
+                        // Interior V: force to nearest boundary
+                        v_snapped = snap_to_nearest(v_iso, sv0, sv1);
+                    }
+                    v_iso = v_snapped;
+                }
                 for (int p = 0; p < nCV; ++p) {
                     double* cv = nc->CV(p);
                     double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1687,7 +1810,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // seam trims require W/E/S/N_iso.
         const bool still_bad =
             (trim.m_iso == ON_Surface::not_iso) ||
-            (trim.m_type == ON_BrepTrim::seam &&
+            ((trim.m_type == ON_BrepTrim::seam ||
+              trim.m_type == ON_BrepTrim::singular) &&
              (trim.m_iso == ON_Surface::x_iso ||
               trim.m_iso == ON_Surface::y_iso));
         if (still_bad) {
@@ -1700,22 +1824,25 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 double su0=0, su1=0, sv0=0, sv1=0;
                 srf2->GetDomain(0, &su0, &su1);
                 srf2->GetDomain(1, &sv0, &sv1);
-                const double kBndTol = 1e-4;
+                // Use domain-relative tolerance: 1% of domain extent,
+                // or absolute 1e-4, whichever is larger.
+                const double uBndTol = std::max(1e-4, 0.01*(su1-su0));
+                const double vBndTol = std::max(1e-4, 0.01*(sv1-sv0));
                 if (snap_u) {
                     const double* cv0 = nc->CV(0);
                     double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
                     if (w0 == 0.0) w0 = 1.0;
                     double u0 = cv0[0] / w0;
-                    if      (fabs(u0 - su0) <= kBndTol) trim.m_iso = ON_Surface::W_iso;
-                    else if (fabs(u0 - su1) <= kBndTol) trim.m_iso = ON_Surface::E_iso;
+                    if      (fabs(u0 - su0) <= uBndTol) trim.m_iso = ON_Surface::W_iso;
+                    else if (fabs(u0 - su1) <= uBndTol) trim.m_iso = ON_Surface::E_iso;
                     else                                 trim.m_iso = ON_Surface::x_iso;
                 } else {
                     const double* cv0 = nc->CV(0);
                     double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
                     if (w0 == 0.0) w0 = 1.0;
                     double v0 = cv0[1] / w0;
-                    if      (fabs(v0 - sv0) <= kBndTol) trim.m_iso = ON_Surface::S_iso;
-                    else if (fabs(v0 - sv1) <= kBndTol) trim.m_iso = ON_Surface::N_iso;
+                    if      (fabs(v0 - sv0) <= vBndTol) trim.m_iso = ON_Surface::S_iso;
+                    else if (fabs(v0 - sv1) <= vBndTol) trim.m_iso = ON_Surface::N_iso;
                     else                                 trim.m_iso = ON_Surface::y_iso;
                 }
             }
