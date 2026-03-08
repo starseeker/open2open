@@ -20,6 +20,7 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
+#include <TopoDS_Compound.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopExp.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -50,6 +51,7 @@
 #include <set>
 #include <tuple>
 #include <cmath>
+#include <functional>
 
 namespace open2open {
 
@@ -435,39 +437,113 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     }
 
     // ------------------------------------------------------------------
-    // Step 5 — assemble shell / solid
+    // Step 5 — assemble shell(s) / solid(s) / compound
     // ------------------------------------------------------------------
-    TopoDS_Shell shell;
-    B.MakeShell(shell);
-    for (int fi = 0; fi < brep.m_F.Count(); ++fi)
-        B.Add(shell, f_map[fi]);
+    // Group faces into connected components via shared edges so that
+    // disconnected sub-solids (e.g. a COMPOUND of two bodies) are assembled
+    // as separate shells rather than a single shell.  BRepCheck requires
+    // every shell inside a solid to be connected; merging disconnected
+    // components into one shell triggers BRepCheck_NotConnected.
+    //
+    // Union-Find over face indices, unioning faces that share an edge.
+    const int nF = brep.m_F.Count();
+    std::vector<int> parent(nF);
+    for (int i = 0; i < nF; ++i) parent[i] = i;
+    std::function<int(int)> find = [&](int x) -> int {
+        return parent[x] == x ? x : (parent[x] = find(parent[x]));
+    };
+    auto unite = [&](int a, int b) {
+        a = find(a); b = find(b);
+        if (a != b) parent[b] = a;
+    };
 
-    // Only wrap the shell in a solid when all edges have at least 2 trims
-    // (i.e., the shell is closed).  An open shell (a single face or a
-    // surface-with-boundary) must be returned as TopAbs_SHELL, not as a
-    // TopAbs_SOLID, because BRepCheck_Analyzer requires closed shells inside
-    // solids.  Seam edges have 2 trims on the same face; they also satisfy
-    // the >=2 condition.
-    bool shell_closed = true;
+    // For each edge, union all faces whose loops contain a trim of that edge.
+    // We accumulate face-per-trim directly from m_T.
     {
-        std::vector<int> trim_count(brep.m_E.Count(), 0);
+        std::vector<int> edge_face(brep.m_E.Count(), -1); // first face seen for edge
         for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
-            int ei = brep.m_T[ti].m_ei;
-            if (ei >= 0 && ei < brep.m_E.Count())
-                ++trim_count[ei];
-        }
-        for (int i = 0; i < brep.m_E.Count(); ++i) {
-            if (trim_count[i] < 2) { shell_closed = false; break; }
+            const ON_BrepTrim& trim = brep.m_T[ti];
+            int ei = trim.m_ei;
+            if (ei < 0 || ei >= brep.m_E.Count()) continue;
+            int li = trim.m_li;
+            if (li < 0 || li >= brep.m_L.Count()) continue;
+            int fi = brep.m_L[li].m_fi;
+            if (fi < 0 || fi >= nF) continue;
+            if (edge_face[ei] < 0) {
+                edge_face[ei] = fi;
+            } else {
+                unite(edge_face[ei], fi);
+            }
         }
     }
 
-    if (shell_closed) {
-        TopoDS_Solid solid;
-        B.MakeSolid(solid);
-        B.Add(solid, shell);
-        return solid;
+    // Collect faces per component root.
+    std::map<int, std::vector<int>> components;
+    for (int fi = 0; fi < nF; ++fi)
+        components[find(fi)].push_back(fi);
+
+    // Build one shell per component.  Wrap closed shells (all edges have ≥2
+    // trims) in a solid.  Collect all resulting shapes.
+    //
+    // Pre-compute per-edge trim counts (globally, not per component, which
+    // is correct: a 2-trim edge is always shared by 2 faces in the same
+    // component if the B-Rep was originally valid).
+    std::vector<int> trim_count(brep.m_E.Count(), 0);
+    for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+        int ei = brep.m_T[ti].m_ei;
+        if (ei >= 0 && ei < brep.m_E.Count())
+            ++trim_count[ei];
     }
-    return shell;
+
+    // Helper: is every edge of this component's faces a shared edge (≥2 trims)?
+    // A component is closed when none of its boundary edges is a free edge.
+    auto component_is_closed = [&](const std::vector<int>& faces) -> bool {
+        // Collect all edges touched by faces in this component.
+        std::set<int> face_set(faces.begin(), faces.end());
+        // For each trim of each face in the component, check the edge count.
+        for (int fi : faces) {
+            const ON_BrepFace& face = brep.m_F[fi];
+            for (int li = 0; li < face.m_li.Count(); ++li) {
+                int loop_idx = face.m_li[li];
+                const ON_BrepLoop& loop = brep.m_L[loop_idx];
+                for (int ti_local = 0; ti_local < loop.m_ti.Count(); ++ti_local) {
+                    int ti = loop.m_ti[ti_local];
+                    int ei = brep.m_T[ti].m_ei;
+                    if (ei >= 0 && ei < brep.m_E.Count()) {
+                        if (trim_count[ei] < 2) return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    std::vector<TopoDS_Shape> parts;
+    for (auto& kv : components) {
+        TopoDS_Shell comp_shell;
+        B.MakeShell(comp_shell);
+        for (int fi : kv.second)
+            B.Add(comp_shell, f_map[fi]);
+
+        if (component_is_closed(kv.second)) {
+            TopoDS_Solid solid;
+            B.MakeSolid(solid);
+            B.Add(solid, comp_shell);
+            parts.push_back(solid);
+        } else {
+            parts.push_back(comp_shell);
+        }
+    }
+
+    if (parts.size() == 1)
+        return parts[0];
+
+    // Multiple components: wrap in a compound.
+    TopoDS_Compound compound;
+    B.MakeCompound(compound);
+    for (const auto& p : parts)
+        B.Add(compound, p);
+    return compound;
 }
 
 // ===========================================================================
