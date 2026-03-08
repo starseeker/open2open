@@ -39,7 +39,8 @@
 #include <BRepTools_WireExplorer.hxx>
 #include <gp_Pnt.hxx>
 
-// ---- OCCT containers ----
+// ---- OCCT tools ----
+#include <BRepLib.hxx>
 #include <Standard_Handle.hxx>
 #include <NCollection_Map.hxx>
 #include <TColgp_Array1OfPnt2d.hxx>
@@ -354,8 +355,8 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                 }
                 B.UpdateEdge(e_map[ei], C1, C2, f_map[fi], sp.tol);
                 B.Range(e_map[ei], f_map[fi], sp.t0, sp.t1);
-                // If seam pcurve domain differs from 3D edge domain,
-                // mark SameRange=false and SameParameter=false.
+                // Clear SameRange when domain differs; SameParameter is
+                // handled globally after the shape is built.
                 {
                     const double kRangeTol = 1e-10;
                     const auto& ed = e3d_domain[ei];
@@ -453,11 +454,8 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     double pd_min = trim.Domain().Min();
                     double pd_max = trim.Domain().Max();
                     B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
-                    // If the pcurve domain differs from the 3D edge domain,
-                    // the edge has SameRange=false in the original shape.
-                    // We must propagate this: SameRange=false also implies
-                    // SameParameter=false (otherwise BRepCheck fires
-                    // InvalidSameParameterFlag).
+                    // Clear SameRange when domains differ.
+                    // SameParameter is handled globally after the shape is built.
                     const double kRangeTol = 1e-10;
                     const auto& ed = e3d_domain[ei];
                     if (std::fabs(pd_min - ed.first)  > kRangeTol ||
@@ -578,14 +576,19 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
         }
     }
 
-    if (parts.size() == 1)
+    if (parts.size() == 1) {
+        try { BRepLib::SameParameter(parts[0], linear_tolerance,
+                                     Standard_False); } catch (...) {}
         return parts[0];
+    }
 
     // Multiple components: wrap in a compound.
     TopoDS_Compound compound;
     B.MakeCompound(compound);
     for (const auto& p : parts)
         B.Add(compound, p);
+    try { BRepLib::SameParameter(compound, linear_tolerance,
+                                  Standard_False); } catch (...) {}
     return compound;
 }
 
@@ -887,15 +890,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         if (!gs.IsNull()) {
             Handle(Geom_BSplineSurface) bs =
                 Handle(Geom_BSplineSurface)::DownCast(gs);
-            if (bs.IsNull()) {
-                try {
-                    bs = GeomConvert::SurfaceToBSplineSurface(gs);
-                } catch (...) {}
-            }
-            if (bs.IsNull()) {
-                // Fallback for unbounded analytical surfaces
-                // (Geom_Plane, Geom_ConicalSurface, etc.):
-                // restrict to the face's UV parameter domain first.
+            // For periodic BSpline surfaces OR non-BSpline analytical surfaces
+            // (Geom_CylindricalSurface, Geom_Plane, etc.): use the
+            // Geom_RectangularTrimmedSurface path which always produces a
+            // non-periodic BSpline whose UV domain exactly matches the face's
+            // UV parameter bounds (= the pcurves' UV range).
+            // DO NOT call SetUNotPeriodic() or rely on GeomConvert on the
+            // unbounded analytical surface — both can produce a surface with
+            // an incorrect/tiny UV domain.
+            bool need_trimmed = bs.IsNull() ||
+                                bs->IsUPeriodic() || bs->IsVPeriodic();
+            if (need_trimmed) {
                 try {
                     double u1, u2, v1, v2;
                     BRepTools::UVBounds(face, u1, u2, v1, v2);
@@ -906,14 +911,41 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 } catch (...) {}
             }
             if (!bs.IsNull()) {
-                // Periodic BSpline surfaces (e.g. sphere U-direction, cylinder
-                // lateral surface) have sum(mults) = nu+deg instead of nu+deg+1.
-                // OCCTSurfaceToON expects the non-periodic convention, so
-                // flatten any periodic directions before conversion.
+                // Handle any residual periodicity (safety fallback for
+                // surfaces that GeomConvert still left periodic).
                 if (bs->IsUPeriodic()) bs->SetUNotPeriodic();
                 if (bs->IsVPeriodic()) bs->SetVNotPeriodic();
                 ON_NurbsSurface* ns = new ON_NurbsSurface();
                 if (OCCTSurfaceToON(bs, *ns)) {
+                    // If the converted surface's UV domain doesn't match the
+                    // face UV bounds (which define the pcurves' UV range),
+                    // reparameterize the knots to match.  This handles cases
+                    // where GeomConvert normalizes the parameterization (e.g.
+                    // a cylinder u-range [0,2π] becomes [0,5.59e-9]).
+                    // Uniform reparameterization is geometry-preserving.
+                    if (need_trimmed) {
+                        double fu1, fu2, fv1, fv2;
+                        BRepTools::UVBounds(face, fu1, fu2, fv1, fv2);
+                        ON_Interval srf_u = ns->Domain(0);
+                        ON_Interval srf_v = ns->Domain(1);
+                        const double kDomTol = 1e-6;
+                        if (fu2 > fu1 && srf_u.IsValid() && srf_u.Length() > 0 &&
+                            (fabs(srf_u[0] - fu1) > kDomTol ||
+                             fabs(srf_u[1] - fu2) > kDomTol)) {
+                            double ku_scale = (fu2 - fu1) / srf_u.Length();
+                            for (int k = 0; k < ns->KnotCount(0); ++k)
+                                ns->m_knot[0][k] = fu1 +
+                                    (ns->m_knot[0][k] - srf_u[0]) * ku_scale;
+                        }
+                        if (fv2 > fv1 && srf_v.IsValid() && srf_v.Length() > 0 &&
+                            (fabs(srf_v[0] - fv1) > kDomTol ||
+                             fabs(srf_v[1] - fv2) > kDomTol)) {
+                            double kv_scale = (fv2 - fv1) / srf_v.Length();
+                            for (int k = 0; k < ns->KnotCount(1); ++k)
+                                ns->m_knot[1][k] = fv1 +
+                                    (ns->m_knot[1][k] - srf_v[0]) * kv_scale;
+                        }
+                    }
                     si = brep.AddSurface(ns);
                 } else {
                     delete ns;
@@ -1615,9 +1647,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         };
 
         auto [d0, d1] = compute_checks(trim);
-        // Only snap when d is significantly negative (not just floating-point
-        // noise).  Genuine kink failures have d ≈ -0.05 to -0.2.
-        const double kSnapThreshold = -0.02;
+        // openNURBS IsValid() uses strict d < 0.0 check for closed trims.
+        // Use a small positive threshold so any negative (or exactly-zero)
+        // dot product triggers the snap/fix below.
+        const double kSnapThreshold = 1e-9;
         if (d0 >= kSnapThreshold && d1 >= kSnapThreshold) continue;
 
         // If BOTH d0 and d1 are strongly negative the m_bRev3d flag itself
