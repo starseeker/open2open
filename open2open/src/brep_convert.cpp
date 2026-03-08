@@ -1575,6 +1575,62 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         bool snap_u = (uMax - uMin) <= kIsoTol;
         bool snap_v = (vMax - vMin) <= kIsoTol;
 
+        // For SINGULAR trims (pole/apex edges), the trim pcurve should lie
+        // exactly on the boundary where the surface degenerates to a point.
+        // After B-spline conversion the degenerate locus may not be perfectly
+        // iso, but if ANY CV is at a surface boundary we can infer the
+        // correct iso line and snap all CVs to it.
+        if (!snap_u && !snap_v && trim.m_type == ON_BrepTrim::singular) {
+            const int li_s  = trim.m_li;
+            const int fi_s  = (li_s >= 0 && li_s < brep.m_L.Count())
+                                  ? brep.m_L[li_s].m_fi : -1;
+            const ON_Surface* srf_s = (fi_s >= 0 && fi_s < brep.m_F.Count())
+                                          ? brep.m_F[fi_s].SurfaceOf() : nullptr;
+            if (srf_s) {
+                double su0s=0,su1s=0,sv0s=0,sv1s=0;
+                srf_s->GetDomain(0,&su0s,&su1s);
+                srf_s->GetDomain(1,&sv0s,&sv1s);
+                const double kBndTol2 = 1e-4;
+                // Check first and last CV for exact boundary membership.
+                auto at_bnd_u = [&](double u) {
+                    return fabs(u-su0s)<=kBndTol2 || fabs(u-su1s)<=kBndTol2;
+                };
+                auto at_bnd_v = [&](double v) {
+                    return fabs(v-sv0s)<=kBndTol2 || fabs(v-sv1s)<=kBndTol2;
+                };
+                const double* cv0 = nc->CV(0);
+                double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                if (w0==0.0) w0=1.0;
+                if (at_bnd_v(cv0[1]/w0)) {
+                    // Anchor V to this boundary value and snap all CVs.
+                    double v_anchor = cv0[1]/w0;
+                    // Snap to exact boundary.
+                    if (fabs(v_anchor-sv0s)<=kBndTol2) v_anchor=sv0s;
+                    else if (fabs(v_anchor-sv1s)<=kBndTol2) v_anchor=sv1s;
+                    for (int p=0;p<nCV;++p) {
+                        double* cv = nc->CV(p);
+                        double w = rat ? cv[nc->m_dim] : 1.0;
+                        if (w==0.0) w=1.0;
+                        cv[1] = v_anchor * w;
+                    }
+                    snap_v = true;
+                    vMin = vMax = v_anchor;
+                } else if (at_bnd_u(cv0[0]/w0)) {
+                    double u_anchor = cv0[0]/w0;
+                    if (fabs(u_anchor-su0s)<=kBndTol2) u_anchor=su0s;
+                    else if (fabs(u_anchor-su1s)<=kBndTol2) u_anchor=su1s;
+                    for (int p=0;p<nCV;++p) {
+                        double* cv = nc->CV(p);
+                        double w = rat ? cv[nc->m_dim] : 1.0;
+                        if (w==0.0) w=1.0;
+                        cv[0] = u_anchor * w;
+                    }
+                    snap_u = true;
+                    uMin = uMax = u_anchor;
+                }
+            }
+        }
+
         if (!snap_u && !snap_v) continue;  // not iso-like — skip
 
         // Snap to exact iso: snap to the nearest surface domain
@@ -1740,19 +1796,25 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                     double w0 = nnc->IsRational()
                                                     ? cv0[nnc->m_dim] : 1.0;
                                     if (w0 == 0.0) w0 = 1.0;
-                                    // Only snap if the next trim's first CV
-                                    // is already close to the iso value we
-                                    // want (within 1e-3). This avoids
-                                    // corrupting trims on the opposite side
-                                    // of the seam (e.g. the U=0 trim when
-                                    // the seam is at U=2π).
-                                    bool snap_next = false;
-                                    if (snap_u) {
-                                        double cur_u = cv0[0] / w0;
-                                        snap_next = fabs(cur_u - pt_end.x) <= 1e-3;
-                                    } else {
-                                        double cur_v = cv0[1] / w0;
-                                        snap_next = fabs(cur_v - pt_end.y) <= 1e-3;
+                                    // For singular trims, always snap the
+                                    // next trim to the iso value (the apex
+                                    // boundary can be offset vs. the adjacent
+                                    // trim's natural start by up to 0.5 UV
+                                    // units due to B-spline approximation of
+                                    // cones/spheres).  For seam trims, only
+                                    // snap if already close (1e-3) to avoid
+                                    // corrupting trims on the opposite seam.
+                                    const bool is_singular_trim =
+                                        (trim.m_type == ON_BrepTrim::singular);
+                                    bool snap_next = is_singular_trim;
+                                    if (!snap_next) {
+                                        if (snap_u) {
+                                            double cur_u = cv0[0] / w0;
+                                            snap_next = fabs(cur_u - pt_end.x) <= 1e-3;
+                                        } else {
+                                            double cur_v = cv0[1] / w0;
+                                            snap_next = fabs(cur_v - pt_end.y) <= 1e-3;
+                                        }
                                     }
                                     if (snap_next) {
                                         if (snap_u) cv0[0] = pt_end.x * w0;
