@@ -21,8 +21,24 @@ if(NOT TARGET opennurbsStatic)
 endif()
 
 # ---------------------------------------------------------------------------
-# 2. OpenCASCADE  — prefer an installed package; fall back to the in-tree source
+# 2. OpenCASCADE  — search order:
+#    a) caller-supplied OpenCASCADE_DIR (highest priority)
+#    b) pre-built artifacts checked into build_artifacts/occt/
+#    c) system-installed package
+#    d) bundled OCCT-7_9_3 source tree (slowest — full recompile)
 # ---------------------------------------------------------------------------
+set(_BUNDLED_OCCT_CMAKE
+    "${REPO_ROOT}/build_artifacts/occt/lib/cmake/opencascade-7.9.3")
+
+if(NOT OpenCASCADE_DIR AND NOT OpenCASCADE_FOUND
+   AND EXISTS "${_BUNDLED_OCCT_CMAKE}/OpenCASCADEConfig.cmake")
+    set(OpenCASCADE_DIR "${_BUNDLED_OCCT_CMAKE}" CACHE PATH
+        "OpenCASCADE cmake config dir (auto-set from build_artifacts/occt)" FORCE)
+    message(STATUS
+        "open2open: using pre-built OCCT from build_artifacts/occt/ "
+        "(set OpenCASCADE_DIR to override)")
+endif()
+
 find_package(OpenCASCADE QUIET)
 
 if(OpenCASCADE_FOUND)
