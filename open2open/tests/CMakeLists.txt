@@ -49,3 +49,35 @@ add_executable(test_occ_roundtrip test_occ_roundtrip.cpp)
 target_link_libraries(test_occ_roundtrip PRIVATE open2open)
 add_test(NAME test_occ_roundtrip
          COMMAND test_occ_roundtrip "${_occ_brep_dir}")
+
+# Round-trip tests for FreeCAD .FCStd files.
+# .FCStd files are ZIP archives containing *.brp OCCT BREP shapes.
+# For each shape inside each archive the test runs the full round-trip:
+#   BRepTools::Read → OCCTToON_Brep → ON_BrepToOCCT → BRepCheck_Analyzer
+#   + surface-area and volume comparison before/after round-trip.
+# The test searches recursively, so it can be pointed at either:
+#   - testfcstd/            (small set of hand-picked files for quick smoke test)
+#   - FreeCAD-Examples/     (git submodule, 159 files for comprehensive testing)
+set(_fcstd_examples_dir "${CMAKE_SOURCE_DIR}/../FreeCAD-Examples")
+set(_fcstd_smoke_dir    "${CMAKE_SOURCE_DIR}/../testfcstd")
+# Prefer the submodule if it has been checked out; fall back to smoke dir.
+if(EXISTS "${_fcstd_examples_dir}/README.md")
+    set(_fcstd_dir "${_fcstd_examples_dir}")
+else()
+    set(_fcstd_dir "${_fcstd_smoke_dir}")
+endif()
+add_executable(test_fcstd_roundtrip test_fcstd_roundtrip.cpp)
+target_link_libraries(test_fcstd_roundtrip PRIVATE open2open)
+add_test(NAME test_fcstd_roundtrip
+         COMMAND test_fcstd_roundtrip "${_fcstd_dir}")
+
+
+# Additional FCStd test using freecad-models submodule (if checked out).
+# freecad-models uses the older FreeCAD "dump" format (concatenated entries
+# with size|size|type|filename\n headers) rather than ZIP; test_fcstd_roundtrip
+# detects and parses this format automatically.
+set(_freecad_models_dir "${CMAKE_SOURCE_DIR}/../freecad-models")
+if(EXISTS "${_freecad_models_dir}/README.rst")
+    add_test(NAME test_fcstd_freecad_models
+             COMMAND test_fcstd_roundtrip "${_freecad_models_dir}")
+endif()

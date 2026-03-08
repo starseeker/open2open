@@ -637,6 +637,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     std::map<PntKey, int>          vertex_map;  // rounded 3D pos → vertex index
     std::map<EdgeKey, int>         edge_map;    // (TShape*, start_pos) → edge index
     std::map<Standard_Address, int> surface_map;// TShape* → surface index
+    // Original OCCT surface periods, stored per surface index (si) so that the
+    // gap-snap code can apply period-shift corrections even when the converted
+    // ON_NurbsSurface does not report IsClosed() correctly (e.g. a cylinder face
+    // whose BSpline representation spans slightly more than one period).
+    std::map<int, double> surface_uperiod; // si → OCCT U period (0 = non-periodic)
+    std::map<int, double> surface_vperiod; // si → OCCT V period (0 = non-periodic)
 
     // Helper: compute the EdgeKey for a (non-degenerate) edge.
     // TopExp::Vertices with CumOri=false always returns tv0 as the FORWARD
@@ -924,8 +930,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             if (!bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
                 // surfaces that GeomConvert still left periodic).
-                if (bs->IsUPeriodic()) bs->SetUNotPeriodic();
-                if (bs->IsVPeriodic()) bs->SetVNotPeriodic();
+                // BSplCLib::Unperiodize computes scale = 1/(knot_last - knot_first).
+                // For degenerate periodic surfaces (collapsed knot span), this
+                // produces a zero denominator, triggering SIGFPE which cannot be
+                // caught by C++ try-catch.  Guard: only unperiodize when the
+                // knot span is non-zero.
+                if (bs->IsUPeriodic() && bs->NbUKnots() >= 2 &&
+                    bs->UKnot(bs->NbUKnots()) - bs->UKnot(1) > 1e-15)
+                    bs->SetUNotPeriodic();
+                if (bs->IsVPeriodic() && bs->NbVKnots() >= 2 &&
+                    bs->VKnot(bs->NbVKnots()) - bs->VKnot(1) > 1e-15)
+                    bs->SetVNotPeriodic();
                 ON_NurbsSurface* ns = new ON_NurbsSurface();
                 if (OCCTSurfaceToON(bs, *ns)) {
                     // If the converted surface's UV domain doesn't match the
@@ -965,8 +980,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
             // Cache by shape pointer so seam surfaces are shared
             Standard_Address sk = face.TShape().get();
-            if (!surface_map.count(sk) && si >= 0)
+            if (!surface_map.count(sk) && si >= 0) {
                 surface_map[sk] = si;
+                // Record the original OCCT surface's period so the gap-snap
+                // code can apply period-shift corrections even when the
+                // converted ON_NurbsSurface's IsClosed() returns false.
+                if (!gs.IsNull()) {
+                    surface_uperiod[si] =
+                        gs->IsUPeriodic() ? gs->UPeriod() : 0.0;
+                    surface_vperiod[si] =
+                        gs->IsVPeriodic() ? gs->VPeriod() : 0.0;
+                }
+            }
         }
 
         // Check if the surface pointer was already added
@@ -1004,8 +1029,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // First entry is outer; all others are inner holes.
             const bool wire_is_outer = (&wire == &face_wires[0]);
 
-            ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
-
             // Collect edges in the correct wire traversal order.
             // BRepTools_WireExplorer follows the wire's connectivity (handles
             // seam and degenerate edges in native OCCT shapes correctly).
@@ -1014,9 +1037,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // that case fall back to TopExp_Explorer which is order-agnostic
             // but visits all edges.
             std::vector<TopoDS_Edge> wire_edges;
+            bool wire_explorer_found_edges = false;
             {
-                for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next())
+                for (BRepTools_WireExplorer we(wire, face); we.More(); we.Next()) {
                     wire_edges.push_back(we.Current());
+                    wire_explorer_found_edges = true;
+                }
             }
             // Count unique physical edges (TShape + start-vertex position) from
             // TopExp_Explorer.  WireExplorer may visit seam edges twice (FORWARD
@@ -1032,6 +1058,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 std::set<EdgeKey> we_keys;
                 for (const TopoDS_Edge& e : wire_edges)
                     we_keys.insert(make_edge_key(e));
+
+                // If BRepTools_WireExplorer found nothing but TopExp found
+                // edges, this is an open (slit/dangling) wire.  ON_Brep
+                // requires all loops to be closed; skip these wires.  They
+                // appear in FreeCAD files as reference geometry or partition
+                // seams and do not bound a surface region.
+                if (!wire_explorer_found_edges && !tex_keys.empty())
+                    continue;
+
                 if (we_keys.size() < tex_keys.size()) {
                     // WireExplorer missed some edges — revert to TopExp order
                     wire_edges.clear();
@@ -1040,6 +1075,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         wire_edges.push_back(TopoDS::Edge(eex.Current()));
                 }
             }
+
+            ON_BrepLoop& ol = brep.NewLoop(ON_BrepLoop::unknown, of);
 
             for (const TopoDS_Edge& edge : wire_edges) {
                 EdgeKey ek = make_edge_key(edge);
@@ -1138,6 +1175,31 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                     nc->m_knot[ki2++] = kv2;
                             }
                             if (nc->IsValid()) {
+                                // Sync pc_t0/pc_t1 to the actual B-spline domain.
+                                //
+                                // Geom2dConvert::CurveToBSplineCurve normalizes the
+                                // output domain to [0,1] for many curve types (lines,
+                                // circles, trimmed non-BSplines).  If the OCCT pcurve
+                                // parameter range pc_t0/pc_t1 differs from nc->Domain(),
+                                // SetProxyCurve would evaluate PointAtEnd() at an
+                                // intermediate parameter of the [0,1] curve rather than
+                                // at cv[last], giving a wrong trim endpoint.
+                                //
+                                // After this sync, proxy_dom = nc->Domain() so
+                                // PointAtEnd() = curve(nc_dom.Max()) = cv[last] = the
+                                // correct geometric endpoint of the edge.
+                                //
+                                // The m_c3i reparameterization below may further adjust
+                                // nc's knots for period-shifted seam pcurves; pc_t0/pc_t1
+                                // are updated there as well.
+                                {
+                                    ON_Interval nc_dom_init = nc->Domain();
+                                    if (nc_dom_init.IsValid()) {
+                                        pc_t0 = nc_dom_init.Min();
+                                        pc_t1 = nc_dom_init.Max();
+                                    }
+                                }
+
                                 // Remap the pcurve's knot domain to match the
                                 // 3D edge domain so SameRange=true is preserved
                                 // in the round-trip.  In the original OCCT B-Rep
@@ -1308,6 +1370,23 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     const bool cls_u = srf->IsClosed(0);
                     const bool cls_v = srf->IsClosed(1);
 
+                    // Also fetch the original OCCT surface period (recorded
+                    // during surface conversion).  When the converted
+                    // ON_NurbsSurface does not report IsClosed() correctly —
+                    // e.g. a cylinder face whose BSpline was trimmed to a UV
+                    // range slightly wider than one period, causing IsClosed(0)
+                    // = false even though the underlying geometry closes — use
+                    // the stored OCCT period to allow period-shift detection.
+                    const int si_for_gap = (fi >= 0 && fi < brep.m_F.Count())
+                                             ? brep.m_F[fi].SurfaceIndexOf()
+                                             : -1;
+                    auto up_it = surface_uperiod.find(si_for_gap);
+                    auto vp_it = surface_vperiod.find(si_for_gap);
+                    const double occt_uperiod =
+                        (up_it != surface_uperiod.end()) ? up_it->second : 0.0;
+                    const double occt_vperiod =
+                        (vp_it != surface_vperiod.end()) ? vp_it->second : 0.0;
+
                     const int nc = ol.m_ti.Count();
                     for (int k = 0; k < nc; ++k) {
                         ON_BrepTrim& tk  = brep.m_T[ol.m_ti[k]];
@@ -1331,17 +1410,30 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         bool modified = false;
 
                         // Strategy 1: period gap — translate all poles.
+                        // Check using both the ON_Surface domain width (cls_u /
+                        // uperiod) and the original OCCT surface period stored
+                        // during conversion.  The OCCT period catches cylinders
+                        // whose BSpline spans slightly more than one period,
+                        // causing IsClosed(0) = false.
                         const double kRelTol = 1e-3;
                         double shift_u = 0.0, shift_v = 0.0;
-                        if (cls_u && uperiod > 0.0 &&
-                            fabs(fabs(dx) - uperiod) <
-                                kRelTol * uperiod &&
-                            fabs(dy) < kRelTol * uperiod) {
+                        // U period: prefer OCCT period if available, fall back
+                        // to domain width when surface reports IsClosed.
+                        const double eff_uperiod = (occt_uperiod > 0.0)
+                                                       ? occt_uperiod
+                                                       : (cls_u ? uperiod : 0.0);
+                        const double eff_vperiod = (occt_vperiod > 0.0)
+                                                       ? occt_vperiod
+                                                       : (cls_v ? vperiod : 0.0);
+                        if (eff_uperiod > 0.0 &&
+                            fabs(fabs(dx) - eff_uperiod) <
+                                kRelTol * eff_uperiod &&
+                            fabs(dy) < kRelTol * eff_uperiod) {
                             shift_u = -dx;
-                        } else if (cls_v && vperiod > 0.0 &&
-                                   fabs(fabs(dy) - vperiod) <
-                                       kRelTol * vperiod &&
-                                   fabs(dx) < kRelTol * vperiod) {
+                        } else if (eff_vperiod > 0.0 &&
+                                   fabs(fabs(dy) - eff_vperiod) <
+                                       kRelTol * eff_vperiod &&
+                                   fabs(dx) < kRelTol * eff_vperiod) {
                             shift_v = -dy;
                         }
 
@@ -1418,7 +1510,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     brep.SetTolerancesBoxesAndFlags(/*bLazy=*/true);
 
     // ---------------------------------------------------------------------------
-    // Post-processing pass: repair seam trim m_iso corruption.
+    // Post-processing pass: repair seam/singular trim m_iso corruption.
     //
     // The UV-gap snap occasionally sets CV[0] of a seam pcurve to the
     // floating-point endpoint of the preceding trim (e.g. U=2.8e-9 instead
@@ -1428,17 +1520,37 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
     // not_iso for the seam trim and failing the ON_Brep::IsValid() check
     // "seam trim m_iso is not N/E/W/S_iso".
     //
-    // Fix: for any seam trim whose m_iso is still not_iso after
-    // SetTolerancesBoxesAndFlags, check whether all of the pcurve's CVs
-    // share a nearly-constant U or V value (within 1e-4 of the maximum
-    // CV extent in that direction).  If so, snap all CVs to the exact
-    // iso value (the mean of all CV coordinates in the constant direction)
-    // and call SetTrimIsoFlags again to update m_iso.
+    // Similarly, singular trims (degenerate poles) on B-spline surfaces can
+    // have SetTrimIsoFlags() silently return not_iso even when the pcurve CVs
+    // lie exactly on a surface boundary.  The ON_NurbsSurface::IsIsoparametric
+    // implementation uses a tight absolute tolerance (~1e-12) that can fail for
+    // large domain values (e.g. V_max = 28.6515).
+    //
+    // Also fixes the case where SetTrimIsoFlags correctly identifies a seam
+    // pcurve as x_iso or y_iso (interior U/V constant) but the validation
+    // requires N/E/W/S_iso (boundary) for seam trims.  For example, a cylinder
+    // seam at U=2π gets x_iso instead of E_iso.  We promote x_iso→W_iso/E_iso
+    // and y_iso→S_iso/N_iso for seam trims that are at a surface boundary.
+    //
+    // Fix for all cases: for any seam or singular trim whose m_iso is not_iso,
+    // x_iso, or y_iso, check whether all CVs share a nearly-constant U or V
+    // value (within 1e-4 of the maximum CV extent in that direction).  If so,
+    // snap to the nearest surface domain boundary and recompute.  If
+    // SetTrimIsoFlags still returns interior iso, compute boundary iso directly.
     // ---------------------------------------------------------------------------
     for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
         ON_BrepTrim& trim = brep.m_T[ti];
-        if (trim.m_type != ON_BrepTrim::seam) continue;
-        if (trim.m_iso != ON_Surface::not_iso) continue;  // already iso
+        if (trim.m_type != ON_BrepTrim::seam &&
+            trim.m_type != ON_BrepTrim::singular) continue;
+        // Skip trims that already have proper boundary iso.
+        // Seam trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2) are
+        // interior-only and invalid for seam trims.
+        const bool needs_repair =
+            (trim.m_iso == ON_Surface::not_iso) ||
+            (trim.m_type == ON_BrepTrim::seam &&
+             (trim.m_iso == ON_Surface::x_iso ||
+              trim.m_iso == ON_Surface::y_iso));
+        if (!needs_repair) continue;
 
         if (trim.m_c2i < 0 || trim.m_c2i >= brep.m_C2.Count()) continue;
         ON_NurbsCurve* nc = ON_NurbsCurve::Cast(brep.m_C2[trim.m_c2i]);
@@ -1462,6 +1574,61 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         const double kIsoTol = 1e-4;
         bool snap_u = (uMax - uMin) <= kIsoTol;
         bool snap_v = (vMax - vMin) <= kIsoTol;
+
+        // For SINGULAR trims (pole/apex edges), the trim pcurve should lie
+        // exactly on the boundary where the surface degenerates to a point.
+        // After B-spline conversion the degenerate locus may not be perfectly
+        // iso, but if ANY CV is at a surface boundary we can infer the
+        // correct iso line and snap all CVs to it.
+        if (!snap_u && !snap_v && trim.m_type == ON_BrepTrim::singular) {
+            const int li_s  = trim.m_li;
+            const int fi_s  = (li_s >= 0 && li_s < brep.m_L.Count())
+                                  ? brep.m_L[li_s].m_fi : -1;
+            const ON_Surface* srf_s = (fi_s >= 0 && fi_s < brep.m_F.Count())
+                                          ? brep.m_F[fi_s].SurfaceOf() : nullptr;
+            if (srf_s) {
+                double su0s=0,su1s=0,sv0s=0,sv1s=0;
+                srf_s->GetDomain(0,&su0s,&su1s);
+                srf_s->GetDomain(1,&sv0s,&sv1s);
+                // Tolerance for checking whether CV[0] lies on a surface boundary.
+                const double kSingularBoundaryTol = 1e-4;
+                // Helper: snap a value to the nearest domain boundary (or return val).
+                auto snap_axis = [&](double val, double bnd0, double bnd1) -> double {
+                    if (fabs(val-bnd0) <= kSingularBoundaryTol) return bnd0;
+                    if (fabs(val-bnd1) <= kSingularBoundaryTol) return bnd1;
+                    return val;
+                };
+                auto at_bnd = [&](double val, double bnd0, double bnd1) -> bool {
+                    return fabs(val-bnd0) <= kSingularBoundaryTol
+                        || fabs(val-bnd1) <= kSingularBoundaryTol;
+                };
+                const double* cv0 = nc->CV(0);
+                double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                if (w0==0.0) w0=1.0;
+                if (at_bnd(cv0[1]/w0, sv0s, sv1s)) {
+                    // Anchor V to this boundary value and snap all CVs.
+                    double v_anchor = snap_axis(cv0[1]/w0, sv0s, sv1s);
+                    for (int p=0;p<nCV;++p) {
+                        double* cv = nc->CV(p);
+                        double w = rat ? cv[nc->m_dim] : 1.0;
+                        if (w==0.0) w=1.0;
+                        cv[1] = v_anchor * w;
+                    }
+                    snap_v = true;
+                    vMin = vMax = v_anchor;
+                } else if (at_bnd(cv0[0]/w0, su0s, su1s)) {
+                    double u_anchor = snap_axis(cv0[0]/w0, su0s, su1s);
+                    for (int p=0;p<nCV;++p) {
+                        double* cv = nc->CV(p);
+                        double w = rat ? cv[nc->m_dim] : 1.0;
+                        if (w==0.0) w=1.0;
+                        cv[0] = u_anchor * w;
+                    }
+                    snap_u = true;
+                    uMin = uMax = u_anchor;
+                }
+            }
+        }
 
         if (!snap_u && !snap_v) continue;  // not iso-like — skip
 
@@ -1510,6 +1677,50 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
         // Recompute the iso flag and parameter bounding box for this trim.
         brep.SetTrimIsoFlags(trim);
+
+        // Fallback: if SetTrimIsoFlags still returns not_iso, x_iso, or y_iso
+        // for a seam trim (can happen because ON_NurbsSurface::IsIsoparametric
+        // uses a tight absolute tolerance, and because it cannot distinguish
+        // between boundary and interior iso curves), compute the correct
+        // boundary iso type directly from the snapped CV values and the surface
+        // domain.  x_iso / y_iso are only valid for non-seam interior curves;
+        // seam trims require W/E/S/N_iso.
+        const bool still_bad =
+            (trim.m_iso == ON_Surface::not_iso) ||
+            (trim.m_type == ON_BrepTrim::seam &&
+             (trim.m_iso == ON_Surface::x_iso ||
+              trim.m_iso == ON_Surface::y_iso));
+        if (still_bad) {
+            const int li2   = trim.m_li;
+            const int fi2   = (li2 >= 0 && li2 < brep.m_L.Count())
+                                  ? brep.m_L[li2].m_fi : -1;
+            const ON_Surface* srf2 = (fi2 >= 0 && fi2 < brep.m_F.Count())
+                                         ? brep.m_F[fi2].SurfaceOf() : nullptr;
+            if (srf2 && nc->CVCount() > 0) {
+                double su0=0, su1=0, sv0=0, sv1=0;
+                srf2->GetDomain(0, &su0, &su1);
+                srf2->GetDomain(1, &sv0, &sv1);
+                const double kBndTol = 1e-4;
+                if (snap_u) {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
+                    if (w0 == 0.0) w0 = 1.0;
+                    double u0 = cv0[0] / w0;
+                    if      (fabs(u0 - su0) <= kBndTol) trim.m_iso = ON_Surface::W_iso;
+                    else if (fabs(u0 - su1) <= kBndTol) trim.m_iso = ON_Surface::E_iso;
+                    else                                 trim.m_iso = ON_Surface::x_iso;
+                } else {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
+                    if (w0 == 0.0) w0 = 1.0;
+                    double v0 = cv0[1] / w0;
+                    if      (fabs(v0 - sv0) <= kBndTol) trim.m_iso = ON_Surface::S_iso;
+                    else if (fabs(v0 - sv1) <= kBndTol) trim.m_iso = ON_Surface::N_iso;
+                    else                                 trim.m_iso = ON_Surface::y_iso;
+                }
+            }
+        }
+
         // Rebuild m_pbox from the (now-corrected) pcurve.
         {
             const ON_Curve* c2 = brep.m_C2[trim.m_c2i];
@@ -1521,52 +1732,122 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
 
         // After snapping this seam pcurve to exact iso, close the
-        // junction gap by snapping the LAST CV of the preceding trim
-        // ONLY in the iso (constant) direction.  The non-constant
-        // direction is left untouched to avoid corrupting the
-        // preceding trim's geometry.
+        // Close junction gaps on both sides of the seam trim:
         //
-        // Exception: skip if the preceding trim is itself a seam trim
-        // (it will be or has been handled by its own pass).
+        // 1. Snap the LAST CV of the preceding trim to match this seam
+        //    trim's first point (gap at the trim's START).
+        // 2. Snap the FIRST CV of the next trim to match this seam
+        //    trim's last point (gap at the trim's END).
+        //
+        // Only the iso (constant) coordinate is changed to avoid corrupting
+        // the non-iso geometry of the adjacent trim.
+        // Both snaps skip the case where the adjacent trim is itself a seam.
         {
             ON_3dPoint pt_start = trim.PointAtStart();
+            ON_3dPoint pt_end   = trim.PointAtEnd();
             const int li2 = trim.m_li;
             if (li2 >= 0 && li2 < brep.m_L.Count()) {
                 const ON_BrepLoop& lp2 = brep.m_L[li2];
                 for (int k = 0; k < lp2.m_ti.Count(); ++k) {
                     if (lp2.m_ti[k] != ti) continue;
-                    int prev_k = (k + lp2.m_ti.Count() - 1)
-                                     % lp2.m_ti.Count();
-                    ON_BrepTrim& prev_t =
-                        brep.m_T[lp2.m_ti[prev_k]];
-                    // Don't modify another seam trim.
-                    if (prev_t.m_type == ON_BrepTrim::seam) break;
-                    int prev_c2i = prev_t.m_c2i;
-                    if (prev_c2i < 0
-                            || prev_c2i >= brep.m_C2.Count()) break;
-                    ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
-                        brep.m_C2[prev_c2i]);
-                    if (!pnc || pnc->CVCount() < 1) break;
-                    const int last = pnc->CVCount() - 1;
-                    double* cvL = pnc->CV(last);
-                    double wL = pnc->IsRational()
-                                    ? cvL[pnc->m_dim] : 1.0;
-                    if (wL == 0.0) wL = 1.0;
-                    // Only snap in the ISO (constant) coordinate.
-                    if (snap_u)
-                        cvL[0] = pt_start.x * wL;
-                    else
-                        cvL[1] = pt_start.y * wL;
-                    const ON_Curve* pc2 = brep.m_C2[prev_c2i];
-                    if (pc2) {
-                        prev_t.m_pbox = pc2->BoundingBox();
-                        prev_t.m_pbox.m_min.z = 0.0;
-                        prev_t.m_pbox.m_max.z = 0.0;
+
+                    // ---- Snap preceding trim's last CV ----
+                    {
+                        int prev_k = (k + lp2.m_ti.Count() - 1)
+                                         % lp2.m_ti.Count();
+                        ON_BrepTrim& prev_t =
+                            brep.m_T[lp2.m_ti[prev_k]];
+                        if (prev_t.m_type != ON_BrepTrim::seam) {
+                            int prev_c2i = prev_t.m_c2i;
+                            if (prev_c2i >= 0
+                                    && prev_c2i < brep.m_C2.Count()) {
+                                ON_NurbsCurve* pnc = ON_NurbsCurve::Cast(
+                                    brep.m_C2[prev_c2i]);
+                                if (pnc && pnc->CVCount() >= 1) {
+                                    const int last = pnc->CVCount() - 1;
+                                    double* cvL = pnc->CV(last);
+                                    double wL = pnc->IsRational()
+                                                    ? cvL[pnc->m_dim] : 1.0;
+                                    if (wL == 0.0) wL = 1.0;
+                                    if (snap_u) cvL[0] = pt_start.x * wL;
+                                    else        cvL[1] = pt_start.y * wL;
+                                    prev_t.m_pbox = brep.m_C2[prev_c2i]->BoundingBox();
+                                    prev_t.m_pbox.m_min.z = 0.0;
+                                    prev_t.m_pbox.m_max.z = 0.0;
+                                }
+                            }
+                        }
                     }
+
+                    // ---- Snap next trim's first CV (only if already close) ----
+                    {
+                        int next_k = (k + 1) % lp2.m_ti.Count();
+                        ON_BrepTrim& next_t =
+                            brep.m_T[lp2.m_ti[next_k]];
+                        if (next_t.m_type != ON_BrepTrim::seam) {
+                            int next_c2i = next_t.m_c2i;
+                            if (next_c2i >= 0
+                                    && next_c2i < brep.m_C2.Count()) {
+                                ON_NurbsCurve* nnc = ON_NurbsCurve::Cast(
+                                    brep.m_C2[next_c2i]);
+                                if (nnc && nnc->CVCount() >= 1) {
+                                    double* cv0 = nnc->CV(0);
+                                    double w0 = nnc->IsRational()
+                                                    ? cv0[nnc->m_dim] : 1.0;
+                                    if (w0 == 0.0) w0 = 1.0;
+                                    // For singular trims, always snap the
+                                    // next trim to the iso value (the apex
+                                    // boundary can be offset vs. the adjacent
+                                    // trim's natural start by up to 0.5 UV
+                                    // units due to B-spline approximation of
+                                    // cones/spheres).  For seam trims, only
+                                    // snap if already close (1e-3) to avoid
+                                    // corrupting trims on the opposite seam.
+                                    const bool is_singular_trim =
+                                        (trim.m_type == ON_BrepTrim::singular);
+                                    bool snap_next = is_singular_trim;
+                                    if (!snap_next) {
+                                        if (snap_u) {
+                                            double cur_u = cv0[0] / w0;
+                                            snap_next = fabs(cur_u - pt_end.x) <= 1e-3;
+                                        } else {
+                                            double cur_v = cv0[1] / w0;
+                                            snap_next = fabs(cur_v - pt_end.y) <= 1e-3;
+                                        }
+                                    }
+                                    if (snap_next) {
+                                        if (snap_u) cv0[0] = pt_end.x * w0;
+                                        else        cv0[1] = pt_end.y * w0;
+                                        next_t.m_pbox = brep.m_C2[next_c2i]->BoundingBox();
+                                        next_t.m_pbox.m_min.z = 0.0;
+                                        next_t.m_pbox.m_max.z = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     break;
                 }
             }
         }
+    }
+
+    // Rebuild loop pboxes after seam/singular trim CV snapping.
+    // SetTolerancesBoxesAndFlags computed loop pboxes from the original CVs;
+    // our snapping may have moved a trim's pbox outside the loop's pbox.
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        ON_BrepLoop& lp = brep.m_L[li];
+        lp.m_pbox.Destroy();
+        for (int k = 0; k < lp.m_ti.Count(); ++k) {
+            int tki = lp.m_ti[k];
+            if (tki >= 0 && tki < brep.m_T.Count())
+                lp.m_pbox.Union(brep.m_T[tki].m_pbox);
+        }
+        // Parameter-space bounding boxes are 2D (UV only); the z coordinate
+        // must be zero so that ON_BrepLoop::IsValid() accepts the pbox.
+        lp.m_pbox.m_min.z = 0.0;
+        lp.m_pbox.m_max.z = 0.0;
     }
 
     // ---------------------------------------------------------------------------
