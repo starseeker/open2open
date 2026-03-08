@@ -442,12 +442,32 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     for (int fi = 0; fi < brep.m_F.Count(); ++fi)
         B.Add(shell, f_map[fi]);
 
-    // Attempt to build a solid
-    TopoDS_Solid solid;
-    B.MakeSolid(solid);
-    B.Add(solid, shell);
+    // Only wrap the shell in a solid when all edges have at least 2 trims
+    // (i.e., the shell is closed).  An open shell (a single face or a
+    // surface-with-boundary) must be returned as TopAbs_SHELL, not as a
+    // TopAbs_SOLID, because BRepCheck_Analyzer requires closed shells inside
+    // solids.  Seam edges have 2 trims on the same face; they also satisfy
+    // the >=2 condition.
+    bool shell_closed = true;
+    {
+        std::vector<int> trim_count(brep.m_E.Count(), 0);
+        for (int ti = 0; ti < brep.m_T.Count(); ++ti) {
+            int ei = brep.m_T[ti].m_ei;
+            if (ei >= 0 && ei < brep.m_E.Count())
+                ++trim_count[ei];
+        }
+        for (int i = 0; i < brep.m_E.Count(); ++i) {
+            if (trim_count[i] < 2) { shell_closed = false; break; }
+        }
+    }
 
-    return solid;
+    if (shell_closed) {
+        TopoDS_Solid solid;
+        B.MakeSolid(solid);
+        B.Add(solid, shell);
+        return solid;
+    }
+    return shell;
 }
 
 // ===========================================================================
