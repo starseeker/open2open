@@ -1230,8 +1230,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         brep.m_V[pole_vi], ol, ON_Surface::not_iso, c2i);
                     strim.m_tolerance[0] = BRep_Tool::Tolerance(edge);
                     strim.m_tolerance[1] = strim.m_tolerance[0];
-                    if (c2i >= 0)
-                        strim.SetProxyCurveDomain(ON_Interval(pc_t0, pc_t1));
+                    if (c2i >= 0) {
+                        ON_Interval proxy_dom(pc_t0, pc_t1);
+                        ON_Interval nc_dom = brep.m_C2[c2i]->Domain();
+                        bool use_sub = proxy_dom.IsIncreasing() &&
+                                       nc_dom.Includes(proxy_dom[0]) &&
+                                       nc_dom.Includes(proxy_dom[1]);
+                        strim.SetProxyCurve(brep.m_C2[c2i],
+                                            use_sub ? proxy_dom : nc_dom);
+                    }
                     continue;
                 }
 
@@ -1240,10 +1247,29 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 trim.m_tolerance[0] = BRep_Tool::Tolerance(edge);
                 trim.m_tolerance[1] = trim.m_tolerance[0];
                 if (c2i >= 0) {
-                    // The pcurve has already been reversed (if needed) in the
-                    // loop above, so it always goes from trim-start to trim-end.
-                    // SetProxyCurveDomain requires an increasing interval.
-                    trim.SetProxyCurveDomain(ON_Interval(pc_t0, pc_t1));
+                    // SetProxyCurve (two-arg form) sets both m_this_domain and
+                    // m_real_curve_domain to [pc_t0, pc_t1], so that
+                    // ON_Brep::IsValid()'s direct evaluation of
+                    // m_C2[c2i]->PointAt(trim.Domain()[1]) agrees with the
+                    // snap code's PointAtEnd() which respects the proxy domain.
+                    // SetProxyCurveDomain alone only updates m_real_curve_domain,
+                    // leaving m_this_domain at the curve's full domain and causing
+                    // a false gap error when the pcurve domain is a sub-range.
+                    // Guards:
+                    // 1. proxy_dom must be strictly increasing (no degenerate
+                    //    or inverted interval).
+                    // 2. proxy_dom must be a subset of the stored B-spline's
+                    //    domain; SetProxyCurve intersects the two intervals, so
+                    //    an out-of-range sub-interval produces EmptyInterval and
+                    //    an invalid proxy (m_real_curve_domain not increasing).
+                    // When either guard fails, fall back to the full curve domain.
+                    ON_Interval proxy_dom(pc_t0, pc_t1);
+                    ON_Interval nc_dom = brep.m_C2[c2i]->Domain();
+                    bool use_sub = proxy_dom.IsIncreasing() &&
+                                   nc_dom.Includes(proxy_dom[0]) &&
+                                   nc_dom.Includes(proxy_dom[1]);
+                    trim.SetProxyCurve(brep.m_C2[c2i],
+                                       use_sub ? proxy_dom : nc_dom);
                 }
                 // Note: trim.m_type is set automatically by NewTrim
                 // (boundary→seam→mated) — do NOT override it here.
