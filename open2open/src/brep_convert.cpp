@@ -815,6 +815,26 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             bc2.Nullify(); // force TrimmedCurve path below
                     }
 
+                    // When the B-spline pcurve spans a wider domain than the
+                    // edge's actual parameter range [pc_t0, pc_t1], the first
+                    // control vertex cv[0] does NOT correspond to the curve
+                    // value at pc_t0 (it's at the B-spline's own domain start).
+                    // The UV-gap snap code writes directly to cv[0], so it
+                    // would be ineffective.  Force the TrimmedCurve path to
+                    // produce a B-spline with domain exactly [pc_t0, pc_t1],
+                    // ensuring cv[0] = PointAt(pc_t0).
+                    //
+                    // Use an absolute tolerance of 1e-4 to avoid re-trimming
+                    // seam pcurves that already have a domain matching
+                    // [pc_t0, pc_t1] to within floating-point precision.
+                    if (!bc2.IsNull() && !bc2->IsPeriodic()) {
+                        const double kDomTol = 1e-4;
+                        if (fabs(bc2->FirstParameter() - pc_t0) > kDomTol ||
+                            fabs(bc2->LastParameter()  - pc_t1) > kDomTol) {
+                            bc2.Nullify(); // force TrimmedCurve path below
+                        }
+                    }
+
                     if (bc2.IsNull()) {
                         try {
                             Handle(Geom2d_TrimmedCurve) tc2 =
@@ -1029,6 +1049,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         // residual gaps.  Only applied when the gap is
                         // smaller than 5% of the surface domain (avoids
                         // snapping a genuine topological mismatch).
+                        // The B-spline domain trimming above ensures that
+                        // cv[0] corresponds to PointAt(proxy_domain_start),
+                        // making this snap effective.
                         if (fabs(dx) > 1e-14 || fabs(dy) > 1e-14) {
                             const double domain_sz =
                                 std::max(uperiod > 0.0 ? uperiod : (u1-u0),
@@ -1039,8 +1062,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                                 fabs(dx) < snap_limit &&
                                 fabs(dy) < snap_limit) {
                                 double* cv0 = nc2->CV(0);
-                                cv0[0] = pe.x;
-                                cv0[1] = pe.y;
+                                // For rational curves CV stores homogeneous
+                                // coords (x*w, y*w, w); multiply by weight.
+                                if (nc2->IsRational()) {
+                                    const double w = cv0[nc2->m_dim];
+                                    cv0[0] = pe.x * w;
+                                    cv0[1] = pe.y * w;
+                                    // cv0[m_dim] (weight) is unchanged
+                                } else {
+                                    cv0[0] = pe.x;
+                                    cv0[1] = pe.y;
+                                }
                                 modified = true;
                                 tk1.SetProxyCurveDomain(
                                     tk1.ProxyCurveDomain());
@@ -1226,6 +1258,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             span_e = nc->m_knot[kc-1] - nc->m_knot[kc-1-deg];
         }
         double scale = (span_s > 1e-14) ? (span_e / span_s) : 1.0;
+
+        // Guard: if the span ratio is extreme (>> 1 or << 1), the C1 snap
+        // would displace CV[n-2] or CV[1] by a huge amount, distorting the
+        // pcurve severely and causing BRepCheck_UnorientableShape in the
+        // round-trip OCCT shape.  Skip the snap in such cases.
+        if (scale > 10.0 || scale < 0.1 || scale != scale) continue;
 
         ON_2dPoint cv0  = get_cv2d(0);
         ON_2dPoint cv1  = get_cv2d(1);
