@@ -23,11 +23,18 @@ open2open/                     ← repo root
 │   ├── include/open2open/
 │   │   ├── brep_convert.h
 │   │   └── geom_convert.h
-│   └── tests/                 ← all test executables
+│   ├── tests/                 ← all test executables
+│   └── tools/                 ← utility programs (step2brep)
 ├── opennurbs-8.24.25281.15001/ ← openNURBS source (submodule-like copy)
 ├── OCCT-7_9_3/                ← OpenCASCADE source (submodule-like copy)
 ├── test3dm/                   ← user-supplied .3dm files (flat directory)
 │   └── YachtMod(55).3dm.gz    ← large model stored gzip-compressed
+├── STEP_Models/               ← STEP model git submodules
+│   ├── Curta-Type-I-3x/       ← https://github.com/marcuswu/Curta-Type-I-3x
+│   ├── brlcad-models/         ← https://github.com/BRL-CAD/models
+│   └── virtualagc/            ← https://github.com/virtualagc/virtualagc (mechanical branch)
+├── step_brep/                 ← pre-converted STEP shapes as .brep files
+│   └── README.md              ← explains how to regenerate with step2brep
 └── build_artifacts/           ← pre-built binaries committed to repo
     ├── libopen2open.a
     └── tests/
@@ -127,11 +134,33 @@ make -j$(nproc)
 |---|---|---|
 | Unit tests (brep, curves, surfaces) | `build/open2open/tests/test_brep_complex` | 14/14 |
 | OCCT .brep round-trip | `build/open2open/tests/test_occ_roundtrip OCCT-7_9_3/data/occ` | 35/37 |
+| STEP-derived .brep round-trip | `build/open2open/tests/test_occ_roundtrip step_brep` | 40/41 |
 | openNURBS 3dm examples | `build/open2open/tests/test_3dm_examples opennurbs-8.24.25281.15001/example_files` | 1204/1209 |
 | test3dm round-trip | `build/open2open/tests/test_3dm_roundtrip test3dm` | 9425/9431 |
+| STEP round-trip (needs STEP_Models submodules) | `build/open2open/tests/test_step_roundtrip STEP_Models` | ~511/547 |
 
 The `.3dm.gz` file (`YachtMod(55).3dm.gz`) is decompressed automatically at
 runtime by `test_3dm_roundtrip` using `gzip -d -c`.
+
+## step2brep — Pre-converting STEP files to .brep
+
+The `step2brep` tool converts STEP files to OCCT `.brep` format so that shapes
+can be committed to `step_brep/` and tested with `test_occ_roundtrip` without
+STEP reading at test time.  It is built automatically when OCCT with DataExchange
+support is present (`build_artifacts/occt/lib/libTKDESTEP.a`).
+
+```bash
+# Convert all STEP files in STEP_Models/ → step_brep/
+build/open2open/tools/step2brep  STEP_Models/  step_brep/
+
+# Commit files you want for regression testing
+git add step_brep/<specific>.brep
+```
+
+The `step_brep/` directory already contains a curated set of shapes:
+- `carry_lever_spring_tool_0.brep` — single-part spring tool from Curta
+- `Curta_Assembly_0`…`_19.brep` — first 20 Curta assembly solids
+- `Curta_Assembly_N.brep` for known-failing shapes (#34, #47, #68, …)
 
 ## Key Conventions in `brep_convert.cpp`
 

@@ -115,3 +115,13 @@ target_link_libraries(open2open
 # ---------------------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests)
+
+# ---------------------------------------------------------------------------
+# 5. Tools (step2brep converter, etc.)
+# ---------------------------------------------------------------------------
+# Only build tools when STEP-capable OCCT is available (DataExchange module).
+# build_artifacts/occt provides TKDESTEP; if it's absent we skip the tools
+# subdirectory silently so plain builds still work.
+if(TARGET TKDESTEP OR EXISTS "${REPO_ROOT}/build_artifacts/occt/lib/libTKDESTEP.a")
+    add_subdirectory(tools)
+endif()
