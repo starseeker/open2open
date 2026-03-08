@@ -4,3 +4,13 @@
 [submodule "freecad-models"]
 	path = freecad-models
 	url = https://github.com/fmorgner/freecad-models.git
+[submodule "STEP_Models/Curta-Type-I-3x"]
+	path = STEP_Models/Curta-Type-I-3x
+	url = https://github.com/marcuswu/Curta-Type-I-3x.git
+[submodule "STEP_Models/brlcad-models"]
+	path = STEP_Models/brlcad-models
+	url = https://github.com/BRL-CAD/models.git
+[submodule "STEP_Models/virtualagc"]
+	path = STEP_Models/virtualagc
+	url = https://github.com/virtualagc/virtualagc.git
+	branch = mechanical

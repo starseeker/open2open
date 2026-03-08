@@ -1543,11 +1543,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         if (trim.m_type != ON_BrepTrim::seam &&
             trim.m_type != ON_BrepTrim::singular) continue;
         // Skip trims that already have proper boundary iso.
-        // Seam trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2) are
-        // interior-only and invalid for seam trims.
+        // Seam and singular trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2)
+        // are interior-only and invalid for seam and singular trims.
         const bool needs_repair =
             (trim.m_iso == ON_Surface::not_iso) ||
-            (trim.m_type == ON_BrepTrim::seam &&
+            ((trim.m_type == ON_BrepTrim::seam ||
+              trim.m_type == ON_BrepTrim::singular) &&
              (trim.m_iso == ON_Surface::x_iso ||
               trim.m_iso == ON_Surface::y_iso));
         if (!needs_repair) continue;
@@ -1580,52 +1581,122 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // After B-spline conversion the degenerate locus may not be perfectly
         // iso, but if ANY CV is at a surface boundary we can infer the
         // correct iso line and snap all CVs to it.
-        if (!snap_u && !snap_v && trim.m_type == ON_BrepTrim::singular) {
+        //
+        // For singular trims we also use domain-relative tolerances: 1e-4
+        // absolute is too tight for large B-spline surfaces (domain ≫ 1).
+        // We also allow a greedy "pick smallest-variation axis" approach when
+        // even the domain-relative check fails, since openNURBS requires
+        // singular trims to have W/E/N/S_iso (boundary iso), not not_iso.
+        if (trim.m_type == ON_BrepTrim::singular) {
             const int li_s  = trim.m_li;
             const int fi_s  = (li_s >= 0 && li_s < brep.m_L.Count())
                                   ? brep.m_L[li_s].m_fi : -1;
             const ON_Surface* srf_s = (fi_s >= 0 && fi_s < brep.m_F.Count())
                                           ? brep.m_F[fi_s].SurfaceOf() : nullptr;
-            if (srf_s) {
+            if (srf_s && (!snap_u || !snap_v)) {
                 double su0s=0,su1s=0,sv0s=0,sv1s=0;
                 srf_s->GetDomain(0,&su0s,&su1s);
                 srf_s->GetDomain(1,&sv0s,&sv1s);
-                // Tolerance for checking whether CV[0] lies on a surface boundary.
-                const double kSingularBoundaryTol = 1e-4;
-                // Helper: snap a value to the nearest domain boundary (or return val).
-                auto snap_axis = [&](double val, double bnd0, double bnd1) -> double {
-                    if (fabs(val-bnd0) <= kSingularBoundaryTol) return bnd0;
-                    if (fabs(val-bnd1) <= kSingularBoundaryTol) return bnd1;
-                    return val;
-                };
-                auto at_bnd = [&](double val, double bnd0, double bnd1) -> bool {
-                    return fabs(val-bnd0) <= kSingularBoundaryTol
-                        || fabs(val-bnd1) <= kSingularBoundaryTol;
-                };
-                const double* cv0 = nc->CV(0);
-                double w0 = rat ? cv0[nc->m_dim] : 1.0;
-                if (w0==0.0) w0=1.0;
-                if (at_bnd(cv0[1]/w0, sv0s, sv1s)) {
-                    // Anchor V to this boundary value and snap all CVs.
-                    double v_anchor = snap_axis(cv0[1]/w0, sv0s, sv1s);
-                    for (int p=0;p<nCV;++p) {
+                const double uDom = su1s - su0s;
+                const double vDom = sv1s - sv0s;
+                // kDomRelFrac: threshold for "nearly constant" in relative terms
+                // (1% of domain extent, or absolute 1e-4, whichever is larger).
+                // Singular trim pcurves can have small numerical drift after
+                // B-spline conversion on large surfaces.
+                // kBndRelFrac: wider threshold (5%) for "near a surface boundary".
+                // Boundary detection needs more slack than general iso detection
+                // because the pcurve endpoint may land slightly away from the
+                // exact surface boundary in the B-spline representation.
+                const double kDomRelFrac = 0.01;
+                const double kBndRelFrac = 0.05;
+                const double uRelTol = (uDom > 0) ? std::max(kIsoTol, kDomRelFrac * uDom) : kIsoTol;
+                const double vRelTol = (vDom > 0) ? std::max(kIsoTol, kDomRelFrac * vDom) : kIsoTol;
+                const double uBndTol = (uDom > 0) ? std::max(kIsoTol, kBndRelFrac * uDom) : kIsoTol;
+                const double vBndTol = (vDom > 0) ? std::max(kIsoTol, kBndRelFrac * vDom) : kIsoTol;
+
+                // Helper: snap all CVs' U (axis=0) or V (axis=1) to anchor.
+                auto snap_all_cvs = [&](int axis, double anchor) {
+                    for (int p = 0; p < nCV; ++p) {
                         double* cv = nc->CV(p);
                         double w = rat ? cv[nc->m_dim] : 1.0;
-                        if (w==0.0) w=1.0;
-                        cv[1] = v_anchor * w;
+                        if (w == 0.0) w = 1.0;
+                        cv[axis] = anchor * w;
                     }
-                    snap_v = true;
-                    vMin = vMax = v_anchor;
-                } else if (at_bnd(cv0[0]/w0, su0s, su1s)) {
-                    double u_anchor = snap_axis(cv0[0]/w0, su0s, su1s);
-                    for (int p=0;p<nCV;++p) {
-                        double* cv = nc->CV(p);
-                        double w = rat ? cv[nc->m_dim] : 1.0;
-                        if (w==0.0) w=1.0;
-                        cv[0] = u_anchor * w;
+                };
+                auto nearest_bnd = [](double val, double b0, double b1) -> double {
+                    return (fabs(val-b0) <= fabs(val-b1)) ? b0 : b1;
+                };
+                auto near_bnd_tol = [](double val, double b0, double b1,
+                                        double tol) -> bool {
+                    return fabs(val-b0) <= tol || fabs(val-b1) <= tol;
+                };
+
+                if (!snap_u && (uMax - uMin) <= uRelTol) snap_u = true;
+                if (!snap_v && (vMax - vMin) <= vRelTol) snap_v = true;
+
+                // If still neither, try to match CV mean to a surface boundary.
+                if (!snap_u && !snap_v) {
+                    double uMean = 0.5*(uMin+uMax), vMean = 0.5*(vMin+vMax);
+                    if (near_bnd_tol(vMean, sv0s, sv1s, vBndTol)) {
+                        double v_anchor = nearest_bnd(vMean, sv0s, sv1s);
+                        snap_all_cvs(1, v_anchor);
+                        snap_v = true;
+                        vMin = vMax = v_anchor;
+                    } else if (near_bnd_tol(uMean, su0s, su1s, uBndTol)) {
+                        double u_anchor = nearest_bnd(uMean, su0s, su1s);
+                        snap_all_cvs(0, u_anchor);
+                        snap_u = true;
+                        uMin = uMax = u_anchor;
+                    } else if (uDom > 0 && vDom > 0) {
+                        // Last resort: pick the axis with smallest relative
+                        // variation and force-snap to nearest boundary.
+                        // openNURBS requires singular trims to be boundary-iso,
+                        // so this is always the correct direction to try.
+                        // Safety: since the singular trim maps to a single 3D
+                        // point (degenerate edge), snapping the pcurve's "iso"
+                        // axis to the nearest surface boundary preserves the
+                        // 3D geometry while satisfying openNURBS's topology
+                        // constraint.  Adjacent trim endpoints are corrected
+                        // by the junction-gap repair pass below.
+                        double uRelVar = (uMax - uMin) / uDom;
+                        double vRelVar = (vMax - vMin) / vDom;
+                        if (vRelVar <= uRelVar) {
+                            double v_anchor = nearest_bnd(vMean, sv0s, sv1s);
+                            snap_all_cvs(1, v_anchor);
+                            snap_v = true;
+                            vMin = vMax = v_anchor;
+                        } else {
+                            double u_anchor = nearest_bnd(uMean, su0s, su1s);
+                            snap_all_cvs(0, u_anchor);
+                            snap_u = true;
+                            uMin = uMax = u_anchor;
+                        }
                     }
-                    snap_u = true;
-                    uMin = uMax = u_anchor;
+                }
+
+                // Also check CV[0] directly against boundaries with relative
+                // tolerance, for cases where snap_u XOR snap_v is still false.
+                if (!snap_v) {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                    if (w0==0.0) w0=1.0;
+                    if (near_bnd_tol(cv0[1]/w0, sv0s, sv1s, vRelTol)) {
+                        double v_anchor = nearest_bnd(cv0[1]/w0, sv0s, sv1s);
+                        snap_all_cvs(1, v_anchor);
+                        snap_v = true;
+                        vMin = vMax = v_anchor;
+                    }
+                }
+                if (!snap_u) {
+                    const double* cv0 = nc->CV(0);
+                    double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                    if (w0==0.0) w0=1.0;
+                    if (near_bnd_tol(cv0[0]/w0, su0s, su1s, uRelTol)) {
+                        double u_anchor = nearest_bnd(cv0[0]/w0, su0s, su1s);
+                        snap_all_cvs(0, u_anchor);
+                        snap_u = true;
+                        uMin = uMax = u_anchor;
+                    }
                 }
             }
         }
@@ -1633,7 +1704,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         if (!snap_u && !snap_v) continue;  // not iso-like — skip
 
         // Snap to exact iso: snap to the nearest surface domain
-        // boundary (if the iso value is within 1e-4 of a boundary) or
+        // boundary (if the iso value is within 1% of a boundary) or
         // to the mean otherwise (interior iso curves).
         {
             const int li = trim.m_li;
@@ -1653,10 +1724,33 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (fabs(val - d1) <= tol) return d1;
                 return val;  // interior
             };
+            // For singular trims, ALWAYS snap to the nearest surface boundary.
+            // openNURBS requires singular trims to have W/E/N/S_iso.  If the
+            // singularity is at an interior parameter (e.g. due to B-spline
+            // conversion changing the parameterization), we must force it to
+            // the nearest boundary.  The adjacent trim endpoints are corrected
+            // by the junction-gap repair pass that follows below.
+            auto snap_to_nearest = [](double val, double d0, double d1) -> double {
+                return (fabs(val-d0) <= fabs(val-d1)) ? d0 : d1;
+            };
+            const bool is_singular = (trim.m_type == ON_BrepTrim::singular);
+            // kDomRelFrac: 1% of domain for boundary-snap tolerance.
+            // (Same value as the kDomRelFrac in the singular-trim block above
+            // and in the still_bad fallback block below; all three use the
+            // same 1% threshold for consistency.)
+            const double kDomRelFrac = 0.01;
 
             if (snap_u) {
                 double u_iso = 0.5 * (uMin + uMax);
-                if (srf) u_iso = snap_to_boundary(u_iso, su0, su1, 1e-4);
+                if (srf) {
+                    const double bndTol = std::max(1e-4, kDomRelFrac*(su1-su0));
+                    double u_snapped = snap_to_boundary(u_iso, su0, su1, bndTol);
+                    if (u_snapped == u_iso && is_singular) {
+                        // Interior U: force to nearest boundary
+                        u_snapped = snap_to_nearest(u_iso, su0, su1);
+                    }
+                    u_iso = u_snapped;
+                }
                 for (int p = 0; p < nCV; ++p) {
                     double* cv = nc->CV(p);
                     double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1665,7 +1759,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 }
             } else {
                 double v_iso = 0.5 * (vMin + vMax);
-                if (srf) v_iso = snap_to_boundary(v_iso, sv0, sv1, 1e-4);
+                if (srf) {
+                    const double bndTol = std::max(1e-4, kDomRelFrac*(sv1-sv0));
+                    double v_snapped = snap_to_boundary(v_iso, sv0, sv1, bndTol);
+                    if (v_snapped == v_iso && is_singular) {
+                        // Interior V: force to nearest boundary
+                        v_snapped = snap_to_nearest(v_iso, sv0, sv1);
+                    }
+                    v_iso = v_snapped;
+                }
                 for (int p = 0; p < nCV; ++p) {
                     double* cv = nc->CV(p);
                     double w = rat ? cv[nc->m_dim] : 1.0;
@@ -1687,7 +1789,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // seam trims require W/E/S/N_iso.
         const bool still_bad =
             (trim.m_iso == ON_Surface::not_iso) ||
-            (trim.m_type == ON_BrepTrim::seam &&
+            ((trim.m_type == ON_BrepTrim::seam ||
+              trim.m_type == ON_BrepTrim::singular) &&
              (trim.m_iso == ON_Surface::x_iso ||
               trim.m_iso == ON_Surface::y_iso));
         if (still_bad) {
@@ -1700,22 +1803,26 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 double su0=0, su1=0, sv0=0, sv1=0;
                 srf2->GetDomain(0, &su0, &su1);
                 srf2->GetDomain(1, &sv0, &sv1);
-                const double kBndTol = 1e-4;
+                // Use domain-relative tolerance (kDomRelFrac = 1% of domain
+                // extent, or absolute 1e-4, whichever is larger).
+                const double kDomRelFrac = 0.01;
+                const double uBndTol = std::max(1e-4, kDomRelFrac*(su1-su0));
+                const double vBndTol = std::max(1e-4, kDomRelFrac*(sv1-sv0));
                 if (snap_u) {
                     const double* cv0 = nc->CV(0);
                     double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
                     if (w0 == 0.0) w0 = 1.0;
                     double u0 = cv0[0] / w0;
-                    if      (fabs(u0 - su0) <= kBndTol) trim.m_iso = ON_Surface::W_iso;
-                    else if (fabs(u0 - su1) <= kBndTol) trim.m_iso = ON_Surface::E_iso;
+                    if      (fabs(u0 - su0) <= uBndTol) trim.m_iso = ON_Surface::W_iso;
+                    else if (fabs(u0 - su1) <= uBndTol) trim.m_iso = ON_Surface::E_iso;
                     else                                 trim.m_iso = ON_Surface::x_iso;
                 } else {
                     const double* cv0 = nc->CV(0);
                     double w0 = nc->IsRational() ? cv0[nc->m_dim] : 1.0;
                     if (w0 == 0.0) w0 = 1.0;
                     double v0 = cv0[1] / w0;
-                    if      (fabs(v0 - sv0) <= kBndTol) trim.m_iso = ON_Surface::S_iso;
-                    else if (fabs(v0 - sv1) <= kBndTol) trim.m_iso = ON_Surface::N_iso;
+                    if      (fabs(v0 - sv0) <= vBndTol) trim.m_iso = ON_Surface::S_iso;
+                    else if (fabs(v0 - sv1) <= vBndTol) trim.m_iso = ON_Surface::N_iso;
                     else                                 trim.m_iso = ON_Surface::y_iso;
                 }
             }
@@ -1849,6 +1956,95 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         lp.m_pbox.m_min.z = 0.0;
         lp.m_pbox.m_max.z = 0.0;
     }
+
+    // ---------------------------------------------------------------------------
+    // Post-processing pass: close small UV gaps between adjacent regular trims.
+    //
+    // The openNURBS loop validity check requires that the end of each trim UV
+    // matches the start of the next trim within tolerance.  Small floating-point
+    // discrepancies (e.g. 0.001) can arise when converting OCCT B-spline pcurve
+    // endpoints to ON_NurbsCurve form.  For non-seam trim pairs with gaps larger
+    // than tolerance but ≤ 0.01, snap the endpoint CVs to the average of the two
+    // mismatched UV points.  Seam and singular trims are handled by the
+    // junction-gap repair in the seam/singular pass above; skip them here.
+    // ---------------------------------------------------------------------------
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        const ON_BrepLoop& lp = brep.m_L[li];
+        const int n = lp.m_ti.Count();
+        for (int k = 0; k < n; ++k) {
+            const int ti0 = lp.m_ti[k];
+            const int ti1 = lp.m_ti[(k + 1) % n];
+            if (ti0 < 0 || ti0 >= brep.m_T.Count()) continue;
+            if (ti1 < 0 || ti1 >= brep.m_T.Count()) continue;
+            ON_BrepTrim& t0 = brep.m_T[ti0];
+            ON_BrepTrim& t1 = brep.m_T[ti1];
+            // Skip if either trim is seam or singular — handled elsewhere.
+            if (t0.m_type == ON_BrepTrim::seam ||
+                t0.m_type == ON_BrepTrim::singular ||
+                t1.m_type == ON_BrepTrim::seam ||
+                t1.m_type == ON_BrepTrim::singular) continue;
+            // Get pcurves.
+            if (t0.m_c2i < 0 || t0.m_c2i >= brep.m_C2.Count()) continue;
+            if (t1.m_c2i < 0 || t1.m_c2i >= brep.m_C2.Count()) continue;
+            ON_NurbsCurve* nc0 = ON_NurbsCurve::Cast(brep.m_C2[t0.m_c2i]);
+            ON_NurbsCurve* nc1 = ON_NurbsCurve::Cast(brep.m_C2[t1.m_c2i]);
+            if (!nc0 || !nc1) continue;
+            if (nc0->CVCount() < 1 || nc1->CVCount() < 1) continue;
+            // Compute UV gap between t0 end and t1 start.
+            ON_3dPoint p0 = t0.PointAtEnd();
+            ON_3dPoint p1 = t1.PointAtStart();
+            const double dx = fabs(p0.x - p1.x);
+            const double dy = fabs(p0.y - p1.y);
+            // kMaxUVGap: maximum gap size to snap.  0.01 covers typical
+            // floating-point drift from B-spline endpoint rounding (empirically
+            // ~0.001 for PCB shapes in the phasma-mech-assembly test suite) while
+            // rejecting genuinely mismatched trims that indicate a deeper error.
+            const double kMaxUVGap = 0.01;
+            if (dx <= ON_ZERO_TOLERANCE && dy <= ON_ZERO_TOLERANCE) continue;
+            if (dx > kMaxUVGap || dy > kMaxUVGap) continue; // too large; skip
+            // Average the gap and snap both endpoints to it.
+            double avg_x = 0.5 * (p0.x + p1.x);
+            double avg_y = 0.5 * (p0.y + p1.y);
+            // Snap t0's last CV to (avg_x, avg_y).
+            {
+                const int last = nc0->CVCount() - 1;
+                double* cv = nc0->CV(last);
+                double w = nc0->IsRational() ? cv[nc0->m_dim] : 1.0;
+                if (w == 0.0) w = 1.0;
+                cv[0] = avg_x * w;
+                cv[1] = avg_y * w;
+                t0.m_pbox = brep.m_C2[t0.m_c2i]->BoundingBox();
+                t0.m_pbox.m_min.z = 0.0;
+                t0.m_pbox.m_max.z = 0.0;
+            }
+            // Snap t1's first CV to (avg_x, avg_y).
+            {
+                double* cv = nc1->CV(0);
+                double w = nc1->IsRational() ? cv[nc1->m_dim] : 1.0;
+                if (w == 0.0) w = 1.0;
+                cv[0] = avg_x * w;
+                cv[1] = avg_y * w;
+                t1.m_pbox = brep.m_C2[t1.m_c2i]->BoundingBox();
+                t1.m_pbox.m_min.z = 0.0;
+                t1.m_pbox.m_max.z = 0.0;
+            }
+        }
+    }
+
+    // Rebuild loop pboxes again after the general UV gap repair.
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        ON_BrepLoop& lp = brep.m_L[li];
+        lp.m_pbox.Destroy();
+        for (int k = 0; k < lp.m_ti.Count(); ++k) {
+            int tki = lp.m_ti[k];
+            if (tki >= 0 && tki < brep.m_T.Count())
+                lp.m_pbox.Union(brep.m_T[tki].m_pbox);
+        }
+        lp.m_pbox.m_min.z = 0.0;
+        lp.m_pbox.m_max.z = 0.0;
+    }
+
+
 
     // ---------------------------------------------------------------------------
     // Post-processing pass: fix edge tolerances so that ON_Brep::IsValid() passes
@@ -2040,45 +2236,42 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
         double scale = (span_s > 1e-14) ? (span_e / span_s) : 1.0;
 
-        // Guard: if the span ratio is extreme (>> 1 or << 1), the C1 snap
-        // would displace CV[n-2] or CV[1] by a huge amount, distorting the
-        // pcurve severely and causing BRepCheck_UnorientableShape in the
-        // round-trip OCCT shape.  Skip the snap in such cases.
-        if (scale > 10.0 || scale < 0.1 || scale != scale) continue;
+        // Guard: if the span ratio is extreme (>> 1 or << 1), the 2D pcurve
+        // C1 snap would displace CV[n-2] or CV[1] by a huge amount, distorting
+        // the pcurve severely and causing BRepCheck_UnorientableShape in the
+        // round-trip OCCT shape.  Skip only the 2D snap in such cases; the
+        // 3D edge snap and bRev3d flip below still run.
+        const bool do_2d_snap = !(scale > 10.0 || scale < 0.1 || scale != scale);
 
-        ON_2dPoint cv0  = get_cv2d(0);
-        ON_2dPoint cv1  = get_cv2d(1);
-        ON_2dPoint cvn1 = get_cv2d(nCV-1);
-        ON_2dPoint cvn2 = get_cv2d(nCV-2);
+        if (do_2d_snap) {
+            ON_2dPoint cv0  = get_cv2d(0);
+            ON_2dPoint cv1  = get_cv2d(1);
+            ON_2dPoint cvn1 = get_cv2d(nCV-1);
+            ON_2dPoint cvn2 = get_cv2d(nCV-2);
 
-        if (d1 < 0.0) {
-            // End tangent bad: snap CV[n-2] to enforce T_end = T_start
-            // T_start direction in 2D: (cv1 - cv0) / span_s
-            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
-            // C1 closure: (cvn1 - cvn2_new) / span_e = (cv1 - cv0) / span_s
-            ON_2dPoint cvn2_new;
-            cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
-            cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
-            set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
-        } else {
-            // Start tangent bad: snap CV[1] to enforce T_start = T_end
-            // T_end   direction in 2D: (cvn1 - cvn2) / span_e
-            // C1 closure: (cv1_new - cv0) / span_s = (cvn1 - cvn2) / span_e
-            ON_2dPoint cv1_new;
-            cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
-            cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
-            set_cv2d(1, cv1_new, get_cv_weight(1));
+            if (d1 < 0.0) {
+                // End tangent bad: snap CV[n-2] to enforce T_end = T_start
+                ON_2dPoint cvn2_new;
+                cvn2_new.x = cvn1.x - (cv1.x - cv0.x) * scale;
+                cvn2_new.y = cvn1.y - (cv1.y - cv0.y) * scale;
+                set_cv2d(nCV-2, cvn2_new, get_cv_weight(nCV-2));
+            } else {
+                // Start tangent bad: snap CV[1] to enforce T_start = T_end
+                ON_2dPoint cv1_new;
+                cv1_new.x = cv0.x + (cvn1.x - cvn2.x) / scale;
+                cv1_new.y = cv0.y + (cvn1.y - cvn2.y) / scale;
+                set_cv2d(1, cv1_new, get_cv_weight(1));
+            }
         }
 
-        // After the 2D pcurve snap, recheck.  If d1 is still bad and the
-        // 3D edge itself has a C1 kink at domain[1] (tangent reverses at
-        // the close of the closed curve), snap the 3D edge curve's CV[n-2]
-        // to enforce C1 closure.  Only apply when d0 is good (the kink is
-        // at the end), and the edge is used only by closed trims so the
-        // 3D curve modification cannot break non-closed trims.
+        // After the 2D pcurve snap (if applied), recheck.  If d1 is still bad
+        // (or the 2D snap was skipped due to scale guard), also try the 3D
+        // edge curve: snap CV[n-2] to remove a C1 kink at the seam, then
+        // re-evaluate and flip bRev3d if the flip gives a better result.
         {
             auto [pd0, pd1] = compute_checks(trim);
-            if (pd1 < 0.0) {
+            // Try to snap the 3D edge when either endpoint check fails
+            if (pd0 < 0.0 || pd1 < 0.0) {
                 ON_NurbsCurve* ec = ON_NurbsCurve::Cast(
                     brep.m_C3[brep.m_E[trim.m_ei].m_c3i]);
                 if (ec && ec->Degree() >= 1 && ec->CVCount() >= 3) {
@@ -2091,7 +2284,16 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     if (ekc >= edeg + 1)
                         esp_e = ec->m_knot[ekc-1] - ec->m_knot[ekc-1-edeg];
                     double escale = (esp_s > 1e-14) ? (esp_e / esp_s) : 1.0;
-                    if (escale > 0.1 && escale < 10.0) {
+                    // Widen the escale guard: even if span ratio is up to 100,
+                    // the snap can be worthwhile when the kink is near-180°.
+                    // The snap just moves one CV slightly; a large span ratio
+                    // means the CV moves proportionally more but the 3D kink
+                    // fix is still useful.  Only skip if escale is degenerate
+                    // (NaN/Inf/zero span).
+                    bool escale_ok = (esp_s > 1e-14) &&
+                                     (escale == escale) && // not NaN
+                                     (escale > 1e-6) && (escale < 1e6);
+                    if (escale_ok) {
                         auto eget = [&](int i) -> ON_3dPoint {
                             ON_4dPoint h; ec->GetCV(i, h);
                             double w = (h.w != 0.0) ? h.w : 1.0;
@@ -2103,17 +2305,86 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         };
                         ON_3dPoint ep0 = eget(0), ep1 = eget(1);
                         ON_3dPoint epn1 = eget(enc-1), epn2 = eget(enc-2);
-                        // Snap CV[n-2] so end tangent = start tangent
-                        ON_3dPoint epn2_new(
-                            epn1.x - (ep1.x - ep0.x) * escale,
-                            epn1.y - (ep1.y - ep0.y) * escale,
-                            epn1.z - (ep1.z - ep0.z) * escale);
-                        double ew2 = ew(enc-2);
-                        ec->SetCV(enc-2, ON_4dPoint(
-                            epn2_new.x * ew2,
-                            epn2_new.y * ew2,
-                            epn2_new.z * ew2,
-                            ew2));
+                        if (pd1 < 0.0) {
+                            // End tangent bad: snap CV[n-2] so end tan = start tan
+                            ON_3dPoint epn2_new(
+                                epn1.x - (ep1.x - ep0.x) * escale,
+                                epn1.y - (ep1.y - ep0.y) * escale,
+                                epn1.z - (ep1.z - ep0.z) * escale);
+                            double ew2 = ew(enc-2);
+                            ec->SetCV(enc-2, ON_4dPoint(
+                                epn2_new.x * ew2,
+                                epn2_new.y * ew2,
+                                epn2_new.z * ew2,
+                                ew2));
+                        } else {
+                            // Start tangent bad: snap CV[1] so start tan = end tan
+                            double inv_sc = (escale > 1e-14) ? (1.0/escale) : 1.0;
+                            ON_3dPoint ep1_new(
+                                ep0.x + (epn1.x - epn2.x) * inv_sc,
+                                ep0.y + (epn1.y - epn2.y) * inv_sc,
+                                ep0.z + (epn1.z - epn2.z) * inv_sc);
+                            double ew1 = ew(1);
+                            ec->SetCV(1, ON_4dPoint(
+                                ep1_new.x * ew1,
+                                ep1_new.y * ew1,
+                                ep1_new.z * ew1,
+                                ew1));
+                        }
+                    }
+                }
+
+                // After the 3D edge snap removes the C1 kink, re-evaluate the
+                // tangent checks.  If bRev3d is wrong, the kink may have been
+                // the only thing making one of the checks pass; once the kink is
+                // gone both checks become clearly negative under the wrong flag.
+                // Flip bRev3d if the min check improves under the flipped flag.
+                {
+                    trim.m_bRev3d = !trim.m_bRev3d;
+                    auto [fd0, fd1] = compute_checks(trim);
+                    if (std::min(fd0, fd1) > std::min(pd0, pd1)) {
+                        // Flipped orientation is better; keep it.
+                        // Also re-snap CV[n-2] of the 2D pcurve now that bRev3d
+                        // is corrected (the tangent reference direction flipped).
+                        if (trim.m_c2i >= 0 && trim.m_c2i < brep.m_C2.Count()) {
+                            ON_NurbsCurve* nc2 = ON_NurbsCurve::Cast(
+                                brep.m_C2[trim.m_c2i]);
+                            if (nc2 && nc2->CVCount() >= 3) {
+                                const int nc = nc2->CVCount();
+                                const int deg2 = nc2->Degree();
+                                const int kc2  = nc2->KnotCount();
+                                double ss = 0.0, se = 0.0;
+                                if (kc2 > deg2)
+                                    ss = nc2->m_knot[deg2] - nc2->m_knot[0];
+                                if (kc2 >= deg2 + 1)
+                                    se = nc2->m_knot[kc2-1] - nc2->m_knot[kc2-1-deg2];
+                                double sc2 = (ss > 1e-14) ? (se / ss) : 1.0;
+                                if (sc2 > 0.1 && sc2 < 10.0) {
+                                    auto g2 = [&](int i) -> ON_2dPoint {
+                                        ON_4dPoint h; nc2->GetCV(i, h);
+                                        double w = (h.w != 0.0) ? h.w : 1.0;
+                                        return ON_2dPoint(h.x/w, h.y/w);
+                                    };
+                                    auto gw2 = [&](int i) -> double {
+                                        ON_4dPoint h; nc2->GetCV(i, h);
+                                        return (h.w != 0.0) ? h.w : 1.0;
+                                    };
+                                    auto s2 = [&](int i, const ON_2dPoint& p, double w) {
+                                        nc2->SetCV(i, ON_4dPoint(p.x*w, p.y*w, 0.0, w));
+                                    };
+                                    ON_2dPoint p0 = g2(0), p1 = g2(1);
+                                    ON_2dPoint pn1 = g2(nc-1);
+                                    // snap end tangent to start tangent
+                                    ON_2dPoint pn2_new;
+                                    pn2_new.x = pn1.x - (p1.x - p0.x) * sc2;
+                                    pn2_new.y = pn1.y - (p1.y - p0.y) * sc2;
+                                    s2(nc-2, pn2_new, gw2(nc-2));
+                                }
+                            }
+                        }
+                    } else {
+                        // Flipped is not better; restore.
+                        trim.m_bRev3d = !trim.m_bRev3d;
                     }
                 }
             }

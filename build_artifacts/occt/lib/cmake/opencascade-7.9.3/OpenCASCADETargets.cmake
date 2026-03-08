@@ -26,7 +26,7 @@ set(CMAKE_IMPORT_FILE_VERSION 1)
 set(_cmake_targets_defined "")
 set(_cmake_targets_not_defined "")
 set(_cmake_expected_targets "")
-foreach(_cmake_expected_target IN ITEMS TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep TKGeomAlgo TKTopAlgo TKPrim TKBO TKShHealing TKBool TKHLR TKFillet TKOffset TKFeat TKMesh TKXMesh TKExpress)
+foreach(_cmake_expected_target IN ITEMS TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep TKGeomAlgo TKTopAlgo TKPrim TKBO TKShHealing TKBool TKHLR TKFillet TKOffset TKFeat TKMesh TKXMesh TKExpress TKCDF TKLCAF TKCAF TKBinL TKXmlL TKBin TKXml TKStdL TKStd TKTObj TKBinTObj TKXmlTObj TKVCAF TKService TKV3d TKDE TKXSBase TKXCAF TKDESTEP TKBinXCAF TKXmlXCAF TKDECascade)
   list(APPEND _cmake_expected_targets "${_cmake_expected_target}")
   if(TARGET "${_cmake_expected_target}")
     list(APPEND _cmake_targets_defined "${_cmake_expected_target}")
@@ -51,7 +51,6 @@ endif()
 unset(_cmake_targets_defined)
 unset(_cmake_targets_not_defined)
 unset(_cmake_expected_targets)
-
 
 # Create imported target TKernel
 add_library(TKernel STATIC IMPORTED)
@@ -318,6 +317,293 @@ set_target_properties(TKExpress PROPERTIES
   IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "C;CXX"
   IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKExpress.a"
   )
+
+# Create imported target TKCDF
+add_library(TKCDF STATIC IMPORTED)
+set_target_properties(TKCDF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKernel"
+)
+
+# Create imported target TKLCAF
+add_library(TKLCAF STATIC IMPORTED)
+set_target_properties(TKLCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKernel;TKMath"
+)
+
+# Create imported target TKCAF
+add_library(TKCAF STATIC IMPORTED)
+set_target_properties(TKCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKernel;TKMath"
+)
+
+# Create imported target TKBinL
+add_library(TKBinL STATIC IMPORTED)
+set_target_properties(TKBinL PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKernel;TKMath"
+)
+
+# Create imported target TKXmlL
+add_library(TKXmlL STATIC IMPORTED)
+set_target_properties(TKXmlL PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKernel"
+)
+
+# Create imported target TKBin
+add_library(TKBin STATIC IMPORTED)
+set_target_properties(TKBin PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKCAF;TKBinL;TKernel;TKMath"
+)
+
+# Create imported target TKXml
+add_library(TKXml STATIC IMPORTED)
+set_target_properties(TKXml PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKCAF;TKXmlL;TKernel"
+)
+
+# Create imported target TKStdL
+add_library(TKStdL STATIC IMPORTED)
+set_target_properties(TKStdL PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKernel;TKMath;TKG2d;TKG3d;TKBRep;TKGeomBase;TKGeomAlgo;TKTopAlgo;TKBRep;TKBinL;TKXmlL"
+)
+
+# Create imported target TKStd
+add_library(TKStd STATIC IMPORTED)
+set_target_properties(TKStd PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKCAF;TKBin;TKXml;TKStdL;TKBinL;TKXmlL;TKernel;TKMath;TKG2d;TKG3d;TKBRep;TKGeomBase;TKTopAlgo"
+)
+
+# Create imported target TKTObj
+add_library(TKTObj STATIC IMPORTED)
+set_target_properties(TKTObj PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKCAF;TKBinL;TKXmlL;TKernel;TKMath"
+)
+
+# Create imported target TKBinTObj
+add_library(TKBinTObj STATIC IMPORTED)
+set_target_properties(TKBinTObj PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKTObj;TKBinL;TKCDF;TKLCAF;TKernel"
+)
+
+# Create imported target TKXmlTObj
+add_library(TKXmlTObj STATIC IMPORTED)
+set_target_properties(TKXmlTObj PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKTObj;TKXmlL;TKCDF;TKLCAF;TKernel"
+)
+
+# Create imported target TKVCAF
+add_library(TKVCAF STATIC IMPORTED)
+set_target_properties(TKVCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKCDF;TKLCAF;TKCAF;TKernel"
+)
+
+# Create imported target TKService
+add_library(TKService STATIC IMPORTED)
+set_target_properties(TKService PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKernel;TKMath"
+)
+
+# Create imported target TKV3d
+add_library(TKV3d STATIC IMPORTED)
+set_target_properties(TKV3d PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKService;TKBRep;TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKGeomAlgo;TKTopAlgo;TKMesh;TKShHealing"
+)
+
+# Create imported target TKDE
+add_library(TKDE STATIC IMPORTED)
+set_target_properties(TKDE PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKernel;TKMath;TKBRep;TKG2d;TKG3d;TKGeomBase;TKTopAlgo;TKShHealing"
+)
+
+# Create imported target TKXSBase
+add_library(TKXSBase STATIC IMPORTED)
+set_target_properties(TKXSBase PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKDE;TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKBRep;TKTopAlgo;TKShHealing;TKGeomAlgo"
+)
+
+# Create imported target TKXCAF
+add_library(TKXCAF STATIC IMPORTED)
+set_target_properties(TKXCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKV3d;TKService;TKCDF;TKLCAF;TKCAF;TKBRep;TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKGeomAlgo;TKTopAlgo;TKMesh;TKShHealing"
+)
+
+# Create imported target TKDESTEP
+add_library(TKDESTEP STATIC IMPORTED)
+set_target_properties(TKDESTEP PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKDE;TKXSBase;TKXCAF;TKCDF;TKLCAF;TKBRep;TKernel;TKMath;TKG2d;TKG3d;TKGeomBase;TKTopAlgo;TKShHealing"
+)
+
+# Create imported target TKBinXCAF
+add_library(TKBinXCAF STATIC IMPORTED)
+set_target_properties(TKBinXCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKXCAF;TKBin;TKBinL;TKCDF;TKLCAF;TKCAF;TKernel"
+)
+
+# Create imported target TKXmlXCAF
+add_library(TKXmlXCAF STATIC IMPORTED)
+set_target_properties(TKXmlXCAF PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKXCAF;TKXml;TKXmlL;TKCDF;TKLCAF;TKCAF;TKernel"
+)
+
+# Create imported target TKDECascade
+add_library(TKDECascade STATIC IMPORTED)
+set_target_properties(TKDECascade PROPERTIES
+  INTERFACE_LINK_LIBRARIES "TKDE;TKXCAF;TKBin;TKXml;TKBinL;TKXmlL;TKBinTObj;TKXmlTObj;TKBinXCAF;TKXmlXCAF;TKCDF;TKLCAF;TKCAF;TKStd;TKStdL;TKernel"
+)
+
+# Import target "TKCDF" for configuration "Release"
+set_property(TARGET TKCDF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKCDF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKCDF.a"
+  )
+
+# Import target "TKLCAF" for configuration "Release"
+set_property(TARGET TKLCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKLCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKLCAF.a"
+  )
+
+# Import target "TKCAF" for configuration "Release"
+set_property(TARGET TKCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKCAF.a"
+  )
+
+# Import target "TKBinL" for configuration "Release"
+set_property(TARGET TKBinL APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKBinL PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKBinL.a"
+  )
+
+# Import target "TKXmlL" for configuration "Release"
+set_property(TARGET TKXmlL APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXmlL PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXmlL.a"
+  )
+
+# Import target "TKBin" for configuration "Release"
+set_property(TARGET TKBin APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKBin PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKBin.a"
+  )
+
+# Import target "TKXml" for configuration "Release"
+set_property(TARGET TKXml APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXml PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXml.a"
+  )
+
+# Import target "TKStdL" for configuration "Release"
+set_property(TARGET TKStdL APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKStdL PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKStdL.a"
+  )
+
+# Import target "TKStd" for configuration "Release"
+set_property(TARGET TKStd APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKStd PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKStd.a"
+  )
+
+# Import target "TKTObj" for configuration "Release"
+set_property(TARGET TKTObj APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKTObj PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKTObj.a"
+  )
+
+# Import target "TKBinTObj" for configuration "Release"
+set_property(TARGET TKBinTObj APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKBinTObj PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKBinTObj.a"
+  )
+
+# Import target "TKXmlTObj" for configuration "Release"
+set_property(TARGET TKXmlTObj APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXmlTObj PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXmlTObj.a"
+  )
+
+# Import target "TKVCAF" for configuration "Release"
+set_property(TARGET TKVCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKVCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKVCAF.a"
+  )
+
+# Import target "TKService" for configuration "Release"
+set_property(TARGET TKService APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKService PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKService.a"
+  )
+
+# Import target "TKV3d" for configuration "Release"
+set_property(TARGET TKV3d APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKV3d PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKV3d.a"
+  )
+
+# Import target "TKDE" for configuration "Release"
+set_property(TARGET TKDE APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKDE PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKDE.a"
+  )
+
+# Import target "TKXSBase" for configuration "Release"
+set_property(TARGET TKXSBase APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXSBase PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXSBase.a"
+  )
+
+# Import target "TKXCAF" for configuration "Release"
+set_property(TARGET TKXCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXCAF.a"
+  )
+
+# Import target "TKDESTEP" for configuration "Release"
+set_property(TARGET TKDESTEP APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKDESTEP PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKDESTEP.a"
+  )
+
+# Import target "TKBinXCAF" for configuration "Release"
+set_property(TARGET TKBinXCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKBinXCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKBinXCAF.a"
+  )
+
+# Import target "TKXmlXCAF" for configuration "Release"
+set_property(TARGET TKXmlXCAF APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKXmlXCAF PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKXmlXCAF.a"
+  )
+
+# Import target "TKDECascade" for configuration "Release"
+set_property(TARGET TKDECascade APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+set_target_properties(TKDECascade PROPERTIES
+  IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX"
+  IMPORTED_LOCATION_RELEASE "${_OCCT_INSTALL_PREFIX}/lib/libTKDECascade.a"
+  )
+
 
 # This file does not depend on other imported targets which have
 # been exported from the same project but in a separate export set.

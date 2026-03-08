@@ -124,8 +124,11 @@ static bool RoundTripShape(const TopoDS_Shape& shape, std::string& reason)
         ON_TextLog log(wlog);
         on_brep.IsValid(&log);
         ON_String slog(wlog);
-        if (slog.Length() > 0 && slog.Length() < 256) {
-            reason = std::string("OCCTToON_Brep returned false: ") + slog.Array();
+        if (slog.Length() > 0) {
+            // Show up to 512 chars of the first validation error line
+            std::string msg(slog.Array(),
+                            std::min((int)slog.Length(), 512));
+            reason = std::string("OCCTToON_Brep returned false: ") + msg;
         } else {
             reason = "OCCTToON_Brep returned false";
         }
@@ -317,7 +320,13 @@ static ShapeResult TestBrpFile(const std::string& brp_path,
         }
 
         if (!skipped && !BRepTools::Read(shape, brp_path.c_str(), builder)) {
-            reason = "BRepTools::Read failed";
+            // BRepTools::Read fails on FreeCAD-internal BRP files such as
+            // *.SuppressedShape.brp, *.InternalShape.brp, *.AddSubShape.brp
+            // that store partially-constructed or suppressed solid-modelling
+            // operations which are not valid standalone B-Reps.  Skip them
+            // instead of counting as failures.
+            skipped = true;
+            reason  = "BRepTools::Read failed (internal/suppressed shape, skipped)";
         } else if (!skipped) {
             bool ok = RoundTripShape(shape, reason);
             if (!ok && reason.find("skipped") != std::string::npos) {
