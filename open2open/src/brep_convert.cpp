@@ -162,10 +162,11 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
         const ON_BrepEdge& e = brep.m_E[i];
         B.MakeEdge(e_map[i]);
 
+        double t0 = 0.0, t1 = 0.0;
         if (e.m_c3i >= 0 && e.m_c3i < (int)c3_map.size() &&
             !c3_map[e.m_c3i].IsNull()) {
-            double t0 = e.Domain().Min();
-            double t1 = e.Domain().Max();
+            t0 = e.Domain().Min();
+            t1 = e.Domain().Max();
             B.UpdateEdge(e_map[i], c3_map[e.m_c3i], linear_tolerance);
             B.Range(e_map[i], t0, t1, /*only3d=*/Standard_True);
             e3d_domain[i] = {t0, t1};
@@ -180,9 +181,8 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
         if (e.m_vi[1] >= 0 && e.m_vi[1] < (int)v_map.size() &&
             e.m_vi[1] != e.m_vi[0]) {
             // End vertex: REVERSED orientation (standard OCCT convention).
-            // TopExp::Vertices(edge, V0, V1, CumOri=false) returns V0=FORWARD
-            // and V1=REVERSED, so both must have distinct orientations for
-            // OCCTToON_Brep to recover the correct vi[0]/vi[1] mapping.
+            // The FORWARD vertex (vi[0]) is at the edge-curve start (t0),
+            // the REVERSED vertex (vi[1]) is at the end (t1).
             TopoDS_Vertex vend = v_map[e.m_vi[1]];
             vend.Orientation(TopAbs_REVERSED);
             B.Add(e_map[i], vend);
@@ -198,6 +198,20 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             vclosed.Orientation(TopAbs_REVERSED);
             B.Add(e_map[i], vclosed);
         }
+
+        // Explicitly set vertex parameters so BRep_Tool::Parameter returns
+        // the correct values (B.Add sets the parameter from the edge range,
+        // but an explicit UpdateVertex call avoids any ambiguity).
+        if (e.m_c3i >= 0) {
+            double etol = (e.m_tolerance > 0.0 && e.m_tolerance != ON_UNSET_VALUE)
+                              ? e.m_tolerance : linear_tolerance;
+            if (e.m_vi[0] >= 0 && e.m_vi[0] < (int)v_map.size())
+                B.UpdateVertex(v_map[e.m_vi[0]], t0, e_map[i], etol);
+            if (e.m_vi[1] >= 0 && e.m_vi[1] < (int)v_map.size() &&
+                e.m_vi[1] != e.m_vi[0])
+                B.UpdateVertex(v_map[e.m_vi[1]], t1, e_map[i], etol);
+        }
+
         if (e.m_tolerance != ON_UNSET_VALUE)
             B.UpdateEdge(e_map[i], e.m_tolerance);
     }
@@ -683,27 +697,88 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         double t0, t1;
         Handle(Geom_Curve) gc = BRep_Tool::Curve(edge, t0, t1);
 
+        // Determine the actual vertex parameter range for this edge.
+        // BRep_Tool::Curve gives the 3D curve and its edge-level range
+        // [t0, t1].  For BSplines stored with a wider natural domain (e.g.
+        // [-3.1, 76.07] when the edge only uses [7.9, 24.19]), t0 equals the
+        // full BSpline start, not the vertex parameter.  We fetch the vertex
+        // parameters via BRep_Tool::Parameter to get the exact sub-range.
+        //
+        // TopExp::Vertices(CumOri=false) returns vertices ordered by the
+        // EDGE's own orientation: for a REVERSED edge tv0 is the end vertex
+        // (at the curve's last parameter) and tv1 is the start vertex.  When
+        // the resulting vertex parameters are inverted (vp0 > vp1) we swap
+        // tv0/tv1 so that tv0 always corresponds to edge_t0 (curve start).
+        TopoDS_Vertex tv0, tv1;
+        double edge_t0 = t0, edge_t1 = t1;
+        if (!topoClosedEdge) {
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+            if (!tv0.IsNull()) {
+                try {
+                    double vp = BRep_Tool::Parameter(tv0, edge);
+                    if (std::isfinite(vp)) edge_t0 = vp;
+                } catch (...) {}
+            }
+            if (!tv1.IsNull()) {
+                try {
+                    double vp = BRep_Tool::Parameter(tv1, edge);
+                    if (std::isfinite(vp)) edge_t1 = vp;
+                } catch (...) {}
+            }
+            // For REVERSED edges BRep_Tool::Parameter(tv0) = t_end > t_start.
+            // Swap so edge_t0 ≤ edge_t1 and tv0 corresponds to curve start.
+            if (edge_t0 > edge_t1) {
+                std::swap(edge_t0, edge_t1);
+                std::swap(tv0, tv1);
+            }
+        } else {
+            // Closed edges: still look up vertices for vi0/vi1 assignment.
+            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
+        }
+
         int c3i = -1;
         if (!gc.IsNull()) {
             // For non-BSpline curves (Geom_Line, Geom_Circle, Geom_Ellipse,
             // etc.) always convert only the edge's actual parameter range
-            // [t0, t1] using a Geom_TrimmedCurve.  This avoids domain
-            // mismatch when the full curve spans more than the edge (e.g.
-            // Geom_Circle with t=[3π/2..5π/2]) and avoids periodic BSplines.
+            // [edge_t0, edge_t1] using a Geom_TrimmedCurve.  This avoids
+            // domain mismatch when the full curve spans more than the edge
+            // (e.g. Geom_Circle with t=[3π/2..5π/2]) and avoids periodic
+            // BSplines.
             //
             // For topologically-closed edges we also force the TrimmedCurve
             // path even when gc is already a BSpline, so that the resulting
             // ON_NurbsCurve has domain exactly [t0, t1] with matching
             // start/end 3D points (required for IsClosed() == true).
+            //
+            // For BSpline edges whose natural domain is wider than the edge
+            // range (e.g. [-3.1, 76.07] vs vertex parameters [7.9, 24.19]),
+            // we also trim so that NC.Domain() == [edge_t0, edge_t1] and
+            // NC(edge_t0) == vertex position.  This keeps ON_BrepEdge.Domain()
+            // equal to the trimmed range without relying on reparameterization
+            // via SetProxyCurveDomain (whose Domain() getter still returns the
+            // wider NC domain, causing vertex mismatches in ON_BrepToOCCT).
             Handle(Geom_BSplineCurve) bc;
             if (!topoClosedEdge) {
                 bc = Handle(Geom_BSplineCurve)::DownCast(gc);
+                // Trim the BSpline if its natural domain is wider than the
+                // vertex parameter range.
+                if (!bc.IsNull() &&
+                    (fabs(edge_t0 - bc->FirstParameter()) > 1e-9 ||
+                     fabs(edge_t1 - bc->LastParameter())  > 1e-9)) {
+                    try {
+                        Handle(Geom_TrimmedCurve) tc =
+                            new Geom_TrimmedCurve(bc, edge_t0, edge_t1);
+                        bc = GeomConvert::CurveToBSplineCurve(tc);
+                    } catch (...) {
+                        bc = Handle(Geom_BSplineCurve)::DownCast(gc);
+                    }
+                }
             }
             if (bc.IsNull()) {
                 // Trimmed conversion first (preserves arc domain)
                 try {
                     Handle(Geom_TrimmedCurve) tc =
-                        new Geom_TrimmedCurve(gc, t0, t1);
+                        new Geom_TrimmedCurve(gc, edge_t0, edge_t1);
                     bc = GeomConvert::CurveToBSplineCurve(tc);
                 } catch (...) {}
             }
@@ -757,15 +832,13 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
 
         // Determine start/end vertex indices.
-        // TopExp::Vertices(edge, V0, V1, CumOri=false) always gives
-        // V0 = vertex at parameter t0 (start of 3D curve) and
-        // V1 = vertex at parameter t1 (end of 3D curve), regardless of
-        // the edge's orientation in the parent shape.  This is the correct
-        // order for ON_BrepEdge.m_vi[0]/[1].
+        // tv0/tv1 were already computed above (with the swap applied so that
+        // tv0 is always the vertex at edge_t0 = the curve start).
+        // The EdgeKey used by make_edge_key may differ from the swapped tv0
+        // (it was based on the original TopExp order), but that is only for
+        // lookup purposes; the vi0/vi1 assignment here uses the corrected tv0.
         int vi0 = -1, vi1 = -1;
         {
-            TopoDS_Vertex tv0, tv1;
-            TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
             if (!tv0.IsNull()) {
                 auto it = vertex_map.find(make_pnt_key(BRep_Tool::Pnt(tv0)));
                 if (it != vertex_map.end()) vi0 = it->second;
@@ -779,6 +852,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
         // Use the vertex-reference form of NewEdge so that openNURBS
         // automatically maintains the vertex→edge back-references.
+        // The NC was already trimmed to [edge_t0, edge_t1] above, so
+        // NewEdge will set ProxyCurveDomain = NC.Domain() = [edge_t0, edge_t1]
+        // automatically (no separate SetProxyCurveDomain call needed).
         double edge_tol = BRep_Tool::Tolerance(edge);
         if (edge_tol < 0.0) edge_tol = linear_tolerance;
         ON_BrepEdge* poe = nullptr;
@@ -793,22 +869,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         int this_ei = poe->m_edge_index;
         // Defensive: force tolerance on the edge after creation
         brep.m_E[this_ei].m_tolerance = edge_tol;
-        if (c3i >= 0) {
-            // For closed edges we set the proxy domain to the curve's own
-            // domain so that ON_CurveProxy::IsClosed() can delegate to the
-            // underlying curve (it requires ProxyCurveDomain()==Curve()->Domain()).
-            // For non-closed edges the proxy domain is the edge's actual
-            // parameter range [t0, t1] within a potentially wider BSpline.
-            if (topoClosedEdge) {
-                ON_NurbsCurve* nc_chk =
-                    ON_NurbsCurve::Cast(brep.m_C3[c3i]);
-                ON_Interval crv_dom = nc_chk ? nc_chk->Domain()
-                                             : ON_Interval(t0, t1);
-                brep.m_E[this_ei].SetProxyCurveDomain(crv_dom);
-            } else {
-                brep.m_E[this_ei].SetProxyCurveDomain(ON_Interval(t0, t1));
-            }
-        }
         edge_map[ek] = this_ei;
     }
 
