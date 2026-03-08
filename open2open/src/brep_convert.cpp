@@ -1649,8 +1649,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         uMin = uMax = u_anchor;
                     } else if (uDom > 0 && vDom > 0) {
                         // Last resort: pick the axis with smallest relative
-                        // variation and snap to nearest boundary.  openNURBS
-                        // requires singular trims to be boundary-iso.
+                        // variation and force-snap to nearest boundary.
+                        // openNURBS requires singular trims to be boundary-iso,
+                        // so this is always the correct direction to try.
+                        // Safety: since the singular trim maps to a single 3D
+                        // point (degenerate edge), snapping the pcurve's "iso"
+                        // axis to the nearest surface boundary preserves the
+                        // 3D geometry while satisfying openNURBS's topology
+                        // constraint.  Adjacent trim endpoints are corrected
+                        // by the junction-gap repair pass below.
                         double uRelVar = (uMax - uMin) / uDom;
                         double vRelVar = (vMax - vMin) / vDom;
                         if (vRelVar <= uRelVar) {
@@ -1728,6 +1735,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             };
             const bool is_singular = (trim.m_type == ON_BrepTrim::singular);
             // kDomRelFrac: 1% of domain for boundary-snap tolerance.
+            // (Same value as the kDomRelFrac in the singular-trim block above
+            // and in the still_bad fallback block below; all three use the
+            // same 1% threshold for consistency.)
             const double kDomRelFrac = 0.01;
 
             if (snap_u) {
@@ -1946,6 +1956,95 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         lp.m_pbox.m_min.z = 0.0;
         lp.m_pbox.m_max.z = 0.0;
     }
+
+    // ---------------------------------------------------------------------------
+    // Post-processing pass: close small UV gaps between adjacent regular trims.
+    //
+    // The openNURBS loop validity check requires that the end of each trim UV
+    // matches the start of the next trim within tolerance.  Small floating-point
+    // discrepancies (e.g. 0.001) can arise when converting OCCT B-spline pcurve
+    // endpoints to ON_NurbsCurve form.  For non-seam trim pairs with gaps larger
+    // than tolerance but ≤ 0.01, snap the endpoint CVs to the average of the two
+    // mismatched UV points.  Seam and singular trims are handled by the
+    // junction-gap repair in the seam/singular pass above; skip them here.
+    // ---------------------------------------------------------------------------
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        const ON_BrepLoop& lp = brep.m_L[li];
+        const int n = lp.m_ti.Count();
+        for (int k = 0; k < n; ++k) {
+            const int ti0 = lp.m_ti[k];
+            const int ti1 = lp.m_ti[(k + 1) % n];
+            if (ti0 < 0 || ti0 >= brep.m_T.Count()) continue;
+            if (ti1 < 0 || ti1 >= brep.m_T.Count()) continue;
+            ON_BrepTrim& t0 = brep.m_T[ti0];
+            ON_BrepTrim& t1 = brep.m_T[ti1];
+            // Skip if either trim is seam or singular — handled elsewhere.
+            if (t0.m_type == ON_BrepTrim::seam ||
+                t0.m_type == ON_BrepTrim::singular ||
+                t1.m_type == ON_BrepTrim::seam ||
+                t1.m_type == ON_BrepTrim::singular) continue;
+            // Get pcurves.
+            if (t0.m_c2i < 0 || t0.m_c2i >= brep.m_C2.Count()) continue;
+            if (t1.m_c2i < 0 || t1.m_c2i >= brep.m_C2.Count()) continue;
+            ON_NurbsCurve* nc0 = ON_NurbsCurve::Cast(brep.m_C2[t0.m_c2i]);
+            ON_NurbsCurve* nc1 = ON_NurbsCurve::Cast(brep.m_C2[t1.m_c2i]);
+            if (!nc0 || !nc1) continue;
+            if (nc0->CVCount() < 1 || nc1->CVCount() < 1) continue;
+            // Compute UV gap between t0 end and t1 start.
+            ON_3dPoint p0 = t0.PointAtEnd();
+            ON_3dPoint p1 = t1.PointAtStart();
+            const double dx = fabs(p0.x - p1.x);
+            const double dy = fabs(p0.y - p1.y);
+            // kMaxUVGap: maximum gap size to snap.  0.01 covers typical
+            // floating-point drift from B-spline endpoint rounding (empirically
+            // ~0.001 for PCB shapes in the phasma-mech-assembly test suite) while
+            // rejecting genuinely mismatched trims that indicate a deeper error.
+            const double kMaxUVGap = 0.01;
+            if (dx <= ON_ZERO_TOLERANCE && dy <= ON_ZERO_TOLERANCE) continue;
+            if (dx > kMaxUVGap || dy > kMaxUVGap) continue; // too large; skip
+            // Average the gap and snap both endpoints to it.
+            double avg_x = 0.5 * (p0.x + p1.x);
+            double avg_y = 0.5 * (p0.y + p1.y);
+            // Snap t0's last CV to (avg_x, avg_y).
+            {
+                const int last = nc0->CVCount() - 1;
+                double* cv = nc0->CV(last);
+                double w = nc0->IsRational() ? cv[nc0->m_dim] : 1.0;
+                if (w == 0.0) w = 1.0;
+                cv[0] = avg_x * w;
+                cv[1] = avg_y * w;
+                t0.m_pbox = brep.m_C2[t0.m_c2i]->BoundingBox();
+                t0.m_pbox.m_min.z = 0.0;
+                t0.m_pbox.m_max.z = 0.0;
+            }
+            // Snap t1's first CV to (avg_x, avg_y).
+            {
+                double* cv = nc1->CV(0);
+                double w = nc1->IsRational() ? cv[nc1->m_dim] : 1.0;
+                if (w == 0.0) w = 1.0;
+                cv[0] = avg_x * w;
+                cv[1] = avg_y * w;
+                t1.m_pbox = brep.m_C2[t1.m_c2i]->BoundingBox();
+                t1.m_pbox.m_min.z = 0.0;
+                t1.m_pbox.m_max.z = 0.0;
+            }
+        }
+    }
+
+    // Rebuild loop pboxes again after the general UV gap repair.
+    for (int li = 0; li < brep.m_L.Count(); ++li) {
+        ON_BrepLoop& lp = brep.m_L[li];
+        lp.m_pbox.Destroy();
+        for (int k = 0; k < lp.m_ti.Count(); ++k) {
+            int tki = lp.m_ti[k];
+            if (tki >= 0 && tki < brep.m_T.Count())
+                lp.m_pbox.Union(brep.m_T[tki].m_pbox);
+        }
+        lp.m_pbox.m_min.z = 0.0;
+        lp.m_pbox.m_max.z = 0.0;
+    }
+
+
 
     // ---------------------------------------------------------------------------
     // Post-processing pass: fix edge tolerances so that ON_Brep::IsValid() passes
