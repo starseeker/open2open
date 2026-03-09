@@ -8,6 +8,7 @@
 //   2. Convert TopoDS_Shape  →  ON_Brep  (OCCTToON_Brep).
 //   3. Convert ON_Brep  →  TopoDS_Shape  (ON_BrepToOCCT).
 //   4. Validate the round-tripped shape with BRepCheck_Analyzer.
+//   5. Compare surface area (and volume for closed solids).
 //
 // Usage:
 //   test_occ_roundtrip <path-to-brep-dir>
@@ -19,12 +20,15 @@
 #include "opennurbs.h"
 
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepGProp.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Builder.hxx>
+#include <GProp_GProps.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -104,6 +108,48 @@ static bool RoundTripShape(const TopoDS_Shape& shape, std::string& reason)
         if (!fex.More()) {
             reason = "round-trip shape has no faces";
             return false;
+        }
+    }
+
+    // Step 4: compare surface area and volume
+    GProp_GProps aProps;
+    BRepGProp::SurfaceProperties(shape, aProps);
+    double orig_area = aProps.Mass();
+    GProp_GProps aProps2;
+    BRepGProp::SurfaceProperties(rt_shape, aProps2);
+    double rt_area = aProps2.Mass();
+    if (orig_area > 1e-12) {
+        double pct = std::fabs(rt_area - orig_area) / orig_area * 100.0;
+        if (pct > 1.0) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "surface area changed by %.4g%% (orig=%.6g, rt=%.6g)",
+                pct, orig_area, rt_area);
+            reason = buf;
+            return false;
+        }
+    }
+    {
+        TopExp_Explorer sex(shape, TopAbs_SOLID);
+        if (sex.More()) {
+            GProp_GProps vProps;
+            BRepGProp::VolumeProperties(shape, vProps);
+            double orig_vol = vProps.Mass();
+            GProp_GProps vProps2;
+            BRepGProp::VolumeProperties(rt_shape, vProps2);
+            double rt_vol = vProps2.Mass();
+            if (std::fabs(orig_vol) > 1e-12) {
+                double pct =
+                    std::fabs(rt_vol - orig_vol) / std::fabs(orig_vol) * 100.0;
+                if (pct > 1.0) {
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf),
+                        "volume changed by %.4g%% (orig=%.6g, rt=%.6g)",
+                        pct, orig_vol, rt_vol);
+                    reason = buf;
+                    return false;
+                }
+            }
         }
     }
 
