@@ -714,15 +714,26 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 double vtx_tol =
                     std::max(BRep_Tool::Tolerance(tv0),
                              BRep_Tool::Tolerance(tv1));
-                if (p0.Distance(p1) <= vtx_tol + 1e-7) {
-                    if (tv0.TShape() == tv1.TShape()) {
-                        // Canonical closed edge: same underlying TShape.
+                if (tv0.TShape() == tv1.TShape()) {
+                    // Canonical closed edge: same underlying TShape.
+                    // Require the vertex positions to be coincident.
+                    if (p0.Distance(p1) <= vtx_tol + 1e-7)
                         topoClosedEdge = true;
-                    } else {
-                        // Different TShape instances at coincident positions.
-                        // Accept as closed only when the 3D curve also closes
-                        // (i.e. the edge is a full loop, not a degenerate short
-                        // open edge whose endpoints accidentally coincide).
+                } else {
+                    // Different TShape instances.  Apply a two-tier check:
+                    // 1. Outer guard (vertex proximity): the vertex positions
+                    //    must be within vtx_tol.  This is the same condition
+                    //    as for same-TShape and prevents treating open edges
+                    //    in round-tripped shapes (where vtx_tol comes from the
+                    //    linear_tolerance passed to ON_BrepToOCCT, typically
+                    //    1e-6) as closed.
+                    // 2. Inner check (curve closure): the 3D curve must
+                    //    evaluate to coincident endpoints within the edge's own
+                    //    geometric tolerance.  This is tighter than the old
+                    //    max(vtx_tol, etol) threshold, which incorrectly
+                    //    accepted genuinely open edges in STEP assemblies where
+                    //    vtx_tol >> etol (e.g. vtx_tol=7.3e-2, etol=1.1e-3).
+                    if (p0.Distance(p1) <= vtx_tol + 1e-7) {
                         double tc0, tc1;
                         Handle(Geom_Curve) gc_tmp =
                             BRep_Tool::Curve(edge, tc0, tc1);
@@ -732,8 +743,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             gc_tmp->D0(tc1, q1);
                             double etol = BRep_Tool::Tolerance(edge);
                             topoClosedEdge =
-                                (q0.Distance(q1) <=
-                                 std::max(vtx_tol, etol) + 1e-7);
+                                (q0.Distance(q1) <= etol + 1e-7);
                         }
                     }
                 }
@@ -851,31 +861,41 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
         }
 
+        // Secondary topoClosedEdge detection: if the converted 3D NURBS is
+        // already IsClosed() (endpoints coincide via ON_PointsAreCoincident),
+        // treat the edge as topologically closed.  This handles edges where
+        // the OCCT vertices have different TShape objects at positions that
+        // don't satisfy the vertex-proximity check above (e.g. a seam edge
+        // whose two vertex instances are stored at different assembly
+        // positions, even though the 3D curve is a perfect closed loop).
+        if (!topoClosedEdge && c3i >= 0) {
+            const ON_NurbsCurve* nc3 =
+                ON_NurbsCurve::Cast(brep.m_C3[c3i]);
+            if (nc3 && nc3->IsClosed())
+                topoClosedEdge = true;
+        }
+
         // For topologically-closed edges the curve's own domain endpoints
-        // must be coincident (IsClosed() == true).  After the TrimmedCurve
-        // conversion the endpoints should already be equal; snap the last
-        // CV to exactly match the first to eliminate any floating-point
-        // residual so that ON_PointsAreCoincident() returns true.
+        // must be coincident (IsClosed() == true).  Always snap the last
+        // CV to exactly match the first so that ON_PointsAreCoincident()
+        // returns true.  This handles:
+        // 1. Same-TShape seam edges: endpoints are nearly equal, snap
+        //    removes any floating-point residual.
+        // 2. Different-TShape coincident-vertex edges (STEP assemblies):
+        //    the endpoint gap may be larger (up to vtx_tol), but the
+        //    snap is within the edge's declared tolerance.
+        // 3. Full-period periodic edges with exact endpoint equality:
+        //    snap is a no-op but ensures forward compatibility.
         if (topoClosedEdge && c3i >= 0) {
             ON_NurbsCurve* nc =
                 ON_NurbsCurve::Cast(brep.m_C3[c3i]);
             if (nc && nc->m_cv_count >= 2) {
-                ON_3dPoint p0 = nc->PointAt(nc->Domain()[0]);
-                ON_3dPoint p1 = nc->PointAt(nc->Domain()[1]);
-                double d = p0.DistanceTo(p1);
-                double scale = std::max(
-                    1.0, std::max(fabs(p0.x),
-                         std::max(fabs(p0.y), fabs(p0.z))));
-                // Only snap when the endpoints are already geometrically
-                // close (genuine floating-point residual, not a mismatch).
-                if (d <= 1e-4 * scale) {
-                    const int stride = nc->m_cv_stride;
-                    double* cv0 = nc->CV(0);
-                    double* cvN = nc->CV(nc->m_cv_count - 1);
-                    if (cv0 && cvN) {
-                        for (int k = 0; k < stride; ++k)
-                            cvN[k] = cv0[k];
-                    }
+                const int stride = nc->m_cv_stride;
+                double* cv0 = nc->CV(0);
+                double* cvN = nc->CV(nc->m_cv_count - 1);
+                if (cv0 && cvN) {
+                    for (int k = 0; k < stride; ++k)
+                        cvN[k] = cv0[k];
                 }
             }
         }
