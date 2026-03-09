@@ -1630,13 +1630,43 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         //    so random gaps on planar faces don't trigger this;
                         //  - the cross-direction residual is checked against the
                         //    opposite domain (same as Strategy 1), preventing
-                        //    misclassification of oblique non-period gaps.
+                        //    misclassification of oblique non-period gaps;
+                        //  - a seam-crossing guard (below) prevents firing when
+                        //    both endpoints are at opposite domain boundaries
+                        //    and the gap is just the expected seam crossing
+                        //    (which would cascade around the loop if shifted).
+                        //
+                        // Seam-crossing guard for Strategy 1b only: when tk
+                        // ends at one surface boundary and tk1 starts at the
+                        // OPPOSITE boundary, the gap is a legitimate seam
+                        // crossing on a non-periodic surface — the two UV
+                        // points map to the same 3D location.  Applying a
+                        // period shift would cascade and corrupt the loop.
+                        // Strategy 1 (periodic surfaces) is NOT guarded here
+                        // because periodic-surface seam edges are always
+                        // represented as explicit seam trims in OCCT, so the
+                        // k-loop never encounters a raw seam gap for periodic
+                        // surfaces; the guard is only needed for non-periodic
+                        // closed B-splines (eff_uperiod == 0).
                         if (shift_u == 0.0 && shift_v == 0.0) {
-                            if (eff_uperiod == 0.0 && udom > 0.0 &&
+                            const double kSeamTol = kRelTol;
+                            const bool at_u_seam_1b =
+                                (fabs(pe.x - u1) < kSeamTol * udom &&
+                                 fabs(ps.x - u0) < kSeamTol * udom) ||
+                                (fabs(pe.x - u0) < kSeamTol * udom &&
+                                 fabs(ps.x - u1) < kSeamTol * udom);
+                            const bool at_v_seam_1b =
+                                (fabs(pe.y - v1) < kSeamTol * vdom &&
+                                 fabs(ps.y - v0) < kSeamTol * vdom) ||
+                                (fabs(pe.y - v0) < kSeamTol * vdom &&
+                                 fabs(ps.y - v1) < kSeamTol * vdom);
+                            if (!at_u_seam_1b && eff_uperiod == 0.0 &&
+                                udom > 0.0 &&
                                 fabs(fabs(dx) - udom) < kRelTol * udom &&
                                 fabs(dy) < kRelTol * vdom) {
                                 shift_u = -dx;
-                            } else if (eff_vperiod == 0.0 && vdom > 0.0 &&
+                            } else if (!at_v_seam_1b && eff_vperiod == 0.0 &&
+                                       vdom > 0.0 &&
                                        fabs(fabs(dy) - vdom) < kRelTol * vdom &&
                                        fabs(dx) < kRelTol * udom) {
                                 shift_v = -dy;
@@ -1645,41 +1675,28 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
 
                         if (fabs(shift_u) > 1e-12 ||
                             fabs(shift_v) > 1e-12) {
-                            // Shift ALL poles of tk1's pcurve and of every
-                            // subsequent trim in the loop by the same amount.
-                            //
-                            // Shifting only tk1 and leaving later trims
-                            // unshifted creates a cascade: when the k-loop
-                            // reaches k=(nc-1) and shifts the first trim's
-                            // predecessor, it undoes the tk1 fix from k=0
-                            // (because that predecessor's end-point moved).
-                            // By pre-shifting all remaining trims we ensure
-                            // that every subsequent k-iteration only sees the
-                            // small residual floating-point noise, not another
-                            // full period gap.
-                            auto applyShift = [&](ON_BrepTrim& t) {
-                                int ci = t.m_c2i;
-                                if (ci < 0 || ci >= brep.m_C2.Count()) return;
-                                ON_NurbsCurve* nc_s =
-                                    ON_NurbsCurve::Cast(brep.m_C2[ci]);
-                                if (!nc_s) return;
-                                for (int p = 0; p < nc_s->m_cv_count; ++p) {
-                                    double* cv = nc_s->CV(p);
-                                    cv[0] += shift_u;
-                                    cv[1] += shift_v;
-                                }
-                                t.SetProxyCurveDomain(t.ProxyCurveDomain());
-                                t.m_pbox.Destroy();
-                            };
-                            // Shift tk1 (immediately following trim).
-                            applyShift(tk1);
-                            // Shift all remaining trims in the loop
-                            // (k+2, k+3, ..., nc-1).
-                            for (int kk = k + 2; kk < nc; ++kk)
-                                applyShift(brep.m_T[ol.m_ti[kk]]);
+                            // Shift all poles of tk1's pcurve by the period.
+                            // Only tk1 is shifted (not tk+2, tk+3, ...): if
+                            // multiple consecutive junctions in the same loop
+                            // each need the same period shift, the subsequent
+                            // k-iterations will detect and apply the same shift
+                            // to tk+2, tk+3, etc. individually.  The seam-
+                            // crossing guard above ensures that loops whose
+                            // junctions are genuine seam crossings (not period
+                            // shift errors) are never shifted, preventing the
+                            // cascade where shifting tk+1 creates a new gap at
+                            // the next junction (and eventually at the wrap-
+                            // around junction k=nc-1 which would corrupt the
+                            // k=0 fix).
+                            for (int p = 0; p < nc2->m_cv_count; ++p) {
+                                double* cv = nc2->CV(p);
+                                cv[0] += shift_u;
+                                cv[1] += shift_v;
+                            }
                             modified = true;
                             // Re-evaluate after translation so that
                             // strategy 2 below sees the updated gap.
+                            tk1.SetProxyCurveDomain(tk1.ProxyCurveDomain());
                             pe = tk.PointAtEnd();
                             ps = tk1.PointAtStart();
                             dx = ps.x - pe.x;
