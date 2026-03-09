@@ -1537,6 +1537,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         (vp_it != surface_vperiod.end()) ? vp_it->second : 0.0;
 
                     const int nc = ol.m_ti.Count();
+
+                    // Build a pcurve reference-count map for this loop so
+                    // that the shared-pcurve guard inside the gap loop can
+                    // answer "is c2i exclusive to this trim?" in O(1) rather
+                    // than rescanning all brep trims for every gap.
+                    std::unordered_map<int,int> c2i_refcount;
+                    for (int ti_s = 0; ti_s < brep.m_T.Count(); ++ti_s) {
+                        const int c2i_s = brep.m_T[ti_s].m_c2i;
+                        if (c2i_s >= 0)
+                            ++c2i_refcount[c2i_s];
+                    }
+
                     for (int k = 0; k < nc; ++k) {
                         ON_BrepTrim& tk  = brep.m_T[ol.m_ti[k]];
                         ON_BrepTrim& tk1 =
@@ -1564,6 +1576,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         // during conversion.  The OCCT period catches cylinders
                         // whose BSpline spans slightly more than one period,
                         // causing IsClosed(0) = false.
+                        //
+                        // The cross-direction residual (dy for a U period gap,
+                        // dx for a V period gap) is bounded by a fraction of
+                        // the OPPOSITE domain dimension so that small numerical
+                        // misalignment in the non-periodic direction does not
+                        // block detection.
                         const double kRelTol = 3e-3;
                         double shift_u = 0.0, shift_v = 0.0;
                         // U period: prefer OCCT period if available, fall back
@@ -1574,15 +1592,21 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         const double eff_vperiod = (occt_vperiod > 0.0)
                                                        ? occt_vperiod
                                                        : (cls_v ? vperiod : 0.0);
+                        // Absolute tolerance for the cross-direction component:
+                        // use the domain width in the OTHER direction so that
+                        // small residuals (e.g. dy=0.05 on a V-domain of 2.0)
+                        // don't block a valid U-period shift detection.
+                        const double vdom = (v1 > v0) ? (v1 - v0) : 1.0;
+                        const double udom = (u1 > u0) ? (u1 - u0) : 1.0;
                         if (eff_uperiod > 0.0 &&
                             fabs(fabs(dx) - eff_uperiod) <
                                 kRelTol * eff_uperiod &&
-                            fabs(dy) < kRelTol * eff_uperiod) {
+                            fabs(dy) < kRelTol * vdom) {
                             shift_u = -dx;
                         } else if (eff_vperiod > 0.0 &&
                                    fabs(fabs(dy) - eff_vperiod) <
                                        kRelTol * eff_vperiod &&
-                                   fabs(dx) < kRelTol * eff_vperiod) {
+                                   fabs(dx) < kRelTol * udom) {
                             shift_v = -dy;
                         }
 
@@ -1603,34 +1627,103 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             dy = ps.y - pe.y;
                         }
 
-                        // Strategy 2: snap the first pole of tk1's pcurve
-                        // to tk's UV endpoint to eliminate floating-point
-                        // residual gaps.  Only applied when the gap is
-                        // smaller than 5% of the surface domain (avoids
-                        // snapping a genuine topological mismatch).
+                        // Strategy 2a: snap the first pole of tk1's pcurve
+                        // to tk's UV endpoint.  Applied for gaps within 5% of
+                        // the surface domain (floating-point noise level).
+                        //
+                        // Strategy 2b: C1-preserving re-fit for larger gaps
+                        // (between 5% and 30% of domain).  Instead of only
+                        // moving cv[0], move both cv[0] and cv[1] by the same
+                        // delta so the initial tangent direction is preserved.
+                        // For a clamped B-spline the tangent at the domain
+                        // start is proportional to (cv[1] - cv[0]), so an
+                        // equal translation of both maintains C1 continuity at
+                        // the loop junction.  The re-fit is riskier than the
+                        // pure snap (it moves two poles instead of one) and
+                        // can be disabled via kEnableLargeGapRefit.
+                        //
+                        // Guard: the C1 re-fit only moves cv[1] when the
+                        // pcurve is not shared between multiple trims.
+                        // Shared pcurves (e.g. degenerate seam edge pairs) can
+                        // have a different trim use the same curve in the
+                        // opposite direction; moving cv[1] would corrupt its
+                        // end-point and can incorrectly cause SetTrimIsoFlags
+                        // to classify another trim as iso-parametric.
+                        //
                         // The B-spline domain trimming above ensures that
                         // cv[0] corresponds to PointAt(proxy_domain_start),
-                        // making this snap effective.
+                        // making both strategies effective.
+                        static constexpr bool kEnableLargeGapRefit = true;
+
                         if (fabs(dx) > 1e-14 || fabs(dy) > 1e-14) {
-                            const double domain_sz =
-                                std::max(uperiod > 0.0 ? uperiod : (u1-u0),
-                                         vperiod > 0.0 ? vperiod : (v1-v0));
-                            const double snap_limit =
-                                0.05 * domain_sz;
-                            if (snap_limit > 0.0 &&
-                                fabs(dx) < snap_limit &&
-                                fabs(dy) < snap_limit) {
+                            // Compute per-axis domain sizes for the limits.
+                            const double udomain_sz =
+                                uperiod > 0.0 ? uperiod : udom;
+                            const double vdomain_sz =
+                                vperiod > 0.0 ? vperiod : vdom;
+                            const double snap_limit_u = 0.05 * udomain_sz;
+                            const double snap_limit_v = 0.05 * vdomain_sz;
+                            const double refit_limit_u = 0.30 * udomain_sz;
+                            const double refit_limit_v = 0.30 * vdomain_sz;
+
+                            const bool within_snap =
+                                (snap_limit_u > 0.0 && fabs(dx) < snap_limit_u) &&
+                                (snap_limit_v > 0.0 && fabs(dy) < snap_limit_v);
+                            const bool within_refit =
+                                kEnableLargeGapRefit &&
+                                (refit_limit_u > 0.0 && fabs(dx) < refit_limit_u) &&
+                                (refit_limit_v > 0.0 && fabs(dy) < refit_limit_v);
+
+                            if (within_snap || within_refit) {
                                 double* cv0 = nc2->CV(0);
-                                // For rational curves CV stores homogeneous
-                                // coords (x*w, y*w, w); multiply by weight.
-                                if (nc2->IsRational()) {
-                                    const double w = cv0[nc2->m_dim];
-                                    cv0[0] = pe.x * w;
-                                    cv0[1] = pe.y * w;
-                                    // cv0[m_dim] (weight) is unchanged
-                                } else {
-                                    cv0[0] = pe.x;
-                                    cv0[1] = pe.y;
+                                const double w0 = nc2->IsRational()
+                                                    ? cv0[nc2->m_dim] : 1.0;
+                                // Guard against degenerate rational curves
+                                // where a zero weight can arise due to
+                                // floating-point cancellation during OCCT
+                                // B-spline conversion; treat as weight=1.
+                                const double safe_w0 =
+                                    (w0 != 0.0) ? w0 : 1.0;
+
+                                // Always move cv[0] to the target start point.
+                                cv0[0] = pe.x * safe_w0;
+                                cv0[1] = pe.y * safe_w0;
+
+                                // Strategy 2b: also move cv[1] by the same
+                                // delta to preserve the initial tangent.
+                                // Only safe when:
+                                //   - the gap is too large for strategy 2a
+                                //     (we are in the refit range), AND
+                                //   - the pcurve is NOT shared by another
+                                //     trim (moving cv[1] of a shared curve
+                                //     corrupts the other trim's geometry).
+                                if (!within_snap && nc2->m_cv_count >= 2) {
+                                    // delta is computed here rather than
+                                    // outside the if-block so it is only
+                                    // evaluated in the refit path.
+                                    const double delta_x = pe.x - ps.x;
+                                    const double delta_y = pe.y - ps.y;
+                                    // Use precomputed refcount map (O(1)).
+                                    const int c2i_check = tk1.m_c2i;
+                                    auto rc_it = c2i_refcount.find(c2i_check);
+                                    const int c2i_refs =
+                                        (rc_it != c2i_refcount.end())
+                                            ? rc_it->second : 0;
+                                    if (c2i_refs <= 1) {
+                                        // Pcurve is exclusive to tk1; safe to
+                                        // move cv[1] for C1 continuity.
+                                        double* cv1 = nc2->CV(1);
+                                        const double w1 = nc2->IsRational()
+                                                            ? cv1[nc2->m_dim]
+                                                            : 1.0;
+                                        const double safe_w1 =
+                                            (w1 != 0.0) ? w1 : 1.0;
+                                        cv1[0] += delta_x * safe_w1;
+                                        cv1[1] += delta_y * safe_w1;
+                                    }
+                                    // If pcurve is shared (c2i_refs > 1),
+                                    // only cv[0] was moved (strategy 2a
+                                    // applied with the larger gap threshold).
                                 }
                                 modified = true;
                                 tk1.SetProxyCurveDomain(
@@ -2638,6 +2731,24 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             }
         }
     }
+
+    // Final post-processing: re-run SetTrimIsoFlags for ALL trims to ensure
+    // m_iso is consistent with the current pcurve geometry.
+    //
+    // The seam/singular repair and UV gap snap passes may modify pcurves after
+    // the initial SetTolerancesBoxesAndFlags call (line 1738).  When a pcurve
+    // is shared between a seam trim and a regular trim, the seam repair only
+    // calls SetTrimIsoFlags on the seam trim — leaving the regular trim's
+    // m_iso stale.  Similarly, the UV gap snap can kink a shared pcurve,
+    // making it no longer truly iso-parametric even though m_iso was set to
+    // x_iso/y_iso before the snap.  A fresh unconditional call here ensures
+    // IsValid() and the stored m_iso agree, avoiding "m_iso = X but should
+    // be Y" failures.
+    //
+    // NOTE: We call SetTrimIsoFlags() directly rather than
+    // SetTolerancesBoxesAndFlags() to avoid resetting the edge tolerances
+    // adjusted by the previous pass.
+    brep.SetTrimIsoFlags();
 
     if (!brep.IsValid())
         return false;
