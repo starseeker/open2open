@@ -1012,9 +1012,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // Geom_RectangularTrimmedSurface path which always produces a
             // non-periodic BSpline whose UV domain exactly matches the face's
             // UV parameter bounds (= the pcurves' UV range).
-            // DO NOT call SetUNotPeriodic() or rely on GeomConvert on the
-            // unbounded analytical surface — both can produce a surface with
-            // an incorrect/tiny UV domain.
+            //
+            // IMPORTANT: For seam faces whose UV bounds span the full period
+            // of a periodic surface, Geom_RectangularTrimmedSurface reduces
+            // the domain modulo the period and collapses it to nearly zero.
+            // Subsequent knot reparameterisation scales the knots to [0,2π]
+            // but the control points describe a zero-width arc, giving zero
+            // surface area.  Fix: when the face spans ≥99% of the period in
+            // U or V, trim only in the OTHER direction and then remove the
+            // residual periodicity with SetU/VNotPeriodic().
             bool need_trimmed = bs.IsNull() ||
                                 bs->IsUPeriodic() || bs->IsVPeriodic();
             if (need_trimmed) {
@@ -1022,10 +1028,106 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 try {
                     double u1, u2, v1, v2;
                     BRepTools::UVBounds(face, u1, u2, v1, v2);
-                    Handle(Geom_RectangularTrimmedSurface) ts =
-                        new Geom_RectangularTrimmedSurface(
-                            gs, u1, u2, v1, v2);
-                    bs = GeomConvert::SurfaceToBSplineSurface(ts);
+
+                    // Detect if the face spans (nearly) the full period in U
+                    // or V so that we can avoid the domain-collapse trap.
+                    bool u_full = false, v_full = false;
+                    if (gs->IsUPeriodic()) {
+                        double uper = gs->UPeriod();
+                        if (uper > 0 && (u2 - u1) >= 0.99 * uper)
+                            u_full = true;
+                    }
+                    if (gs->IsVPeriodic()) {
+                        double vper = gs->VPeriod();
+                        if (vper > 0 && (v2 - v1) >= 0.99 * vper)
+                            v_full = true;
+                    }
+
+                    if ((u_full || v_full) &&
+                        !Precision::IsInfinite(v1) &&
+                        !Precision::IsInfinite(v2) &&
+                        v2 > v1 &&
+                        !Precision::IsInfinite(u1) &&
+                        !Precision::IsInfinite(u2) &&
+                        u2 > u1) {
+                        // Trim only in the direction(s) that are NOT full
+                        // period, then use SetNotPeriodic + Segment to
+                        // extract the exact face parameter range.
+                        //
+                        // Why Segment?  SetUNotPeriodic() on a degree-d
+                        // periodic circle expands the domain from [0, T] to
+                        // [-T/d, T*(1+1/d)] by prepending/appending extra
+                        // knots.  A subsequent linear knot rescale would
+                        // restore the domain width but change the rational
+                        // blending functions, distorting the geometry.
+                        // Segment() uses Boehm's knot-insertion algorithm
+                        // which correctly adjusts both poles and weights, so
+                        // the geometry is preserved exactly.
+                        if (u_full && !v_full) {
+                            // Trim V only (Standard_False = V trim)
+                            Handle(Geom_RectangularTrimmedSurface) ts_v =
+                                new Geom_RectangularTrimmedSurface(
+                                    gs, v1, v2, Standard_False);
+                            bs = GeomConvert::SurfaceToBSplineSurface(ts_v);
+                        } else if (v_full && !u_full) {
+                            // Trim U only (Standard_True = U trim)
+                            Handle(Geom_RectangularTrimmedSurface) ts_u =
+                                new Geom_RectangularTrimmedSurface(
+                                    gs, u1, u2, Standard_True);
+                            bs = GeomConvert::SurfaceToBSplineSurface(ts_u);
+                        } else {
+                            // Both directions span the full period (e.g.
+                            // a torus): convert the un-trimmed surface.
+                            bs = GeomConvert::SurfaceToBSplineSurface(gs);
+                        }
+
+                        // Remove periodicity and then segment to the exact
+                        // face UV bounds so the surface domain matches the
+                        // pcurves without any knot rescaling.
+                        if (!bs.IsNull()) {
+                            if (bs->IsUPeriodic() && bs->NbUKnots() >= 2 &&
+                                bs->UKnot(bs->NbUKnots()) -
+                                    bs->UKnot(1) > 1e-15)
+                                bs->SetUNotPeriodic();
+                            if (bs->IsVPeriodic() && bs->NbVKnots() >= 2 &&
+                                bs->VKnot(bs->NbVKnots()) -
+                                    bs->VKnot(1) > 1e-15)
+                                bs->SetVNotPeriodic();
+                            // Segment to face bounds (clamped to the new
+                            // non-periodic domain).
+                            //
+                            // Segment() uses Boehm's knot-insertion algorithm
+                            // to correctly adjust poles and weights while
+                            // producing a B-spline with domain exactly
+                            // [su0,su1]x[sv0,sv1].  If Segment() fails (e.g.
+                            // because the bounds coincide with existing
+                            // multiplicity-saturated knots), fall back to the
+                            // SetUNotPeriodic result: the expanded domain
+                            // [-T/d, T*(1+1/d)] still contains all pcurve UV
+                            // values and evaluates correctly at them, so the
+                            // face topology is preserved.  The updated
+                            // reparameterization guard below avoids distorting
+                            // the geometry by not rescaling in this case.
+                            double ku0 = bs->UKnot(1);
+                            double ku1 = bs->UKnot(bs->NbUKnots());
+                            double kv0 = bs->VKnot(1);
+                            double kv1 = bs->VKnot(bs->NbVKnots());
+                            double su0 = std::max(ku0, std::min(ku1, u1));
+                            double su1 = std::max(ku0, std::min(ku1, u2));
+                            double sv0 = std::max(kv0, std::min(kv1, v1));
+                            double sv1 = std::max(kv0, std::min(kv1, v2));
+                            if (su1 - su0 > 1e-12 && sv1 - sv0 > 1e-12) {
+                                try {
+                                    bs->Segment(su0, su1, sv0, sv1);
+                                } catch (...) {}
+                            }
+                        }
+                    } else {
+                        Handle(Geom_RectangularTrimmedSurface) ts =
+                            new Geom_RectangularTrimmedSurface(
+                                gs, u1, u2, v1, v2);
+                        bs = GeomConvert::SurfaceToBSplineSurface(ts);
+                    }
                 } catch (...) {
                     // Restore original so SetUNotPeriodic() below is not
                     // called on the shared geometry object (which would
@@ -1061,17 +1163,24 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         ON_Interval srf_u = ns->Domain(0);
                         ON_Interval srf_v = ns->Domain(1);
                         const double kDomTol = 1e-6;
+                        // Reparameterize only when the face UV bounds fall
+                        // OUTSIDE the surface domain (surface is too small
+                        // for the face).  Do NOT reparameterize when the
+                        // surface domain is larger than the face bounds —
+                        // the rational blending functions must not change.
+                        // For full-period surfaces the Segment() call above
+                        // already made the domains match.
                         if (fu2 > fu1 && srf_u.IsValid() && srf_u.Length() > 0 &&
-                            (fabs(srf_u[0] - fu1) > kDomTol ||
-                             fabs(srf_u[1] - fu2) > kDomTol)) {
+                            (fu1 < srf_u[0] - kDomTol ||
+                             fu2 > srf_u[1] + kDomTol)) {
                             double ku_scale = (fu2 - fu1) / srf_u.Length();
                             for (int k = 0; k < ns->KnotCount(0); ++k)
                                 ns->m_knot[0][k] = fu1 +
                                     (ns->m_knot[0][k] - srf_u[0]) * ku_scale;
                         }
                         if (fv2 > fv1 && srf_v.IsValid() && srf_v.Length() > 0 &&
-                            (fabs(srf_v[0] - fv1) > kDomTol ||
-                             fabs(srf_v[1] - fv2) > kDomTol)) {
+                            (fv1 < srf_v[0] - kDomTol ||
+                             fv2 > srf_v[1] + kDomTol)) {
                             double kv_scale = (fv2 - fv1) / srf_v.Length();
                             for (int k = 0; k < ns->KnotCount(1); ++k)
                                 ns->m_knot[1][k] = fv1 +
@@ -1111,7 +1220,16 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         double pd = gs_base->UPeriod();
                         if (ns_ptr) {
                             ON_Interval du = ns_ptr->Domain(0);
-                            if (du.IsIncreasing()) pd = du.Length();
+                            if (du.IsIncreasing()) {
+                                // Use the domain width as the effective period
+                                // only when it closely matches the OCCT period
+                                // (i.e. the surface domain was not expanded by
+                                // SetUNotPeriodic from [-T/d, T*(1+1/d)]).
+                                // For expanded domains, the OCCT period is the
+                                // correct shift for gap-repair corrections.
+                                if (fabs(du.Length() - pd) < 1e-4 * pd)
+                                    pd = du.Length();
+                            }
                         }
                         surface_uperiod[si] = pd;
                     } else {
@@ -1123,7 +1241,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         double pd = gs_base->VPeriod();
                         if (ns_ptr) {
                             ON_Interval dv = ns_ptr->Domain(1);
-                            if (dv.IsIncreasing()) pd = dv.Length();
+                            if (dv.IsIncreasing()) {
+                                if (fabs(dv.Length() - pd) < 1e-4 * pd)
+                                    pd = dv.Length();
+                            }
                         }
                         surface_vperiod[si] = pd;
                     } else {
