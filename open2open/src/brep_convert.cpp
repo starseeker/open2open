@@ -1576,6 +1576,123 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         bool snap_u = (uMax - uMin) <= kIsoTol;
         bool snap_v = (vMax - vMin) <= kIsoTol;
 
+        // ---------------------------------------------------------------------------
+        // Shared helpers for seam and singular trim domain-relative snapping.
+        //
+        // kDomRelFrac: threshold for "nearly constant" in relative terms —
+        //   1% of domain extent, or absolute 1e-4, whichever is larger.
+        //   Trim pcurves can have small numerical drift after B-spline conversion
+        //   on large surfaces.
+        // kBndRelFrac: wider threshold (5%) for "near a surface boundary".
+        //   Boundary detection needs more slack than general iso detection because
+        //   the pcurve endpoint may land slightly away from the exact boundary.
+        // ---------------------------------------------------------------------------
+        const double kDomRelFrac = 0.01;
+        const double kBndRelFrac = 0.05;
+
+        // snap_all_cvs: set all CVs' coordinate along the given axis to anchor.
+        auto snap_all_cvs = [&](int axis, double anchor) {
+            for (int p = 0; p < nCV; ++p) {
+                double* cv = nc->CV(p);
+                double w = rat ? cv[nc->m_dim] : 1.0;
+                if (w == 0.0) w = 1.0;
+                cv[axis] = anchor * w;
+            }
+        };
+        // nearest_bnd: return whichever of b0 or b1 is closer to val.
+        auto nearest_bnd = [](double val, double b0, double b1) -> double {
+            return (fabs(val-b0) <= fabs(val-b1)) ? b0 : b1;
+        };
+        // near_bnd_tol: true if val is within tol of b0 or b1.
+        auto near_bnd_tol = [](double val, double b0, double b1,
+                                double tol) -> bool {
+            return fabs(val-b0) <= tol || fabs(val-b1) <= tol;
+        };
+
+        // For SEAM trims (periodic surface closure), the trim pcurve must lie
+        // exactly on a surface domain boundary (su0 or su1 for U-seams, sv0 or
+        // sv1 for V-seams).  The absolute tolerance kIsoTol=1e-4 is too tight
+        // for surfaces with large parameter domains (e.g. helical springs where
+        // the U domain is many multiples of 2π).  Use domain-relative tolerances
+        // and the greedy smallest-variation axis approach, just like singular trims.
+        if (trim.m_type == ON_BrepTrim::seam) {
+            const int li_seam  = trim.m_li;
+            const int fi_seam  = (li_seam >= 0 && li_seam < brep.m_L.Count())
+                                   ? brep.m_L[li_seam].m_fi : -1;
+            const ON_Surface* srf_seam = (fi_seam >= 0 && fi_seam < brep.m_F.Count())
+                                           ? brep.m_F[fi_seam].SurfaceOf() : nullptr;
+            if (srf_seam && (!snap_u || !snap_v)) {
+                double su0s=0,su1s=0,sv0s=0,sv1s=0;
+                srf_seam->GetDomain(0,&su0s,&su1s);
+                srf_seam->GetDomain(1,&sv0s,&sv1s);
+                const double uDom = su1s - su0s;
+                const double vDom = sv1s - sv0s;
+                const double uRelTol = (uDom > 0) ? std::max(kIsoTol, kDomRelFrac * uDom) : kIsoTol;
+                const double vRelTol = (vDom > 0) ? std::max(kIsoTol, kDomRelFrac * vDom) : kIsoTol;
+                const double uBndTol = (uDom > 0) ? std::max(kIsoTol, kBndRelFrac * uDom) : kIsoTol;
+                const double vBndTol = (vDom > 0) ? std::max(kIsoTol, kBndRelFrac * vDom) : kIsoTol;
+
+                if (!snap_u && (uMax - uMin) <= uRelTol) snap_u = true;
+                if (!snap_v && (vMax - vMin) <= vRelTol) snap_v = true;
+
+                // If still neither, try to match CV mean to a surface boundary.
+                if (!snap_u && !snap_v) {
+                    double uMean = 0.5*(uMin+uMax), vMean = 0.5*(vMin+vMax);
+                    if (near_bnd_tol(vMean, sv0s, sv1s, vBndTol)) {
+                        double v_anchor = nearest_bnd(vMean, sv0s, sv1s);
+                        snap_all_cvs(1, v_anchor);
+                        snap_v = true;
+                        vMin = vMax = v_anchor;
+                    } else if (near_bnd_tol(uMean, su0s, su1s, uBndTol)) {
+                        double u_anchor = nearest_bnd(uMean, su0s, su1s);
+                        snap_all_cvs(0, u_anchor);
+                        snap_u = true;
+                        uMin = uMax = u_anchor;
+                    } else if (uDom > 0 && vDom > 0) {
+                        // Last resort: seam trims must be at a domain boundary,
+                        // so pick the axis with smallest relative variation and
+                        // force-snap to the nearest boundary.
+                        double uRelVar = (uMax - uMin) / uDom;
+                        double vRelVar = (vMax - vMin) / vDom;
+                        if (uRelVar <= vRelVar) {
+                            double u_anchor = nearest_bnd(0.5*(uMin+uMax), su0s, su1s);
+                            snap_all_cvs(0, u_anchor);
+                            snap_u = true;
+                            uMin = uMax = u_anchor;
+                        } else {
+                            double v_anchor = nearest_bnd(0.5*(vMin+vMax), sv0s, sv1s);
+                            snap_all_cvs(1, v_anchor);
+                            snap_v = true;
+                            vMin = vMax = v_anchor;
+                        }
+                    }
+
+                    // Also check CV[0] proximity to boundaries when the iso
+                    // direction is still undetermined.  Only run when both
+                    // snap_u and snap_v are false so that a correctly-identified
+                    // U-iso seam (snap_u=true, snap_v=false) does not have its
+                    // V values incorrectly snapped because CV[0] happens to lie
+                    // near a V boundary.
+                    if (!snap_u && !snap_v) {
+                        const double* cv0 = nc->CV(0);
+                        double w0 = rat ? cv0[nc->m_dim] : 1.0;
+                        if (w0==0.0) w0=1.0;
+                        if (near_bnd_tol(cv0[1]/w0, sv0s, sv1s, vRelTol)) {
+                            double v_anchor = nearest_bnd(cv0[1]/w0, sv0s, sv1s);
+                            snap_all_cvs(1, v_anchor);
+                            snap_v = true;
+                            vMin = vMax = v_anchor;
+                        } else if (near_bnd_tol(cv0[0]/w0, su0s, su1s, uRelTol)) {
+                            double u_anchor = nearest_bnd(cv0[0]/w0, su0s, su1s);
+                            snap_all_cvs(0, u_anchor);
+                            snap_u = true;
+                            uMin = uMax = u_anchor;
+                        }
+                    }
+                }
+            }
+        }
+
         // For SINGULAR trims (pole/apex edges), the trim pcurve should lie
         // exactly on the boundary where the surface degenerates to a point.
         // After B-spline conversion the degenerate locus may not be perfectly
@@ -1599,37 +1716,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 srf_s->GetDomain(1,&sv0s,&sv1s);
                 const double uDom = su1s - su0s;
                 const double vDom = sv1s - sv0s;
-                // kDomRelFrac: threshold for "nearly constant" in relative terms
-                // (1% of domain extent, or absolute 1e-4, whichever is larger).
-                // Singular trim pcurves can have small numerical drift after
-                // B-spline conversion on large surfaces.
-                // kBndRelFrac: wider threshold (5%) for "near a surface boundary".
-                // Boundary detection needs more slack than general iso detection
-                // because the pcurve endpoint may land slightly away from the
-                // exact surface boundary in the B-spline representation.
-                const double kDomRelFrac = 0.01;
-                const double kBndRelFrac = 0.05;
                 const double uRelTol = (uDom > 0) ? std::max(kIsoTol, kDomRelFrac * uDom) : kIsoTol;
                 const double vRelTol = (vDom > 0) ? std::max(kIsoTol, kDomRelFrac * vDom) : kIsoTol;
                 const double uBndTol = (uDom > 0) ? std::max(kIsoTol, kBndRelFrac * uDom) : kIsoTol;
                 const double vBndTol = (vDom > 0) ? std::max(kIsoTol, kBndRelFrac * vDom) : kIsoTol;
-
-                // Helper: snap all CVs' U (axis=0) or V (axis=1) to anchor.
-                auto snap_all_cvs = [&](int axis, double anchor) {
-                    for (int p = 0; p < nCV; ++p) {
-                        double* cv = nc->CV(p);
-                        double w = rat ? cv[nc->m_dim] : 1.0;
-                        if (w == 0.0) w = 1.0;
-                        cv[axis] = anchor * w;
-                    }
-                };
-                auto nearest_bnd = [](double val, double b0, double b1) -> double {
-                    return (fabs(val-b0) <= fabs(val-b1)) ? b0 : b1;
-                };
-                auto near_bnd_tol = [](double val, double b0, double b1,
-                                        double tol) -> bool {
-                    return fabs(val-b0) <= tol || fabs(val-b1) <= tol;
-                };
 
                 if (!snap_u && (uMax - uMin) <= uRelTol) snap_u = true;
                 if (!snap_v && (vMax - vMin) <= vRelTol) snap_v = true;
@@ -1734,19 +1824,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 return (fabs(val-d0) <= fabs(val-d1)) ? d0 : d1;
             };
             const bool is_singular = (trim.m_type == ON_BrepTrim::singular);
-            // kDomRelFrac: 1% of domain for boundary-snap tolerance.
-            // (Same value as the kDomRelFrac in the singular-trim block above
-            // and in the still_bad fallback block below; all three use the
-            // same 1% threshold for consistency.)
-            const double kDomRelFrac = 0.01;
+            const bool is_seam     = (trim.m_type == ON_BrepTrim::seam);
 
             if (snap_u) {
                 double u_iso = 0.5 * (uMin + uMax);
                 if (srf) {
                     const double bndTol = std::max(1e-4, kDomRelFrac*(su1-su0));
                     double u_snapped = snap_to_boundary(u_iso, su0, su1, bndTol);
-                    if (u_snapped == u_iso && is_singular) {
-                        // Interior U: force to nearest boundary
+                    if (u_snapped == u_iso && (is_singular || is_seam)) {
+                        // Interior U: force to nearest boundary.
+                        // Seam trims must be at a domain boundary (W_iso/E_iso);
+                        // they arise from periodic surface closure and can only
+                        // appear at su0 or su1.
                         u_snapped = snap_to_nearest(u_iso, su0, su1);
                     }
                     u_iso = u_snapped;
@@ -1762,8 +1851,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (srf) {
                     const double bndTol = std::max(1e-4, kDomRelFrac*(sv1-sv0));
                     double v_snapped = snap_to_boundary(v_iso, sv0, sv1, bndTol);
-                    if (v_snapped == v_iso && is_singular) {
-                        // Interior V: force to nearest boundary
+                    if (v_snapped == v_iso && (is_singular || is_seam)) {
+                        // Interior V: force to nearest boundary.
+                        // Seam trims must be at a domain boundary (S_iso/N_iso).
                         v_snapped = snap_to_nearest(v_iso, sv0, sv1);
                     }
                     v_iso = v_snapped;
@@ -1803,9 +1893,6 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 double su0=0, su1=0, sv0=0, sv1=0;
                 srf2->GetDomain(0, &su0, &su1);
                 srf2->GetDomain(1, &sv0, &sv1);
-                // Use domain-relative tolerance (kDomRelFrac = 1% of domain
-                // extent, or absolute 1e-4, whichever is larger).
-                const double kDomRelFrac = 0.01;
                 const double uBndTol = std::max(1e-4, kDomRelFrac*(su1-su0));
                 const double vBndTol = std::max(1e-4, kDomRelFrac*(sv1-sv0));
                 if (snap_u) {
@@ -1815,6 +1902,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     double u0 = cv0[0] / w0;
                     if      (fabs(u0 - su0) <= uBndTol) trim.m_iso = ON_Surface::W_iso;
                     else if (fabs(u0 - su1) <= uBndTol) trim.m_iso = ON_Surface::E_iso;
+                    else if (trim.m_type == ON_BrepTrim::seam ||
+                             trim.m_type == ON_BrepTrim::singular)
+                        // Seam/singular trims must have boundary iso; force to
+                        // the nearest W_iso/E_iso even if the value is interior.
+                        trim.m_iso = (fabs(u0-su0) <= fabs(u0-su1))
+                                         ? ON_Surface::W_iso : ON_Surface::E_iso;
                     else                                 trim.m_iso = ON_Surface::x_iso;
                 } else {
                     const double* cv0 = nc->CV(0);
@@ -1823,6 +1916,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     double v0 = cv0[1] / w0;
                     if      (fabs(v0 - sv0) <= vBndTol) trim.m_iso = ON_Surface::S_iso;
                     else if (fabs(v0 - sv1) <= vBndTol) trim.m_iso = ON_Surface::N_iso;
+                    else if (trim.m_type == ON_BrepTrim::seam ||
+                             trim.m_type == ON_BrepTrim::singular)
+                        // Seam/singular trims must have boundary iso; force to
+                        // the nearest S_iso/N_iso even if the value is interior.
+                        trim.m_iso = (fabs(v0-sv0) <= fabs(v0-sv1))
+                                         ? ON_Surface::S_iso : ON_Surface::N_iso;
                     else                                 trim.m_iso = ON_Surface::y_iso;
                 }
             }
