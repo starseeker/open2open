@@ -697,20 +697,46 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // both ends AND the same 3D world position.  Edges where the same TShape
         // appears at two DIFFERENT positions (e.g. a translated body-of-revolution
         // with a shared seam vertex at two Z heights) are NOT closed edges.
+        //
+        // Secondary case: different TShape objects at the same 3D position can
+        // arise when STEP assemblies store a seam-return edge with two distinct
+        // vertex instances that happen to be geometrically coincident.  We treat
+        // such edges as closed only when the 3D curve also evaluates to the same
+        // 3D point at both ends (confirming a genuine loop rather than a very
+        // short open edge with coincident-by-chance endpoints).
         bool topoClosedEdge = false;
         {
             TopoDS_Vertex tv0, tv1;
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
-            if (!tv0.IsNull() && !tv1.IsNull() &&
-                tv0.TShape() == tv1.TShape()) {
+            if (!tv0.IsNull() && !tv1.IsNull()) {
                 gp_Pnt p0 = BRep_Tool::Pnt(tv0);
                 gp_Pnt p1 = BRep_Tool::Pnt(tv1);
-                // Closed only when the two vertex instances are at the same
-                // 3D location (within a generous position tolerance).
                 double vtx_tol =
                     std::max(BRep_Tool::Tolerance(tv0),
                              BRep_Tool::Tolerance(tv1));
-                topoClosedEdge = (p0.Distance(p1) <= vtx_tol + 1e-7);
+                if (p0.Distance(p1) <= vtx_tol + 1e-7) {
+                    if (tv0.TShape() == tv1.TShape()) {
+                        // Canonical closed edge: same underlying TShape.
+                        topoClosedEdge = true;
+                    } else {
+                        // Different TShape instances at coincident positions.
+                        // Accept as closed only when the 3D curve also closes
+                        // (i.e. the edge is a full loop, not a degenerate short
+                        // open edge whose endpoints accidentally coincide).
+                        double tc0, tc1;
+                        Handle(Geom_Curve) gc_tmp =
+                            BRep_Tool::Curve(edge, tc0, tc1);
+                        if (!gc_tmp.IsNull()) {
+                            gp_Pnt q0, q1;
+                            gc_tmp->D0(tc0, q0);
+                            gc_tmp->D0(tc1, q1);
+                            double etol = BRep_Tool::Tolerance(edge);
+                            topoClosedEdge =
+                                (q0.Distance(q1) <=
+                                 std::max(vtx_tol, etol) + 1e-7);
+                        }
+                    }
+                }
             }
         }
 
@@ -871,7 +897,14 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (it != vertex_map.end()) vi1 = it->second;
             }
         }
-        if (vi1 < 0) vi1 = vi0; // closed edge
+        // For topologically-closed edges always use the same vertex at both
+        // ends so that the pcurve's IsClosed() == true check in ON_Brep
+        // IsValid() is consistent with the trim's vertex indices.
+        if (topoClosedEdge) {
+            if      (vi0 >= 0) vi1 = vi0;
+            else if (vi1 >= 0) vi0 = vi1;
+        }
+        if (vi1 < 0) vi1 = vi0; // fallback for truly free-standing closed edge
 
         // Use the vertex-reference form of NewEdge so that openNURBS
         // automatically maintains the vertex→edge back-references.
@@ -985,11 +1018,45 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 // Record the original OCCT surface's period so the gap-snap
                 // code can apply period-shift corrections even when the
                 // converted ON_NurbsSurface's IsClosed() returns false.
+                //
+                // Geom_RectangularTrimmedSurface::IsUPeriodic() always returns
+                // false even when the underlying basis surface is periodic.
+                // Unwrap one level of trimming before checking, and use the
+                // converted ON_NurbsSurface's domain width as the effective
+                // period (which correctly reflects any reparameterisation).
                 if (!gs.IsNull()) {
-                    surface_uperiod[si] =
-                        gs->IsUPeriodic() ? gs->UPeriod() : 0.0;
-                    surface_vperiod[si] =
-                        gs->IsVPeriodic() ? gs->VPeriod() : 0.0;
+                    Handle(Geom_Surface) gs_base = gs;
+                    {
+                        Handle(Geom_RectangularTrimmedSurface) trm =
+                            Handle(Geom_RectangularTrimmedSurface)::DownCast(gs);
+                        if (!trm.IsNull()) gs_base = trm->BasisSurface();
+                    }
+                    const ON_NurbsSurface* ns_ptr =
+                        ON_NurbsSurface::Cast(brep.m_S[si]);
+                    // U period
+                    if (gs_base->IsUPeriodic()) {
+                        double pd = gs_base->UPeriod();
+                        if (ns_ptr) {
+                            ON_Interval du = ns_ptr->Domain(0);
+                            if (du.IsIncreasing()) pd = du.Length();
+                        }
+                        surface_uperiod[si] = pd;
+                    } else {
+                        surface_uperiod[si] =
+                            gs->IsUPeriodic() ? gs->UPeriod() : 0.0;
+                    }
+                    // V period
+                    if (gs_base->IsVPeriodic()) {
+                        double pd = gs_base->VPeriod();
+                        if (ns_ptr) {
+                            ON_Interval dv = ns_ptr->Domain(1);
+                            if (dv.IsIncreasing()) pd = dv.Length();
+                        }
+                        surface_vperiod[si] = pd;
+                    } else {
+                        surface_vperiod[si] =
+                            gs->IsVPeriodic() ? gs->VPeriod() : 0.0;
+                    }
                 }
             }
         }
