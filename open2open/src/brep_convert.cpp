@@ -1610,17 +1610,76 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             shift_v = -dy;
                         }
 
+                        // Strategy 1b: domain-width fallback period detection
+                        // for geometrically closed non-periodic B-spline
+                        // surfaces.
+                        //
+                        // Revolution surfaces (e.g. cones, toroids) are often
+                        // stored as B-spline surfaces whose U parameterization
+                        // spans exactly one full revolution [0, 2π] or another
+                        // complete period, yet OCCT marks them IsUPeriodic=false
+                        // and IsClosed(0)=false because the B-spline knots are
+                        // not periodic.  In that case eff_uperiod = 0 and
+                        // Strategy 1 above does not fire.
+                        //
+                        // Detection: if eff_[u|v]period = 0 but the gap
+                        // magnitude closely matches the raw domain width, treat
+                        // the domain width as the effective period and apply the
+                        // same all-poles translation.  This is safe because:
+                        //  - the gap-magnitude match condition is tight (0.3%),
+                        //    so random gaps on planar faces don't trigger this;
+                        //  - the cross-direction residual is checked against the
+                        //    opposite domain (same as Strategy 1), preventing
+                        //    misclassification of oblique non-period gaps.
+                        if (shift_u == 0.0 && shift_v == 0.0) {
+                            if (eff_uperiod == 0.0 && udom > 0.0 &&
+                                fabs(fabs(dx) - udom) < kRelTol * udom &&
+                                fabs(dy) < kRelTol * vdom) {
+                                shift_u = -dx;
+                            } else if (eff_vperiod == 0.0 && vdom > 0.0 &&
+                                       fabs(fabs(dy) - vdom) < kRelTol * vdom &&
+                                       fabs(dx) < kRelTol * udom) {
+                                shift_v = -dy;
+                            }
+                        }
+
                         if (fabs(shift_u) > 1e-12 ||
                             fabs(shift_v) > 1e-12) {
-                            for (int p = 0; p < nc2->m_cv_count; ++p) {
-                                double* cv = nc2->CV(p);
-                                cv[0] += shift_u;
-                                cv[1] += shift_v;
-                            }
+                            // Shift ALL poles of tk1's pcurve and of every
+                            // subsequent trim in the loop by the same amount.
+                            //
+                            // Shifting only tk1 and leaving later trims
+                            // unshifted creates a cascade: when the k-loop
+                            // reaches k=(nc-1) and shifts the first trim's
+                            // predecessor, it undoes the tk1 fix from k=0
+                            // (because that predecessor's end-point moved).
+                            // By pre-shifting all remaining trims we ensure
+                            // that every subsequent k-iteration only sees the
+                            // small residual floating-point noise, not another
+                            // full period gap.
+                            auto applyShift = [&](ON_BrepTrim& t) {
+                                int ci = t.m_c2i;
+                                if (ci < 0 || ci >= brep.m_C2.Count()) return;
+                                ON_NurbsCurve* nc_s =
+                                    ON_NurbsCurve::Cast(brep.m_C2[ci]);
+                                if (!nc_s) return;
+                                for (int p = 0; p < nc_s->m_cv_count; ++p) {
+                                    double* cv = nc_s->CV(p);
+                                    cv[0] += shift_u;
+                                    cv[1] += shift_v;
+                                }
+                                t.SetProxyCurveDomain(t.ProxyCurveDomain());
+                                t.m_pbox.Destroy();
+                            };
+                            // Shift tk1 (immediately following trim).
+                            applyShift(tk1);
+                            // Shift all remaining trims in the loop
+                            // (k+2, k+3, ..., nc-1).
+                            for (int kk = k + 2; kk < nc; ++kk)
+                                applyShift(brep.m_T[ol.m_ti[kk]]);
                             modified = true;
                             // Re-evaluate after translation so that
                             // strategy 2 below sees the updated gap.
-                            tk1.SetProxyCurveDomain(tk1.ProxyCurveDomain());
                             pe = tk.PointAtEnd();
                             ps = tk1.PointAtStart();
                             dx = ps.x - pe.x;
@@ -1784,6 +1843,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         ON_BrepTrim& trim = brep.m_T[ti];
         if (trim.m_type != ON_BrepTrim::seam &&
             trim.m_type != ON_BrepTrim::singular) continue;
+        // Debug: check if this trim is in loop 7
         // Skip trims that already have proper boundary iso.
         // Seam and singular trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2)
         // are interior-only and invalid for seam and singular trims.
