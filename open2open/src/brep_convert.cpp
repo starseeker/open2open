@@ -705,6 +705,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // 3D point at both ends (confirming a genuine loop rather than a very
         // short open edge with coincident-by-chance endpoints).
         bool topoClosedEdge = false;
+        bool sameTShapeClosedEdge = false; // same-TShape detection (canonical closed)
         {
             TopoDS_Vertex tv0, tv1;
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
@@ -717,8 +718,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (tv0.TShape() == tv1.TShape()) {
                     // Canonical closed edge: same underlying TShape.
                     // Require the vertex positions to be coincident.
-                    if (p0.Distance(p1) <= vtx_tol + 1e-7)
+                    if (p0.Distance(p1) <= vtx_tol + 1e-7) {
                         topoClosedEdge = true;
+                        sameTShapeClosedEdge = true;
+                    }
                 } else {
                     // Different TShape instances.  Apply a two-tier check:
                     // 1. Outer guard (vertex proximity): the vertex positions
@@ -891,6 +894,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // 2. Secondary IsClosed() edges: the B-spline conversion already
         //    produced endpoints that ON_PointsAreCoincident() accepts;
         //    snap is a no-op in that case.
+        //
+        // Two sub-cases:
+        // (a) Small gap (< kTopoSnapGap): floating-point residual from
+        //     SetNotPeriodic() or tiny numerical drift.  Snap cv[N-1] to
+        //     cv[0] so ON_PointsAreCoincident() returns true.
+        // (b) Large gap (≥ kTopoSnapGap) for a same-TShape edge: the OCCT
+        //     shape has an edge whose 3D curve nearly closes via the vertex
+        //     tolerance rather than geometric coincidence (e.g. a spiral-
+        //     like arc that starts and ends at the same vertex with a large
+        //     tolerance).  Snapping would corrupt the geometry; instead
+        //     record the gap so the edge tolerance can be raised to cover it,
+        //     satisfying the IsClosed() tolerance-fallback check in openNURBS.
+        static constexpr double kTopoSnapGap = 1e-3;
+        double topo_closed_large_gap = 0.0; // filled when (b) applies
         if (topoClosedEdge && c3i >= 0) {
             ON_NurbsCurve* nc =
                 ON_NurbsCurve::Cast(brep.m_C3[c3i]);
@@ -900,9 +917,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 ON_3dPoint np1 = nc->PointAt(nc->Domain()[1]);
                 double nc_gap = np0.DistanceTo(np1);
                 double edge_tol_snap = BRep_Tool::Tolerance(edge);
-                // Only snap when the gap is already within the edge
-                // tolerance (genuine closure residual).
-                if (nc_gap <= edge_tol_snap + 1e-7) {
+                if (nc_gap < kTopoSnapGap) {
+                    // Case (a): small gap — snap last CV to first.
+                    // Applies to both same-TShape (floating-point residual
+                    // after SetNotPeriodic) and secondary IsClosed() detections.
                     const int stride = nc->m_cv_stride;
                     double* cv0 = nc->CV(0);
                     double* cvN = nc->CV(nc->m_cv_count - 1);
@@ -910,7 +928,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         for (int k = 0; k < stride; ++k)
                             cvN[k] = cv0[k];
                     }
+                } else if (sameTShapeClosedEdge) {
+                    // Case (b): large gap, same-TShape topology.  The edge
+                    // is topologically closed with a large vertex tolerance
+                    // bridging the geometric gap.  Record for tolerance fixup.
+                    topo_closed_large_gap = nc_gap;
                 }
+                // If nc_gap ≥ kTopoSnapGap and NOT sameTShape (different-
+                // TShape false-close detection), skip both actions — this
+                // is an open arc that happened to pass proximity checks; do
+                // not corrupt it.
+                (void)edge_tol_snap; // used only by the removed guard
             }
         }
 
@@ -947,6 +975,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // automatically (no separate SetProxyCurveDomain call needed).
         double edge_tol = BRep_Tool::Tolerance(edge);
         if (edge_tol < 0.0) edge_tol = linear_tolerance;
+        // For same-TShape edges whose 3D curve has a large geometric gap
+        // (case b above): raise edge tolerance to cover the gap so that
+        // ON_BrepEdge::IsClosed() succeeds via the tolerance fallback.
+        if (topo_closed_large_gap > edge_tol)
+            edge_tol = topo_closed_large_gap;
         ON_BrepEdge* poe = nullptr;
         if (vi0 >= 0 && vi1 >= 0) {
             poe = &brep.NewEdge(brep.m_V[vi0], brep.m_V[vi1], c3i,
@@ -985,6 +1018,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             bool need_trimmed = bs.IsNull() ||
                                 bs->IsUPeriodic() || bs->IsVPeriodic();
             if (need_trimmed) {
+                Handle(Geom_BSplineSurface) bs_orig = bs; // save in case convert fails
                 try {
                     double u1, u2, v1, v2;
                     BRepTools::UVBounds(face, u1, u2, v1, v2);
@@ -992,7 +1026,12 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         new Geom_RectangularTrimmedSurface(
                             gs, u1, u2, v1, v2);
                     bs = GeomConvert::SurfaceToBSplineSurface(ts);
-                } catch (...) {}
+                } catch (...) {
+                    // Restore original so SetUNotPeriodic() below is not
+                    // called on the shared geometry object (which would
+                    // mutate gs and break period detection).
+                    bs = bs_orig;
+                }
             }
             if (!bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
@@ -1169,11 +1208,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     continue;
 
                 if (we_keys.size() < tex_keys.size()) {
-                    // WireExplorer missed some edges — revert to TopExp order
+                    // WireExplorer missed some edges (e.g. degenerate edges
+                    // break the vertex-connectivity chain).  Fall back to
+                    // TopoDS_Iterator which preserves the stored wire order
+                    // as-built by the STEP/BRep reader — this matches the
+                    // intended UV traversal order.  TopExp_Explorer would
+                    // also visit all edges, but may revisit certain edges
+                    // (e.g. seam edges) and does not guarantee the same
+                    // sequential order as TopoDS_Iterator for wires with
+                    // mixed degenerate/regular edges.
                     wire_edges.clear();
-                    for (TopExp_Explorer eex(wire, TopAbs_EDGE);
-                         eex.More(); eex.Next())
-                        wire_edges.push_back(TopoDS::Edge(eex.Current()));
+                    for (TopoDS_Iterator it(wire); it.More(); it.Next()) {
+                        if (it.Value().ShapeType() == TopAbs_EDGE)
+                            wire_edges.push_back(TopoDS::Edge(it.Value()));
+                    }
                 }
             }
 
@@ -1516,7 +1564,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         // during conversion.  The OCCT period catches cylinders
                         // whose BSpline spans slightly more than one period,
                         // causing IsClosed(0) = false.
-                        const double kRelTol = 1e-3;
+                        const double kRelTol = 3e-3;
                         double shift_u = 0.0, shift_v = 0.0;
                         // U period: prefer OCCT period if available, fall back
                         // to domain width when surface reports IsClosed.
@@ -2591,7 +2639,9 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
     }
 
-    return brep.IsValid() ? true : false;
+    if (!brep.IsValid())
+        return false;
+    return true;
 }
 
 } // namespace open2open
