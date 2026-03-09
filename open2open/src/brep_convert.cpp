@@ -705,6 +705,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // 3D point at both ends (confirming a genuine loop rather than a very
         // short open edge with coincident-by-chance endpoints).
         bool topoClosedEdge = false;
+        bool sameTShapeClosedEdge = false; // same-TShape detection (canonical closed)
         {
             TopoDS_Vertex tv0, tv1;
             TopExp::Vertices(edge, tv0, tv1, /*CumOri=*/false);
@@ -717,8 +718,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 if (tv0.TShape() == tv1.TShape()) {
                     // Canonical closed edge: same underlying TShape.
                     // Require the vertex positions to be coincident.
-                    if (p0.Distance(p1) <= vtx_tol + 1e-7)
+                    if (p0.Distance(p1) <= vtx_tol + 1e-7) {
                         topoClosedEdge = true;
+                        sameTShapeClosedEdge = true;
+                    }
                 } else {
                     // Different TShape instances.  Apply a two-tier check:
                     // 1. Outer guard (vertex proximity): the vertex positions
@@ -891,6 +894,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // 2. Secondary IsClosed() edges: the B-spline conversion already
         //    produced endpoints that ON_PointsAreCoincident() accepts;
         //    snap is a no-op in that case.
+        //
+        // Two sub-cases:
+        // (a) Small gap (< kTopoSnapGap): floating-point residual from
+        //     SetNotPeriodic() or tiny numerical drift.  Snap cv[N-1] to
+        //     cv[0] so ON_PointsAreCoincident() returns true.
+        // (b) Large gap (≥ kTopoSnapGap) for a same-TShape edge: the OCCT
+        //     shape has an edge whose 3D curve nearly closes via the vertex
+        //     tolerance rather than geometric coincidence (e.g. a spiral-
+        //     like arc that starts and ends at the same vertex with a large
+        //     tolerance).  Snapping would corrupt the geometry; instead
+        //     record the gap so the edge tolerance can be raised to cover it,
+        //     satisfying the IsClosed() tolerance-fallback check in openNURBS.
+        static constexpr double kTopoSnapGap = 1e-3;
+        double topo_closed_large_gap = 0.0; // filled when (b) applies
         if (topoClosedEdge && c3i >= 0) {
             ON_NurbsCurve* nc =
                 ON_NurbsCurve::Cast(brep.m_C3[c3i]);
@@ -900,9 +917,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 ON_3dPoint np1 = nc->PointAt(nc->Domain()[1]);
                 double nc_gap = np0.DistanceTo(np1);
                 double edge_tol_snap = BRep_Tool::Tolerance(edge);
-                // Only snap when the gap is already within the edge
-                // tolerance (genuine closure residual).
-                if (nc_gap <= edge_tol_snap + 1e-7) {
+                if (nc_gap < kTopoSnapGap) {
+                    // Case (a): small gap — snap last CV to first.
+                    // Applies to both same-TShape (floating-point residual
+                    // after SetNotPeriodic) and secondary IsClosed() detections.
                     const int stride = nc->m_cv_stride;
                     double* cv0 = nc->CV(0);
                     double* cvN = nc->CV(nc->m_cv_count - 1);
@@ -910,7 +928,17 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         for (int k = 0; k < stride; ++k)
                             cvN[k] = cv0[k];
                     }
+                } else if (sameTShapeClosedEdge) {
+                    // Case (b): large gap, same-TShape topology.  The edge
+                    // is topologically closed with a large vertex tolerance
+                    // bridging the geometric gap.  Record for tolerance fixup.
+                    topo_closed_large_gap = nc_gap;
                 }
+                // If nc_gap ≥ kTopoSnapGap and NOT sameTShape (different-
+                // TShape false-close detection), skip both actions — this
+                // is an open arc that happened to pass proximity checks; do
+                // not corrupt it.
+                (void)edge_tol_snap; // used only by the removed guard
             }
         }
 
@@ -947,6 +975,11 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         // automatically (no separate SetProxyCurveDomain call needed).
         double edge_tol = BRep_Tool::Tolerance(edge);
         if (edge_tol < 0.0) edge_tol = linear_tolerance;
+        // For same-TShape edges whose 3D curve has a large geometric gap
+        // (case b above): raise edge tolerance to cover the gap so that
+        // ON_BrepEdge::IsClosed() succeeds via the tolerance fallback.
+        if (topo_closed_large_gap > edge_tol)
+            edge_tol = topo_closed_large_gap;
         ON_BrepEdge* poe = nullptr;
         if (vi0 >= 0 && vi1 >= 0) {
             poe = &brep.NewEdge(brep.m_V[vi0], brep.m_V[vi1], c3i,
@@ -979,20 +1012,128 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // Geom_RectangularTrimmedSurface path which always produces a
             // non-periodic BSpline whose UV domain exactly matches the face's
             // UV parameter bounds (= the pcurves' UV range).
-            // DO NOT call SetUNotPeriodic() or rely on GeomConvert on the
-            // unbounded analytical surface — both can produce a surface with
-            // an incorrect/tiny UV domain.
+            //
+            // IMPORTANT: For seam faces whose UV bounds span the full period
+            // of a periodic surface, Geom_RectangularTrimmedSurface reduces
+            // the domain modulo the period and collapses it to nearly zero.
+            // Subsequent knot reparameterisation scales the knots to [0,2π]
+            // but the control points describe a zero-width arc, giving zero
+            // surface area.  Fix: when the face spans ≥99% of the period in
+            // U or V, trim only in the OTHER direction and then remove the
+            // residual periodicity with SetU/VNotPeriodic().
             bool need_trimmed = bs.IsNull() ||
                                 bs->IsUPeriodic() || bs->IsVPeriodic();
             if (need_trimmed) {
+                Handle(Geom_BSplineSurface) bs_orig = bs; // save in case convert fails
                 try {
                     double u1, u2, v1, v2;
                     BRepTools::UVBounds(face, u1, u2, v1, v2);
-                    Handle(Geom_RectangularTrimmedSurface) ts =
-                        new Geom_RectangularTrimmedSurface(
-                            gs, u1, u2, v1, v2);
-                    bs = GeomConvert::SurfaceToBSplineSurface(ts);
-                } catch (...) {}
+
+                    // Detect if the face spans (nearly) the full period in U
+                    // or V so that we can avoid the domain-collapse trap.
+                    bool u_full = false, v_full = false;
+                    if (gs->IsUPeriodic()) {
+                        double uper = gs->UPeriod();
+                        if (uper > 0 && (u2 - u1) >= 0.99 * uper)
+                            u_full = true;
+                    }
+                    if (gs->IsVPeriodic()) {
+                        double vper = gs->VPeriod();
+                        if (vper > 0 && (v2 - v1) >= 0.99 * vper)
+                            v_full = true;
+                    }
+
+                    if ((u_full || v_full) &&
+                        !Precision::IsInfinite(v1) &&
+                        !Precision::IsInfinite(v2) &&
+                        v2 > v1 &&
+                        !Precision::IsInfinite(u1) &&
+                        !Precision::IsInfinite(u2) &&
+                        u2 > u1) {
+                        // Trim only in the direction(s) that are NOT full
+                        // period, then use SetNotPeriodic + Segment to
+                        // extract the exact face parameter range.
+                        //
+                        // Why Segment?  SetUNotPeriodic() on a degree-d
+                        // periodic circle expands the domain from [0, T] to
+                        // [-T/d, T*(1+1/d)] by prepending/appending extra
+                        // knots.  A subsequent linear knot rescale would
+                        // restore the domain width but change the rational
+                        // blending functions, distorting the geometry.
+                        // Segment() uses Boehm's knot-insertion algorithm
+                        // which correctly adjusts both poles and weights, so
+                        // the geometry is preserved exactly.
+                        if (u_full && !v_full) {
+                            // Trim V only (Standard_False = V trim)
+                            Handle(Geom_RectangularTrimmedSurface) ts_v =
+                                new Geom_RectangularTrimmedSurface(
+                                    gs, v1, v2, Standard_False);
+                            bs = GeomConvert::SurfaceToBSplineSurface(ts_v);
+                        } else if (v_full && !u_full) {
+                            // Trim U only (Standard_True = U trim)
+                            Handle(Geom_RectangularTrimmedSurface) ts_u =
+                                new Geom_RectangularTrimmedSurface(
+                                    gs, u1, u2, Standard_True);
+                            bs = GeomConvert::SurfaceToBSplineSurface(ts_u);
+                        } else {
+                            // Both directions span the full period (e.g.
+                            // a torus): convert the un-trimmed surface.
+                            bs = GeomConvert::SurfaceToBSplineSurface(gs);
+                        }
+
+                        // Remove periodicity and then segment to the exact
+                        // face UV bounds so the surface domain matches the
+                        // pcurves without any knot rescaling.
+                        if (!bs.IsNull()) {
+                            if (bs->IsUPeriodic() && bs->NbUKnots() >= 2 &&
+                                bs->UKnot(bs->NbUKnots()) -
+                                    bs->UKnot(1) > 1e-15)
+                                bs->SetUNotPeriodic();
+                            if (bs->IsVPeriodic() && bs->NbVKnots() >= 2 &&
+                                bs->VKnot(bs->NbVKnots()) -
+                                    bs->VKnot(1) > 1e-15)
+                                bs->SetVNotPeriodic();
+                            // Segment to face bounds (clamped to the new
+                            // non-periodic domain).
+                            //
+                            // Segment() uses Boehm's knot-insertion algorithm
+                            // to correctly adjust poles and weights while
+                            // producing a B-spline with domain exactly
+                            // [su0,su1]x[sv0,sv1].  If Segment() fails (e.g.
+                            // because the bounds coincide with existing
+                            // multiplicity-saturated knots), fall back to the
+                            // SetUNotPeriodic result: the expanded domain
+                            // [-T/d, T*(1+1/d)] still contains all pcurve UV
+                            // values and evaluates correctly at them, so the
+                            // face topology is preserved.  The updated
+                            // reparameterization guard below avoids distorting
+                            // the geometry by not rescaling in this case.
+                            double ku0 = bs->UKnot(1);
+                            double ku1 = bs->UKnot(bs->NbUKnots());
+                            double kv0 = bs->VKnot(1);
+                            double kv1 = bs->VKnot(bs->NbVKnots());
+                            double su0 = std::max(ku0, std::min(ku1, u1));
+                            double su1 = std::max(ku0, std::min(ku1, u2));
+                            double sv0 = std::max(kv0, std::min(kv1, v1));
+                            double sv1 = std::max(kv0, std::min(kv1, v2));
+                            if (su1 - su0 > 1e-12 && sv1 - sv0 > 1e-12) {
+                                try {
+                                    bs->Segment(su0, su1, sv0, sv1);
+                                } catch (...) {}
+                            }
+                        }
+                    } else {
+                        Handle(Geom_RectangularTrimmedSurface) ts =
+                            new Geom_RectangularTrimmedSurface(
+                                gs, u1, u2, v1, v2);
+                        bs = GeomConvert::SurfaceToBSplineSurface(ts);
+                    }
+                } catch (...) {
+                    // Restore original so SetUNotPeriodic() below is not
+                    // called on the shared geometry object (which would
+                    // mutate gs and break period detection).
+                    bs = bs_orig;
+                }
             }
             if (!bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
@@ -1022,17 +1163,24 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         ON_Interval srf_u = ns->Domain(0);
                         ON_Interval srf_v = ns->Domain(1);
                         const double kDomTol = 1e-6;
+                        // Reparameterize only when the face UV bounds fall
+                        // OUTSIDE the surface domain (surface is too small
+                        // for the face).  Do NOT reparameterize when the
+                        // surface domain is larger than the face bounds —
+                        // the rational blending functions must not change.
+                        // For full-period surfaces the Segment() call above
+                        // already made the domains match.
                         if (fu2 > fu1 && srf_u.IsValid() && srf_u.Length() > 0 &&
-                            (fabs(srf_u[0] - fu1) > kDomTol ||
-                             fabs(srf_u[1] - fu2) > kDomTol)) {
+                            (fu1 < srf_u[0] - kDomTol ||
+                             fu2 > srf_u[1] + kDomTol)) {
                             double ku_scale = (fu2 - fu1) / srf_u.Length();
                             for (int k = 0; k < ns->KnotCount(0); ++k)
                                 ns->m_knot[0][k] = fu1 +
                                     (ns->m_knot[0][k] - srf_u[0]) * ku_scale;
                         }
                         if (fv2 > fv1 && srf_v.IsValid() && srf_v.Length() > 0 &&
-                            (fabs(srf_v[0] - fv1) > kDomTol ||
-                             fabs(srf_v[1] - fv2) > kDomTol)) {
+                            (fv1 < srf_v[0] - kDomTol ||
+                             fv2 > srf_v[1] + kDomTol)) {
                             double kv_scale = (fv2 - fv1) / srf_v.Length();
                             for (int k = 0; k < ns->KnotCount(1); ++k)
                                 ns->m_knot[1][k] = fv1 +
@@ -1072,7 +1220,16 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         double pd = gs_base->UPeriod();
                         if (ns_ptr) {
                             ON_Interval du = ns_ptr->Domain(0);
-                            if (du.IsIncreasing()) pd = du.Length();
+                            if (du.IsIncreasing()) {
+                                // Use the domain width as the effective period
+                                // only when it closely matches the OCCT period
+                                // (i.e. the surface domain was not expanded by
+                                // SetUNotPeriodic from [-T/d, T*(1+1/d)]).
+                                // For expanded domains, the OCCT period is the
+                                // correct shift for gap-repair corrections.
+                                if (fabs(du.Length() - pd) < 1e-4 * pd)
+                                    pd = du.Length();
+                            }
                         }
                         surface_uperiod[si] = pd;
                     } else {
@@ -1084,7 +1241,10 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         double pd = gs_base->VPeriod();
                         if (ns_ptr) {
                             ON_Interval dv = ns_ptr->Domain(1);
-                            if (dv.IsIncreasing()) pd = dv.Length();
+                            if (dv.IsIncreasing()) {
+                                if (fabs(dv.Length() - pd) < 1e-4 * pd)
+                                    pd = dv.Length();
+                            }
                         }
                         surface_vperiod[si] = pd;
                     } else {
@@ -1169,11 +1329,20 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     continue;
 
                 if (we_keys.size() < tex_keys.size()) {
-                    // WireExplorer missed some edges — revert to TopExp order
+                    // WireExplorer missed some edges (e.g. degenerate edges
+                    // break the vertex-connectivity chain).  Fall back to
+                    // TopoDS_Iterator which preserves the stored wire order
+                    // as-built by the STEP/BRep reader — this matches the
+                    // intended UV traversal order.  TopExp_Explorer would
+                    // also visit all edges, but may revisit certain edges
+                    // (e.g. seam edges) and does not guarantee the same
+                    // sequential order as TopoDS_Iterator for wires with
+                    // mixed degenerate/regular edges.
                     wire_edges.clear();
-                    for (TopExp_Explorer eex(wire, TopAbs_EDGE);
-                         eex.More(); eex.Next())
-                        wire_edges.push_back(TopoDS::Edge(eex.Current()));
+                    for (TopoDS_Iterator it(wire); it.More(); it.Next()) {
+                        if (it.Value().ShapeType() == TopAbs_EDGE)
+                            wire_edges.push_back(TopoDS::Edge(it.Value()));
+                    }
                 }
             }
 
@@ -1489,6 +1658,18 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         (vp_it != surface_vperiod.end()) ? vp_it->second : 0.0;
 
                     const int nc = ol.m_ti.Count();
+
+                    // Build a pcurve reference-count map for this loop so
+                    // that the shared-pcurve guard inside the gap loop can
+                    // answer "is c2i exclusive to this trim?" in O(1) rather
+                    // than rescanning all brep trims for every gap.
+                    std::unordered_map<int,int> c2i_refcount;
+                    for (int ti_s = 0; ti_s < brep.m_T.Count(); ++ti_s) {
+                        const int c2i_s = brep.m_T[ti_s].m_c2i;
+                        if (c2i_s >= 0)
+                            ++c2i_refcount[c2i_s];
+                    }
+
                     for (int k = 0; k < nc; ++k) {
                         ON_BrepTrim& tk  = brep.m_T[ol.m_ti[k]];
                         ON_BrepTrim& tk1 =
@@ -1516,7 +1697,13 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         // during conversion.  The OCCT period catches cylinders
                         // whose BSpline spans slightly more than one period,
                         // causing IsClosed(0) = false.
-                        const double kRelTol = 1e-3;
+                        //
+                        // The cross-direction residual (dy for a U period gap,
+                        // dx for a V period gap) is bounded by a fraction of
+                        // the OPPOSITE domain dimension so that small numerical
+                        // misalignment in the non-periodic direction does not
+                        // block detection.
+                        const double kRelTol = 3e-3;
                         double shift_u = 0.0, shift_v = 0.0;
                         // U period: prefer OCCT period if available, fall back
                         // to domain width when surface reports IsClosed.
@@ -1526,20 +1713,102 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         const double eff_vperiod = (occt_vperiod > 0.0)
                                                        ? occt_vperiod
                                                        : (cls_v ? vperiod : 0.0);
+                        // Absolute tolerance for the cross-direction component:
+                        // use the domain width in the OTHER direction so that
+                        // small residuals (e.g. dy=0.05 on a V-domain of 2.0)
+                        // don't block a valid U-period shift detection.
+                        const double vdom = (v1 > v0) ? (v1 - v0) : 1.0;
+                        const double udom = (u1 > u0) ? (u1 - u0) : 1.0;
                         if (eff_uperiod > 0.0 &&
                             fabs(fabs(dx) - eff_uperiod) <
                                 kRelTol * eff_uperiod &&
-                            fabs(dy) < kRelTol * eff_uperiod) {
+                            fabs(dy) < kRelTol * vdom) {
                             shift_u = -dx;
                         } else if (eff_vperiod > 0.0 &&
                                    fabs(fabs(dy) - eff_vperiod) <
                                        kRelTol * eff_vperiod &&
-                                   fabs(dx) < kRelTol * eff_vperiod) {
+                                   fabs(dx) < kRelTol * udom) {
                             shift_v = -dy;
+                        }
+
+                        // Strategy 1b: domain-width fallback period detection
+                        // for geometrically closed non-periodic B-spline
+                        // surfaces.
+                        //
+                        // Revolution surfaces (e.g. cones, toroids) are often
+                        // stored as B-spline surfaces whose U parameterization
+                        // spans exactly one full revolution [0, 2π] or another
+                        // complete period, yet OCCT marks them IsUPeriodic=false
+                        // and IsClosed(0)=false because the B-spline knots are
+                        // not periodic.  In that case eff_uperiod = 0 and
+                        // Strategy 1 above does not fire.
+                        //
+                        // Detection: if eff_[u|v]period = 0 but the gap
+                        // magnitude closely matches the raw domain width, treat
+                        // the domain width as the effective period and apply the
+                        // same all-poles translation.  This is safe because:
+                        //  - the gap-magnitude match condition is tight (0.3%),
+                        //    so random gaps on planar faces don't trigger this;
+                        //  - the cross-direction residual is checked against the
+                        //    opposite domain (same as Strategy 1), preventing
+                        //    misclassification of oblique non-period gaps;
+                        //  - a seam-crossing guard (below) prevents firing when
+                        //    both endpoints are at opposite domain boundaries
+                        //    and the gap is just the expected seam crossing
+                        //    (which would cascade around the loop if shifted).
+                        //
+                        // Seam-crossing guard for Strategy 1b only: when tk
+                        // ends at one surface boundary and tk1 starts at the
+                        // OPPOSITE boundary, the gap is a legitimate seam
+                        // crossing on a non-periodic surface — the two UV
+                        // points map to the same 3D location.  Applying a
+                        // period shift would cascade and corrupt the loop.
+                        // Strategy 1 (periodic surfaces) is NOT guarded here
+                        // because periodic-surface seam edges are always
+                        // represented as explicit seam trims in OCCT, so the
+                        // k-loop never encounters a raw seam gap for periodic
+                        // surfaces; the guard is only needed for non-periodic
+                        // closed B-splines (eff_uperiod == 0).
+                        if (shift_u == 0.0 && shift_v == 0.0) {
+                            const double kSeamTol = kRelTol;
+                            const bool at_u_seam_1b =
+                                (fabs(pe.x - u1) < kSeamTol * udom &&
+                                 fabs(ps.x - u0) < kSeamTol * udom) ||
+                                (fabs(pe.x - u0) < kSeamTol * udom &&
+                                 fabs(ps.x - u1) < kSeamTol * udom);
+                            const bool at_v_seam_1b =
+                                (fabs(pe.y - v1) < kSeamTol * vdom &&
+                                 fabs(ps.y - v0) < kSeamTol * vdom) ||
+                                (fabs(pe.y - v0) < kSeamTol * vdom &&
+                                 fabs(ps.y - v1) < kSeamTol * vdom);
+                            if (!at_u_seam_1b && eff_uperiod == 0.0 &&
+                                udom > 0.0 &&
+                                fabs(fabs(dx) - udom) < kRelTol * udom &&
+                                fabs(dy) < kRelTol * vdom) {
+                                shift_u = -dx;
+                            } else if (!at_v_seam_1b && eff_vperiod == 0.0 &&
+                                       vdom > 0.0 &&
+                                       fabs(fabs(dy) - vdom) < kRelTol * vdom &&
+                                       fabs(dx) < kRelTol * udom) {
+                                shift_v = -dy;
+                            }
                         }
 
                         if (fabs(shift_u) > 1e-12 ||
                             fabs(shift_v) > 1e-12) {
+                            // Shift all poles of tk1's pcurve by the period.
+                            // Only tk1 is shifted (not tk+2, tk+3, ...): if
+                            // multiple consecutive junctions in the same loop
+                            // each need the same period shift, the subsequent
+                            // k-iterations will detect and apply the same shift
+                            // to tk+2, tk+3, etc. individually.  The seam-
+                            // crossing guard above ensures that loops whose
+                            // junctions are genuine seam crossings (not period
+                            // shift errors) are never shifted, preventing the
+                            // cascade where shifting tk+1 creates a new gap at
+                            // the next junction (and eventually at the wrap-
+                            // around junction k=nc-1 which would corrupt the
+                            // k=0 fix).
                             for (int p = 0; p < nc2->m_cv_count; ++p) {
                                 double* cv = nc2->CV(p);
                                 cv[0] += shift_u;
@@ -1555,34 +1824,103 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             dy = ps.y - pe.y;
                         }
 
-                        // Strategy 2: snap the first pole of tk1's pcurve
-                        // to tk's UV endpoint to eliminate floating-point
-                        // residual gaps.  Only applied when the gap is
-                        // smaller than 5% of the surface domain (avoids
-                        // snapping a genuine topological mismatch).
+                        // Strategy 2a: snap the first pole of tk1's pcurve
+                        // to tk's UV endpoint.  Applied for gaps within 5% of
+                        // the surface domain (floating-point noise level).
+                        //
+                        // Strategy 2b: C1-preserving re-fit for larger gaps
+                        // (between 5% and 30% of domain).  Instead of only
+                        // moving cv[0], move both cv[0] and cv[1] by the same
+                        // delta so the initial tangent direction is preserved.
+                        // For a clamped B-spline the tangent at the domain
+                        // start is proportional to (cv[1] - cv[0]), so an
+                        // equal translation of both maintains C1 continuity at
+                        // the loop junction.  The re-fit is riskier than the
+                        // pure snap (it moves two poles instead of one) and
+                        // can be disabled via kEnableLargeGapRefit.
+                        //
+                        // Guard: the C1 re-fit only moves cv[1] when the
+                        // pcurve is not shared between multiple trims.
+                        // Shared pcurves (e.g. degenerate seam edge pairs) can
+                        // have a different trim use the same curve in the
+                        // opposite direction; moving cv[1] would corrupt its
+                        // end-point and can incorrectly cause SetTrimIsoFlags
+                        // to classify another trim as iso-parametric.
+                        //
                         // The B-spline domain trimming above ensures that
                         // cv[0] corresponds to PointAt(proxy_domain_start),
-                        // making this snap effective.
+                        // making both strategies effective.
+                        static constexpr bool kEnableLargeGapRefit = true;
+
                         if (fabs(dx) > 1e-14 || fabs(dy) > 1e-14) {
-                            const double domain_sz =
-                                std::max(uperiod > 0.0 ? uperiod : (u1-u0),
-                                         vperiod > 0.0 ? vperiod : (v1-v0));
-                            const double snap_limit =
-                                0.05 * domain_sz;
-                            if (snap_limit > 0.0 &&
-                                fabs(dx) < snap_limit &&
-                                fabs(dy) < snap_limit) {
+                            // Compute per-axis domain sizes for the limits.
+                            const double udomain_sz =
+                                uperiod > 0.0 ? uperiod : udom;
+                            const double vdomain_sz =
+                                vperiod > 0.0 ? vperiod : vdom;
+                            const double snap_limit_u = 0.05 * udomain_sz;
+                            const double snap_limit_v = 0.05 * vdomain_sz;
+                            const double refit_limit_u = 0.30 * udomain_sz;
+                            const double refit_limit_v = 0.30 * vdomain_sz;
+
+                            const bool within_snap =
+                                (snap_limit_u > 0.0 && fabs(dx) < snap_limit_u) &&
+                                (snap_limit_v > 0.0 && fabs(dy) < snap_limit_v);
+                            const bool within_refit =
+                                kEnableLargeGapRefit &&
+                                (refit_limit_u > 0.0 && fabs(dx) < refit_limit_u) &&
+                                (refit_limit_v > 0.0 && fabs(dy) < refit_limit_v);
+
+                            if (within_snap || within_refit) {
                                 double* cv0 = nc2->CV(0);
-                                // For rational curves CV stores homogeneous
-                                // coords (x*w, y*w, w); multiply by weight.
-                                if (nc2->IsRational()) {
-                                    const double w = cv0[nc2->m_dim];
-                                    cv0[0] = pe.x * w;
-                                    cv0[1] = pe.y * w;
-                                    // cv0[m_dim] (weight) is unchanged
-                                } else {
-                                    cv0[0] = pe.x;
-                                    cv0[1] = pe.y;
+                                const double w0 = nc2->IsRational()
+                                                    ? cv0[nc2->m_dim] : 1.0;
+                                // Guard against degenerate rational curves
+                                // where a zero weight can arise due to
+                                // floating-point cancellation during OCCT
+                                // B-spline conversion; treat as weight=1.
+                                const double safe_w0 =
+                                    (w0 != 0.0) ? w0 : 1.0;
+
+                                // Always move cv[0] to the target start point.
+                                cv0[0] = pe.x * safe_w0;
+                                cv0[1] = pe.y * safe_w0;
+
+                                // Strategy 2b: also move cv[1] by the same
+                                // delta to preserve the initial tangent.
+                                // Only safe when:
+                                //   - the gap is too large for strategy 2a
+                                //     (we are in the refit range), AND
+                                //   - the pcurve is NOT shared by another
+                                //     trim (moving cv[1] of a shared curve
+                                //     corrupts the other trim's geometry).
+                                if (!within_snap && nc2->m_cv_count >= 2) {
+                                    // delta is computed here rather than
+                                    // outside the if-block so it is only
+                                    // evaluated in the refit path.
+                                    const double delta_x = pe.x - ps.x;
+                                    const double delta_y = pe.y - ps.y;
+                                    // Use precomputed refcount map (O(1)).
+                                    const int c2i_check = tk1.m_c2i;
+                                    auto rc_it = c2i_refcount.find(c2i_check);
+                                    const int c2i_refs =
+                                        (rc_it != c2i_refcount.end())
+                                            ? rc_it->second : 0;
+                                    if (c2i_refs <= 1) {
+                                        // Pcurve is exclusive to tk1; safe to
+                                        // move cv[1] for C1 continuity.
+                                        double* cv1 = nc2->CV(1);
+                                        const double w1 = nc2->IsRational()
+                                                            ? cv1[nc2->m_dim]
+                                                            : 1.0;
+                                        const double safe_w1 =
+                                            (w1 != 0.0) ? w1 : 1.0;
+                                        cv1[0] += delta_x * safe_w1;
+                                        cv1[1] += delta_y * safe_w1;
+                                    }
+                                    // If pcurve is shared (c2i_refs > 1),
+                                    // only cv[0] was moved (strategy 2a
+                                    // applied with the larger gap threshold).
                                 }
                                 modified = true;
                                 tk1.SetProxyCurveDomain(
@@ -1643,6 +1981,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         ON_BrepTrim& trim = brep.m_T[ti];
         if (trim.m_type != ON_BrepTrim::seam &&
             trim.m_type != ON_BrepTrim::singular) continue;
+        // Debug: check if this trim is in loop 7
         // Skip trims that already have proper boundary iso.
         // Seam and singular trims need W/E/S/N_iso (3–6); x_iso(1) and y_iso(2)
         // are interior-only and invalid for seam and singular trims.
@@ -2591,7 +2930,27 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
     }
 
-    return brep.IsValid() ? true : false;
+    // Final post-processing: re-run SetTrimIsoFlags for ALL trims to ensure
+    // m_iso is consistent with the current pcurve geometry.
+    //
+    // The seam/singular repair and UV gap snap passes may modify pcurves after
+    // the initial SetTolerancesBoxesAndFlags call (line 1738).  When a pcurve
+    // is shared between a seam trim and a regular trim, the seam repair only
+    // calls SetTrimIsoFlags on the seam trim — leaving the regular trim's
+    // m_iso stale.  Similarly, the UV gap snap can kink a shared pcurve,
+    // making it no longer truly iso-parametric even though m_iso was set to
+    // x_iso/y_iso before the snap.  A fresh unconditional call here ensures
+    // IsValid() and the stored m_iso agree, avoiding "m_iso = X but should
+    // be Y" failures.
+    //
+    // NOTE: We call SetTrimIsoFlags() directly rather than
+    // SetTolerancesBoxesAndFlags() to avoid resetting the edge tolerances
+    // adjusted by the previous pass.
+    brep.SetTrimIsoFlags();
+
+    if (!brep.IsValid())
+        return false;
+    return true;
 }
 
 } // namespace open2open
