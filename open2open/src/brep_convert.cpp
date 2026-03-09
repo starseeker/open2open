@@ -728,11 +728,15 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     //    linear_tolerance passed to ON_BrepToOCCT, typically
                     //    1e-6) as closed.
                     // 2. Inner check (curve closure): the 3D curve must
-                    //    evaluate to coincident endpoints within the edge's own
-                    //    geometric tolerance.  This is tighter than the old
-                    //    max(vtx_tol, etol) threshold, which incorrectly
-                    //    accepted genuinely open edges in STEP assemblies where
-                    //    vtx_tol >> etol (e.g. vtx_tol=7.3e-2, etol=1.1e-3).
+                    //    evaluate to NEARLY EXACTLY coincident endpoints.
+                    //    True closed loops (full circles, full ellipses)
+                    //    evaluate to the same mathematical point at both ends;
+                    //    after B-spline conversion the residual gap is at most
+                    //    ~1e-10 (machine precision).  Open arcs whose endpoints
+                    //    happen to be "within etol" of each other have a gap of
+                    //    order etol itself — so we require gap < etol * 1e-3.
+                    //    This rejects such open arcs while still accepting
+                    //    genuine full-period seam curves.
                     if (p0.Distance(p1) <= vtx_tol + 1e-7) {
                         double tc0, tc1;
                         Handle(Geom_Curve) gc_tmp =
@@ -743,7 +747,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                             gc_tmp->D0(tc1, q1);
                             double etol = BRep_Tool::Tolerance(edge);
                             topoClosedEdge =
-                                (q0.Distance(q1) <= etol + 1e-7);
+                                (q0.Distance(q1) <= etol * 1e-3 + 1e-10);
                         }
                     }
                 }
@@ -876,26 +880,36 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         }
 
         // For topologically-closed edges the curve's own domain endpoints
-        // must be coincident (IsClosed() == true).  Always snap the last
-        // CV to exactly match the first so that ON_PointsAreCoincident()
-        // returns true.  This handles:
-        // 1. Same-TShape seam edges: endpoints are nearly equal, snap
-        //    removes any floating-point residual.
-        // 2. Different-TShape coincident-vertex edges (STEP assemblies):
-        //    the endpoint gap may be larger (up to vtx_tol), but the
-        //    snap is within the edge's declared tolerance.
-        // 3. Full-period periodic edges with exact endpoint equality:
-        //    snap is a no-op but ensures forward compatibility.
+        // must be coincident (IsClosed() == true).  Snap the last CV to
+        // exactly match the first so that ON_PointsAreCoincident() returns
+        // true.  This covers two cases:
+        // 1. Same-TShape seam edges: endpoints are nearly equal after
+        //    B-spline conversion; the snap removes any floating-point
+        //    residual.  Guard: only snap when the current gap is small
+        //    (within the edge tolerance) to avoid corrupting open arcs that
+        //    were misclassified as closed.
+        // 2. Secondary IsClosed() edges: the B-spline conversion already
+        //    produced endpoints that ON_PointsAreCoincident() accepts;
+        //    snap is a no-op in that case.
         if (topoClosedEdge && c3i >= 0) {
             ON_NurbsCurve* nc =
                 ON_NurbsCurve::Cast(brep.m_C3[c3i]);
             if (nc && nc->m_cv_count >= 2) {
-                const int stride = nc->m_cv_stride;
-                double* cv0 = nc->CV(0);
-                double* cvN = nc->CV(nc->m_cv_count - 1);
-                if (cv0 && cvN) {
-                    for (int k = 0; k < stride; ++k)
-                        cvN[k] = cv0[k];
+                // Compute endpoint gap via the NURBS evaluator.
+                ON_3dPoint np0 = nc->PointAt(nc->Domain()[0]);
+                ON_3dPoint np1 = nc->PointAt(nc->Domain()[1]);
+                double nc_gap = np0.DistanceTo(np1);
+                double edge_tol_snap = BRep_Tool::Tolerance(edge);
+                // Only snap when the gap is already within the edge
+                // tolerance (genuine closure residual).
+                if (nc_gap <= edge_tol_snap + 1e-7) {
+                    const int stride = nc->m_cv_stride;
+                    double* cv0 = nc->CV(0);
+                    double* cvN = nc->CV(nc->m_cv_count - 1);
+                    if (cv0 && cvN) {
+                        for (int k = 0; k < stride; ++k)
+                            cvN[k] = cv0[k];
+                    }
                 }
             }
         }
