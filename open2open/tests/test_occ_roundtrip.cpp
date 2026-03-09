@@ -58,8 +58,18 @@ static bool RoundTripShape(const TopoDS_Shape& shape, std::string& reason)
         ON_TextLog log(wlog);
         on_brep.IsValid(&log);
         ON_String slog(wlog);
-        if (slog.Length() > 0 && slog.Length() < 256) {
+        if (slog.Length() > 0 && slog.Length() < 2048) {
             reason = std::string("OCCTToON_Brep returned false: ") + slog.Array();
+        } else if (slog.Length() >= 2048) {
+            // Truncate at first newline to get the primary error line
+            const char* p = slog.Array();
+            const char* nl = strchr(p, '\n');
+            if (nl && (nl - p) < 512) {
+                reason = std::string("OCCTToON_Brep returned false: ") +
+                         std::string(p, nl - p);
+            } else {
+                reason = "OCCTToON_Brep returned false";
+            }
         } else {
             reason = "OCCTToON_Brep returned false";
         }
