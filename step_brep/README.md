@@ -34,6 +34,4 @@ Commit the files you want to keep for ongoing regression testing.
 every `.brep` file here.  CMake also registers `test_occ_roundtrip_step_brep`
 as a CTest target that does this automatically.
 
-Expected results (as of last generation): **40/41 pass**; the one known failure
-(`carry_lever_spring_tool_0.brep`) hits a seam-trim ISO-classification issue
-that is tracked separately.
+Expected results (as of last generation): **41/41 pass**.
