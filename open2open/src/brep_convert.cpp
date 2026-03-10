@@ -31,12 +31,16 @@
 #include <Geom_BSplineSurface.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <Geom_RectangularTrimmedSurface.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <Geom_SphericalSurface.hxx>
+#include <Geom_Plane.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <GeomConvert.hxx>
 #include <Geom2dConvert.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
+#include <gp_Ax3.hxx>
 #include <gp_Pnt.hxx>
 
 // ---- OCCT tools ----
