@@ -690,7 +690,11 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     // UV domain (corrupting BRepTools::UVBounds).  By
                     // remapping the knots linearly to [ed.first, ed.second]
                     // we restore SameRange=true without changing geometry.
-                    if (std::fabs(pd_min - ed.first)  > kRangeTol ||
+                    // Only remap when both domains share the same start
+                    // point (pure scale mismatch, not a shift).  When starts
+                    // differ the pcurve UV poles are already outside the
+                    // surface domain; BRepLib::SameParameter must reproject.
+                    if (std::fabs(pd_min - ed.first) < kRangeTol &&
                         std::fabs(pd_max - ed.second) > kRangeTol) {
                         double old_span = pd_max - pd_min;
                         double new_span = ed.second - ed.first;
