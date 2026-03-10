@@ -165,7 +165,16 @@ SurfaceToOCCT(const ON_Surface* srf)
                 double domain_span = ac->Domain().Max() - ac->Domain().Min();
                 bool angle_param =
                     fabs(ac->m_arc.AngleRadians() - domain_span) < 1e-4 * (1.0 + domain_span);
-                if (R > 1e-14 && angle_param) {
+                // Only promote to Geom_SphericalSurface when the revolution
+                // spans the full circle (m_angle range ≈ 2π).  Partial-
+                // revolution faces placed on a full Geom_SphericalSurface
+                // cause OCCT's BRepTools::UVBounds to include U=0 even when
+                // the face never touches the seam, corrupting the pcurve UV
+                // range during OCCTToON_Brep and introducing spurious UV gaps.
+                double uspan = fabs(rev->m_angle[1] - rev->m_angle[0]);
+                bool full_rev =
+                    fabs(uspan - 2.0 * ON_PI) < 1e-4 * (1.0 + uspan);
+                if (R > 1e-14 && angle_param && full_rev) {
                     const ON_Plane& ap = ac->m_arc.plane;
                     // Check that the arc plane contains the revolution axis
                     // (i.e. arc.zaxis ⊥ axdir).
@@ -304,6 +313,65 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // ------------------------------------------------------------------
     // Step 4 — create faces, attach pcurves, build wires
     // ------------------------------------------------------------------
+
+    // Pre-scan: find "cross-face seam" edges — edges shared by two trims
+    // on different faces that use the *same* surface (same m_si).  OCCT
+    // stores pcurves per (edge, surface), so calling the single-pcurve
+    // UpdateEdge(edge, pc, face, tol) twice for the same edge/surface pair
+    // causes the second call to overwrite the first.  Such edges must be
+    // handled with the two-pcurve UpdateEdge(edge, C1, C2, face, tol)
+    // after all faces are built, analogous to same-face seam trims.
+    struct CrossFaceSeam {
+        int fi_fwd = -1, fi_rev = -1;  // face where edge is FORWARD / REVERSED
+        int c2i_fwd = -1, c2i_rev = -1;
+        double t0 = 0, t1 = 0, tol = 0;
+    };
+    std::map<int, CrossFaceSeam> cross_face_seam_map; // edge idx → seam info
+
+    for (int ei = 0; ei < brep.m_E.Count(); ++ei) {
+        const ON_BrepEdge& e = brep.m_E[ei];
+        if (e.m_ti.Count() < 2) continue;
+        // Collect (face, si, trim, rev3d) for each trim on this edge
+        struct TInfo { int fi, si, ti; bool rev3d; };
+        std::vector<TInfo> tv;
+        for (int k = 0; k < e.m_ti.Count(); ++k) {
+            int ti = e.m_ti[k];
+            if (ti < 0 || ti >= brep.m_T.Count()) continue;
+            const ON_BrepTrim& tr = brep.m_T[ti];
+            if (tr.m_type == ON_BrepTrim::seam) continue; // handled by seam_map
+            if (tr.m_li < 0 || tr.m_li >= brep.m_L.Count()) continue;
+            int fi = brep.m_L[tr.m_li].m_fi;
+            if (fi < 0 || fi >= brep.m_F.Count()) continue;
+            int si = brep.m_F[fi].m_si;
+            if (si < 0 || si >= (int)s_map.size() || s_map[si].IsNull()) continue;
+            tv.push_back({fi, si, ti, (bool)tr.m_bRev3d});
+        }
+        // Find a pair with same si but different fi
+        for (int a = 0; a < (int)tv.size() && !cross_face_seam_map.count(ei); ++a) {
+            for (int b = a+1; b < (int)tv.size(); ++b) {
+                if (tv[a].fi == tv[b].fi) continue;
+                if (tv[a].si != tv[b].si) continue;
+                // Same surface, different faces: cross-face seam
+                CrossFaceSeam& cfs = cross_face_seam_map[ei];
+                const ON_BrepTrim& ta = brep.m_T[tv[a].ti];
+                const ON_BrepTrim& tb = brep.m_T[tv[b].ti];
+                // Assign fwd/rev based on m_bRev3d
+                if (!tv[a].rev3d) {
+                    cfs.fi_fwd = tv[a].fi; cfs.c2i_fwd = ta.m_c2i;
+                    cfs.fi_rev = tv[b].fi; cfs.c2i_rev = tb.m_c2i;
+                } else {
+                    cfs.fi_fwd = tv[b].fi; cfs.c2i_fwd = tb.m_c2i;
+                    cfs.fi_rev = tv[a].fi; cfs.c2i_rev = ta.m_c2i;
+                }
+                cfs.t0 = ta.Domain().Min();
+                cfs.t1 = ta.Domain().Max();
+                cfs.tol = ta.m_tolerance[0] > 0.0
+                               ? ta.m_tolerance[0] : linear_tolerance;
+                break;
+            }
+        }
+    }
+
     std::vector<TopoDS_Face> f_map(brep.m_F.Count());
 
     for (int fi = 0; fi < brep.m_F.Count(); ++fi) {
@@ -558,6 +626,90 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             }
 
             B.Add(f_map[fi], wire);
+        }
+    }
+
+    // Post-process: apply two-pcurve UpdateEdge for cross-face seam edges.
+    // The single-pcurve UpdateEdge calls in the face loop above overwrote
+    // each other for these edges (both faces share the same OCCT surface
+    // handle).  Replacing them with the two-pcurve form lets
+    // BRep_Tool::CurveOnSurface correctly distinguish between C1 (edge
+    // traversed FORWARD) and C2 (edge traversed REVERSED).
+    for (auto& kv : cross_face_seam_map) {
+        int ei = kv.first;
+        const CrossFaceSeam& cfs = kv.second;
+        if (ei >= (int)e_map.size()) continue;
+        if (cfs.fi_fwd < 0 || cfs.fi_fwd >= (int)f_map.size()) continue;
+        if (cfs.c2i_fwd < 0 || cfs.c2i_fwd >= (int)c2_map.size()) continue;
+        if (cfs.c2i_rev < 0 || cfs.c2i_rev >= (int)c2_map.size()) continue;
+        if (c2_map[cfs.c2i_fwd].IsNull() || c2_map[cfs.c2i_rev].IsNull()) continue;
+
+        Handle(Geom2d_Curve) c_fwd = c2_map[cfs.c2i_fwd];  // edge-forward dir
+        Handle(Geom2d_Curve) c_rev_efwd = c2_map[cfs.c2i_rev]->Reversed();
+
+        // Remap reversed pcurve domain to [t0,t1] if Reversed() flipped it
+        Handle(Geom2d_BSplineCurve) brev =
+            Handle(Geom2d_BSplineCurve)::DownCast(c_rev_efwd);
+        if (!brev.IsNull() && brev->NbKnots() >= 2) {
+            double old0 = brev->FirstParameter();
+            double old1 = brev->LastParameter();
+            double span = old1 - old0;
+            if (std::abs(span) > 1e-12 &&
+                (std::abs(old0 - cfs.t0) > 1e-10 ||
+                 std::abs(old1 - cfs.t1) > 1e-10)) {
+                const int nk = brev->NbKnots();
+                double scale = (cfs.t1 - cfs.t0) / span;
+                TColStd_Array1OfReal    new_knots(1, nk);
+                TColStd_Array1OfInteger new_mults(1, nk);
+                for (int k = 1; k <= nk; ++k) {
+                    new_knots.SetValue(k, cfs.t0 +
+                                          (brev->Knot(k) - old0) * scale);
+                    new_mults.SetValue(k, brev->Multiplicity(k));
+                }
+                const int np = brev->NbPoles();
+                TColgp_Array1OfPnt2d poles(1, np);
+                TColStd_Array1OfReal  weights(1, np);
+                bool rat = brev->IsRational();
+                for (int p = 1; p <= np; ++p) {
+                    poles.SetValue(p, brev->Pole(p));
+                    weights.SetValue(p, rat ? brev->Weight(p) : 1.0);
+                }
+                try {
+                    Handle(Geom2d_BSplineCurve) remap;
+                    if (rat)
+                        remap = new Geom2d_BSplineCurve(poles, weights,
+                                    new_knots, new_mults, brev->Degree());
+                    else
+                        remap = new Geom2d_BSplineCurve(poles,
+                                    new_knots, new_mults, brev->Degree());
+                    c_rev_efwd = remap;
+                } catch (...) {}
+            }
+        }
+
+        // Use the forward-trim's face as the reference face for UpdateEdge.
+        // For a non-reversed face (m_bRev=0): C1→PCurve (FORWARD edge),
+        // C2→PCurve2 (REVERSED edge).  The reversed-trim face (fi_rev)
+        // traverses the edge in REVERSED orientation, so it receives PCurve2.
+        const ON_BrepFace& fwd_face = brep.m_F[cfs.fi_fwd];
+        Handle(Geom2d_Curve) C1, C2;
+        if (fwd_face.m_bRev) {
+            C1 = c_rev_efwd;
+            C2 = c_fwd;
+        } else {
+            C1 = c_fwd;
+            C2 = c_rev_efwd;
+        }
+        B.UpdateEdge(e_map[ei], C1, C2, f_map[cfs.fi_fwd], cfs.tol);
+        B.Range(e_map[ei], f_map[cfs.fi_fwd], cfs.t0, cfs.t1);
+        {
+            const double kRangeTol = 1e-10;
+            const auto& ed = e3d_domain[ei];
+            if (std::fabs(cfs.t0 - ed.first)  > kRangeTol ||
+                std::fabs(cfs.t1 - ed.second) > kRangeTol) {
+                B.SameRange(e_map[ei], Standard_False);
+                B.SameParameter(e_map[ei], Standard_False);
+            }
         }
     }
 
