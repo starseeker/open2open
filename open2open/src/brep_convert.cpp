@@ -101,20 +101,92 @@ Curve2dToOCCT(const ON_Curve* crv)
 }
 
 // ---------------------------------------------------------------------------
-// Helper: convert any ON_Surface to a Geom_Surface (NURBS fallback)
+// Helper: convert any ON_Surface to a Geom_Surface.
+// Preserves analytical types (cylinder, sphere, plane) when possible so that
+// BRepGProp can use exact integration on the reconstructed shape.
 // ---------------------------------------------------------------------------
-static Handle(Geom_BSplineSurface)
+static Handle(Geom_Surface)
 SurfaceToOCCT(const ON_Surface* srf)
 {
-    if (!srf) return Handle(Geom_BSplineSurface)();
+    if (!srf) return Handle(Geom_Surface)();
 
+    // --- ON_PlaneSurface → Geom_Plane ---
+    const ON_PlaneSurface* ps = ON_PlaneSurface::Cast(srf);
+    if (ps) {
+        const ON_Plane& pl = ps->m_plane;
+        gp_Pnt loc(pl.origin.x, pl.origin.y, pl.origin.z);
+        gp_Dir zdir(pl.zaxis.x, pl.zaxis.y, pl.zaxis.z);
+        gp_Dir xdir(pl.xaxis.x, pl.xaxis.y, pl.xaxis.z);
+        return new Geom_Plane(gp_Ax3(loc, zdir, xdir));
+    }
+
+    // --- ON_RevSurface → Geom_CylindricalSurface or Geom_SphericalSurface ---
+    const ON_RevSurface* rev = ON_RevSurface::Cast(srf);
+    if (rev && rev->m_curve && !rev->m_bTransposed) {
+        // Axis of revolution
+        ON_3dVector axdir = rev->m_axis.to - rev->m_axis.from;
+        if (axdir.Unitize()) {
+            const ON_LineCurve* lc = ON_LineCurve::Cast(rev->m_curve);
+            const ON_ArcCurve*  ac = ON_ArcCurve::Cast(rev->m_curve);
+
+            if (lc) {
+                // Cylinder: profile is a line at angle u=0
+                // P(u,v) = axis_foot + v*ZDir + R*(cos(u)*XDir + sin(u)*YDir)
+                // Recover XDir and Radius from the line start point.
+                double v0 = lc->Domain().Min();
+                ON_3dPoint P0 = lc->m_line.from;
+                // foot of P0 on the axis
+                double t = ON_DotProduct(P0 - rev->m_axis.from, axdir);
+                ON_3dPoint foot = rev->m_axis.from + t * axdir;
+                ON_3dVector xvec = P0 - foot;
+                double R = xvec.Length();
+                if (R > 1e-14 && xvec.Unitize()) {
+                    // OCCT Loc is the point on the axis at v=0
+                    ON_3dPoint Loc3 = foot - v0 * axdir;
+                    gp_Pnt loc(Loc3.x, Loc3.y, Loc3.z);
+                    gp_Dir zdir(axdir.x, axdir.y, axdir.z);
+                    gp_Dir xdir(xvec.x, xvec.y, xvec.z);
+                    return new Geom_CylindricalSurface(gp_Ax3(loc, zdir, xdir), R);
+                }
+            } else if (ac) {
+                // Sphere: profile arc lies in the plane spanned by XDir and ZDir
+                // (the revolution axis direction).  Detection: arc.zaxis ⊥ axdir.
+                // ON_ArcCurve::Evaluate maps domain [v1,v2] linearly to arc span
+                // [0, SetAngleRadians], so the arc orientation is rotated relative
+                // to OCCT's native latitude parameterisation by the start latitude
+                // v1 = ac->Domain().Min().  Recovery: OCCT XDir = cos(v1)*arc.xaxis
+                // - sin(v1)*arc.yaxis (inverse rotation by v1).
+                double R = ac->m_arc.radius;
+                if (R > 1e-14) {
+                    const ON_Plane& ap = ac->m_arc.plane;
+                    // Check that the arc plane contains the revolution axis
+                    // (i.e. arc.zaxis ⊥ axdir).
+                    double cross = fabs(ON_DotProduct(ap.zaxis, axdir));
+                    if (cross < 1e-6) {
+                        double v1 = ac->Domain().Min();
+                        ON_3dPoint cen = rev->m_axis.from;
+                        // Recover OCCT XDir by rotating arc.xaxis back by -v1
+                        ON_3dVector xvec = cos(v1)*ap.xaxis - sin(v1)*ap.yaxis;
+                        if (xvec.Unitize()) {
+                            gp_Pnt loc(cen.x, cen.y, cen.z);
+                            gp_Dir zdir(axdir.x, axdir.y, axdir.z);
+                            gp_Dir xdir(xvec.x, xvec.y, xvec.z);
+                            return new Geom_SphericalSurface(gp_Ax3(loc, zdir, xdir), R);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: convert to NURBS
     const ON_NurbsSurface* ns = ON_NurbsSurface::Cast(srf);
     if (ns)
         return ON_NurbsSurfaceToOCCT(*ns);
 
     ON_NurbsSurface tmp;
     if (!srf->GetNurbForm(tmp))
-        return Handle(Geom_BSplineSurface)();
+        return Handle(Geom_Surface)();
     return ON_NurbsSurfaceToOCCT(tmp);
 }
 
@@ -131,7 +203,7 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // ------------------------------------------------------------------
     std::vector<Handle(Geom_BSplineCurve)>   c3_map(brep.m_C3.Count());
     std::vector<Handle(Geom2d_BSplineCurve)> c2_map(brep.m_C2.Count());
-    std::vector<Handle(Geom_BSplineSurface)> s_map(brep.m_S.Count());
+    std::vector<Handle(Geom_Surface)>        s_map(brep.m_S.Count());
 
     for (int i = 0; i < brep.m_C3.Count(); ++i)
         c3_map[i] = CurveToOCCT(brep.m_C3[i]);
@@ -1009,6 +1081,75 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         Handle(Geom_Surface) gs = BRep_Tool::Surface(face);
         int si = -1;
         if (!gs.IsNull()) {
+            // ------------------------------------------------------------------
+            // Try analytical surface types first (cylinder, sphere, plane).
+            // Storing these as ON_RevSurface / ON_PlaneSurface lets ON_BrepToOCCT
+            // reconstruct exact OCCT analytical surfaces, so BRepGProp can use
+            // exact integration rather than Gaussian quadrature on a B-spline.
+            // ------------------------------------------------------------------
+            Standard_Address sk_try = face.TShape().get();
+            if (!surface_map.count(sk_try)) {
+                double u1, u2, v1, v2;
+                BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+                const double kTwoPi = 2.0 * ON_PI;
+                const double kPiOver2 = 0.5 * ON_PI;
+
+                Handle(Geom_SphericalSurface) sph =
+                    Handle(Geom_SphericalSurface)::DownCast(gs);
+
+                if (!sph.IsNull() &&
+                    u2 > u1 && (u2 - u1) <= kTwoPi + 1e-10 &&
+                    v2 > v1 &&
+                    v1 >= -kPiOver2 - 1e-10 &&
+                    v2 <=  kPiOver2 + 1e-10) {
+                    // Sphere: P(u,v) = Loc + R*(cos(v)*(cos(u)*X+sin(u)*Y)+sin(v)*Z)
+                    // Profile arc at u=0: P(0,v) = Loc + R*(cos(v)*X + sin(v)*Z)
+                    //
+                    // ON_ArcCurve::Evaluate maps domain [v1,v2] LINEARLY to arc span
+                    // [0, SetAngleRadians].  At parameter t, arc angle θ(t) =
+                    // SetAngleRadians*(t-v1)/(v2-v1).  For the evaluation to equal
+                    // Loc+R*(cos(t)*Xax+sin(t)*Zax) we need SetAngleRadians=v2-v1 and
+                    // the arc to be rotated so that:
+                    //   arc.xaxis = cos(v1)*Xax + sin(v1)*Zax  (direction at t=v1)
+                    //   arc.yaxis = -sin(v1)*Xax + cos(v1)*Zax
+                    //   arc.zaxis = Xax × Zax (⊥ to revolution axis — the key
+                    //               sphere-detection criterion in SurfaceToOCCT)
+                    const gp_Ax3& pos = sph->Position();
+                    double R = sph->Radius();
+                    gp_Pnt loc = pos.Location();
+                    gp_Dir zd  = pos.Direction();
+                    gp_Dir xd  = pos.XDirection();
+                    ON_3dPoint  Loc(loc.X(), loc.Y(), loc.Z());
+                    ON_3dVector Zax(zd.X(), zd.Y(), zd.Z());
+                    ON_3dVector Xax(xd.X(), xd.Y(), xd.Z());
+                    // Arc orientation rotated by start-latitude v1 so that the
+                    // ON_ArcCurve linear normalization maps t=v to latitude v.
+                    ON_Plane arc_plane;
+                    arc_plane.origin = Loc;
+                    arc_plane.xaxis  =  cos(v1)*Xax + sin(v1)*Zax;
+                    arc_plane.yaxis  = -sin(v1)*Xax + cos(v1)*Zax;
+                    arc_plane.zaxis  = ON_3dVector::CrossProduct(arc_plane.xaxis, arc_plane.yaxis);
+                    arc_plane.UpdateEquation();
+                    // SetAngleRadians = v2-v1 so arc spans exactly one latitude step
+                    ON_Arc arc(arc_plane, R, v2 - v1);
+                    ON_ArcCurve* ac = new ON_ArcCurve(arc, v1, v2);
+                    ON_RevSurface* rev = new ON_RevSurface();
+                    rev->m_curve = ac;
+                    rev->m_axis.from = Loc;
+                    rev->m_axis.to   = Loc + Zax;
+                    rev->m_angle.Set(u1, u2);
+                    rev->m_t = rev->m_angle;
+                    rev->m_bTransposed = false;
+                    rev->BoundingBox();
+                    if (rev->IsValid()) {
+                        si = brep.AddSurface(rev);
+                    } else {
+                        delete rev;
+                    }
+                }
+            }
+
             Handle(Geom_BSplineSurface) bs =
                 Handle(Geom_BSplineSurface)::DownCast(gs);
             // For periodic BSpline surfaces OR non-BSpline analytical surfaces
@@ -1025,8 +1166,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // surface area.  Fix: when the face spans ≥99% of the period in
             // U or V, trim only in the OTHER direction and then remove the
             // residual periodicity with SetU/VNotPeriodic().
-            bool need_trimmed = bs.IsNull() ||
-                                bs->IsUPeriodic() || bs->IsVPeriodic();
+            bool need_trimmed = si < 0 && (bs.IsNull() ||
+                                bs->IsUPeriodic() || bs->IsVPeriodic());
             if (need_trimmed) {
                 Handle(Geom_BSplineSurface) bs_orig = bs; // save in case convert fails
                 try {
@@ -1139,7 +1280,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     bs = bs_orig;
                 }
             }
-            if (!bs.IsNull()) {
+            if (si < 0 && !bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
                 // surfaces that GeomConvert still left periodic).
                 // BSplCLib::Unperiodize computes scale = 1/(knot_last - knot_first).
