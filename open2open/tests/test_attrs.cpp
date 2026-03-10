@@ -147,8 +147,6 @@ static ONX_Model* BuildTestModel()
 
     model->AddManagedModelGeometryComponent(sphBrep, sphAttrs);
 
-    (void)redLayerIdx;
-    (void)blueLayerIdx;
     return model;
 }
 
