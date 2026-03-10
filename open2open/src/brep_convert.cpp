@@ -31,12 +31,17 @@
 #include <Geom_BSplineSurface.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <Geom_RectangularTrimmedSurface.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <Geom_SphericalSurface.hxx>
+#include <Geom_SurfaceOfRevolution.hxx>
+#include <Geom_Plane.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <GeomConvert.hxx>
 #include <Geom2dConvert.hxx>
 #include <BRepTools.hxx>
 #include <BRepTools_WireExplorer.hxx>
+#include <gp_Ax3.hxx>
 #include <gp_Pnt.hxx>
 
 // ---- OCCT tools ----
@@ -97,20 +102,152 @@ Curve2dToOCCT(const ON_Curve* crv)
 }
 
 // ---------------------------------------------------------------------------
-// Helper: convert any ON_Surface to a Geom_Surface (NURBS fallback)
+// Helper: convert any ON_Surface to a Geom_Surface.
+// Preserves analytical types (cylinder, sphere, plane) when possible so that
+// BRepGProp can use exact integration on the reconstructed shape.
 // ---------------------------------------------------------------------------
-static Handle(Geom_BSplineSurface)
+static Handle(Geom_Surface)
 SurfaceToOCCT(const ON_Surface* srf)
 {
-    if (!srf) return Handle(Geom_BSplineSurface)();
+    if (!srf) return Handle(Geom_Surface)();
 
+    // --- ON_PlaneSurface → Geom_Plane ---
+    const ON_PlaneSurface* ps = ON_PlaneSurface::Cast(srf);
+    if (ps) {
+        const ON_Plane& pl = ps->m_plane;
+        gp_Pnt loc(pl.origin.x, pl.origin.y, pl.origin.z);
+        gp_Dir zdir(pl.zaxis.x, pl.zaxis.y, pl.zaxis.z);
+        gp_Dir xdir(pl.xaxis.x, pl.xaxis.y, pl.xaxis.z);
+        return new Geom_Plane(gp_Ax3(loc, zdir, xdir));
+    }
+
+    // --- ON_RevSurface → Geom_CylindricalSurface or Geom_SphericalSurface ---
+    const ON_RevSurface* rev = ON_RevSurface::Cast(srf);
+    if (rev && rev->m_curve && !rev->m_bTransposed) {
+        // Axis of revolution
+        ON_3dVector axdir = rev->m_axis.to - rev->m_axis.from;
+        if (axdir.Unitize()) {
+            const ON_LineCurve* lc = ON_LineCurve::Cast(rev->m_curve);
+            const ON_ArcCurve*  ac = ON_ArcCurve::Cast(rev->m_curve);
+
+            if (lc) {
+                // Cylinder: profile is a line at angle u=0
+                // P(u,v) = axis_foot + v*ZDir + R*(cos(u)*XDir + sin(u)*YDir)
+                // Recover XDir and Radius from the line start point.
+                double v0 = lc->Domain().Min();
+                ON_3dPoint P0 = lc->m_line.from;
+                // foot of P0 on the axis
+                double t = ON_DotProduct(P0 - rev->m_axis.from, axdir);
+                ON_3dPoint foot = rev->m_axis.from + t * axdir;
+                ON_3dVector xvec = P0 - foot;
+                double R = xvec.Length();
+                if (R > 1e-14 && xvec.Unitize()) {
+                    // OCCT Loc is the point on the axis at v=0
+                    ON_3dPoint Loc3 = foot - v0 * axdir;
+                    gp_Pnt loc(Loc3.x, Loc3.y, Loc3.z);
+                    gp_Dir zdir(axdir.x, axdir.y, axdir.z);
+                    gp_Dir xdir(xvec.x, xvec.y, xvec.z);
+                    return new Geom_CylindricalSurface(gp_Ax3(loc, zdir, xdir), R);
+                }
+            } else if (ac) {
+                // Sphere or Geom_SurfaceOfRevolution with arc profile.
+                // Sphere: profile arc lies in the plane spanned by XDir and ZDir
+                // (the revolution axis direction).  Detection: arc.zaxis ⊥ axdir.
+                // ON_ArcCurve::Evaluate maps domain [v1,v2] linearly to arc span
+                // [0, SetAngleRadians], so the arc orientation is rotated relative
+                // to OCCT's native latitude parameterisation by the start latitude
+                // v1 = ac->Domain().Min().  Recovery: OCCT XDir = cos(v1)*arc.xaxis
+                // - sin(v1)*arc.yaxis (inverse rotation by v1).
+                //
+                // Arc-length-parameterized spheres (ON_BrepSphere sets
+                // m_arc.AngleRadians()=π but domain [-r·π/2, +r·π/2]) must fall
+                // back to NURBS: the arc angle span (radians) must equal the domain
+                // span for the linear mapping to work as angle parameterisation.
+                double R = ac->m_arc.radius;
+                double domain_span = ac->Domain().Max() - ac->Domain().Min();
+                bool angle_param =
+                    fabs(ac->m_arc.AngleRadians() - domain_span) < 1e-4 * (1.0 + domain_span);
+                // Only promote to Geom_SphericalSurface when the revolution
+                // spans the full circle (m_angle range ≈ 2π).  Partial-
+                // revolution faces placed on a full Geom_SphericalSurface
+                // cause OCCT's BRepTools::UVBounds to include U=0 even when
+                // the face never touches the seam, corrupting the pcurve UV
+                // range during OCCTToON_Brep and introducing spurious UV gaps.
+                double uspan = fabs(rev->m_angle[1] - rev->m_angle[0]);
+                bool full_rev =
+                    fabs(uspan - 2.0 * ON_PI) < 1e-4 * (1.0 + uspan);
+                if (R > 1e-14 && angle_param && full_rev) {
+                    const ON_Plane& ap = ac->m_arc.plane;
+                    // Check that the arc plane contains the revolution axis
+                    // (i.e. arc.zaxis ⊥ axdir).
+                    double cross = fabs(ON_DotProduct(ap.zaxis, axdir));
+                    if (cross < 1e-6) {
+                        double v1 = ac->Domain().Min();
+                        ON_3dPoint cen = rev->m_axis.from;
+                        // Recover OCCT XDir by rotating arc.xaxis back by -v1
+                        ON_3dVector xvec = cos(v1)*ap.xaxis - sin(v1)*ap.yaxis;
+                        if (xvec.Unitize()) {
+                            gp_Pnt loc(cen.x, cen.y, cen.z);
+                            gp_Dir zdir(axdir.x, axdir.y, axdir.z);
+                            gp_Dir xdir(xvec.x, xvec.y, xvec.z);
+                            return new Geom_SphericalSurface(gp_Ax3(loc, zdir, xdir), R);
+                        }
+                    }
+                }
+            }
+
+            // --- Geom_SurfaceOfRevolution fallback ---
+            // For any ON_RevSurface whose profile was not handled as a
+            // Geom_CylindricalSurface or Geom_SphericalSurface above, use
+            // Geom_SurfaceOfRevolution with the NURBS form of the profile
+            // as the meridian.  This preserves the revolution structure
+            // analytically (for BRepGProp exact integration and for
+            // round-trip detection in OCCTToON_Brep).
+            //
+            // Precondition 1: m_t == m_angle (the UV parameter IS the angle
+            // in radians) so the pcurves in [m_angle[0], m_angle[1]] map
+            // directly to the periodic U of Geom_SurfaceOfRevolution.
+            // When m_t != m_angle we fall through to the NURBS fallback to
+            // avoid parameter mismatches.
+            //
+            // Precondition 2: profile is NOT an ON_LineCurve.  A line
+            // profile creates a cone which OCCT's GeomConvert approximates
+            // (non-rational) when converting Geom_SurfaceOfRevolution to
+            // BSpline; the resulting error exceeds the round-trip tolerance.
+            // Cones whose apex is off-axis (R > 0) are already handled as
+            // Geom_CylindricalSurface; apex-on-axis cones fall through to
+            // the NURBS path which gives an exact representation.
+            const double tSpan   = rev->m_t[1]     - rev->m_t[0];
+            const double angSpan = rev->m_angle[1] - rev->m_angle[0];
+            const bool   t_is_angle =
+                (fabs(rev->m_t[0] - rev->m_angle[0]) < 1e-8 &&
+                 fabs(rev->m_t[1] - rev->m_angle[1]) < 1e-8) ||
+                (tSpan > 1e-14 &&
+                 fabs(angSpan / tSpan - 1.0) < 1e-6 &&
+                 fabs(rev->m_t[0] - rev->m_angle[0]) < 1e-8);
+            const bool profile_is_line = (ON_LineCurve::Cast(rev->m_curve) != nullptr);
+            if (t_is_angle && !profile_is_line) {
+                Handle(Geom_BSplineCurve) meridian = CurveToOCCT(rev->m_curve);
+                if (!meridian.IsNull()) {
+                    gp_Ax1 ax1(
+                        gp_Pnt(rev->m_axis.from.x,
+                               rev->m_axis.from.y,
+                               rev->m_axis.from.z),
+                        gp_Dir(axdir.x, axdir.y, axdir.z));
+                    return new Geom_SurfaceOfRevolution(meridian, ax1);
+                }
+            }
+        }
+    }
+
+    // Fallback: convert to NURBS
     const ON_NurbsSurface* ns = ON_NurbsSurface::Cast(srf);
     if (ns)
         return ON_NurbsSurfaceToOCCT(*ns);
 
     ON_NurbsSurface tmp;
     if (!srf->GetNurbForm(tmp))
-        return Handle(Geom_BSplineSurface)();
+        return Handle(Geom_Surface)();
     return ON_NurbsSurfaceToOCCT(tmp);
 }
 
@@ -127,7 +264,7 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // ------------------------------------------------------------------
     std::vector<Handle(Geom_BSplineCurve)>   c3_map(brep.m_C3.Count());
     std::vector<Handle(Geom2d_BSplineCurve)> c2_map(brep.m_C2.Count());
-    std::vector<Handle(Geom_BSplineSurface)> s_map(brep.m_S.Count());
+    std::vector<Handle(Geom_Surface)>        s_map(brep.m_S.Count());
 
     for (int i = 0; i < brep.m_C3.Count(); ++i)
         c3_map[i] = CurveToOCCT(brep.m_C3[i]);
@@ -220,6 +357,98 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
     // ------------------------------------------------------------------
     // Step 4 — create faces, attach pcurves, build wires
     // ------------------------------------------------------------------
+
+    // Pre-scan: find "cross-face seam" edges — edges shared by two trims
+    // on different faces that use the *same* surface (same m_si).  OCCT
+    // stores pcurves per (edge, surface), so calling the single-pcurve
+    // UpdateEdge(edge, pc, face, tol) twice for the same edge/surface pair
+    // causes the second call to overwrite the first.  Such edges must be
+    // handled with the two-pcurve UpdateEdge(edge, C1, C2, face, tol)
+    // after all faces are built, analogous to same-face seam trims.
+    struct CrossFaceSeam {
+        int fi_fwd = -1, fi_rev = -1;  // face where edge is FORWARD / REVERSED
+        int c2i_fwd = -1, c2i_rev = -1;
+        double t0 = 0, t1 = 0, tol = 0;
+    };
+    std::map<int, CrossFaceSeam> cross_face_seam_map; // edge idx → seam info
+
+    for (int ei = 0; ei < brep.m_E.Count(); ++ei) {
+        const ON_BrepEdge& e = brep.m_E[ei];
+        if (e.m_ti.Count() < 2) continue;
+        // Collect (face, si, trim, rev3d) for each trim on this edge
+        struct TInfo { int fi, si, ti; bool rev3d; };
+        std::vector<TInfo> tv;
+        for (int k = 0; k < e.m_ti.Count(); ++k) {
+            int ti = e.m_ti[k];
+            if (ti < 0 || ti >= brep.m_T.Count()) continue;
+            const ON_BrepTrim& tr = brep.m_T[ti];
+            if (tr.m_type == ON_BrepTrim::seam) continue; // handled by seam_map
+            if (tr.m_li < 0 || tr.m_li >= brep.m_L.Count()) continue;
+            int fi = brep.m_L[tr.m_li].m_fi;
+            if (fi < 0 || fi >= brep.m_F.Count()) continue;
+            int si = brep.m_F[fi].m_si;
+            if (si < 0 || si >= (int)s_map.size() || s_map[si].IsNull()) continue;
+            tv.push_back({fi, si, ti, (bool)tr.m_bRev3d});
+        }
+        // Find a pair with same si but different fi that is a genuine
+        // cross-face seam (two pcurves at different UV positions on the
+        // shared surface), not a regular mated edge (two faces sharing
+        // an edge where both pcurves are reverses of each other).
+        //
+        // Guard: skip when trim a's start≈trim b's end AND a's end≈b's
+        // start — that pattern means both trims are the same curve in
+        // opposite orientations (regular mated edge).  Only fire when the
+        // two pcurves occupy genuinely different UV positions (e.g. one at
+        // the U=0 seam and the other at U=u_max on the same surface).
+        for (int a = 0; a < (int)tv.size() && !cross_face_seam_map.count(ei); ++a) {
+            for (int b = a+1; b < (int)tv.size(); ++b) {
+                if (tv[a].fi == tv[b].fi) continue;
+                if (tv[a].si != tv[b].si) continue;
+                const ON_BrepTrim& ta = brep.m_T[tv[a].ti];
+                const ON_BrepTrim& tb = brep.m_T[tv[b].ti];
+                // Check if the two trims are simple reverses of each other
+                // by comparing their 2D start/end UV points.
+                ON_3dPoint ta_s = ta.PointAtStart();
+                ON_3dPoint ta_e = ta.PointAtEnd();
+                ON_3dPoint tb_s = tb.PointAtStart();
+                ON_3dPoint tb_e = tb.PointAtEnd();
+                // "Reverse match" tolerance: 1% of the surface domain.
+                const ON_Surface* srf =
+                    (tv[a].si >= 0 && tv[a].si < brep.m_S.Count())
+                        ? brep.m_S[tv[a].si] : nullptr;
+                double rtol = 1e-4;
+                if (srf) {
+                    double u0s,u1s,v0s,v1s;
+                    srf->GetDomain(0,&u0s,&u1s);
+                    srf->GetDomain(1,&v0s,&v1s);
+                    double uspan = u1s - u0s, vspan = v1s - v0s;
+                    if (uspan > 0 && vspan > 0)
+                        rtol = 0.01 * std::min(uspan, vspan);
+                }
+                bool is_reverse = (ta_s.DistanceTo(tb_e) < rtol &&
+                                   ta_e.DistanceTo(tb_s) < rtol);
+                if (is_reverse) continue; // regular mated edge, skip
+
+                // Same surface, different faces, genuinely different UV:
+                // this is a cross-face seam edge.
+                CrossFaceSeam& cfs = cross_face_seam_map[ei];
+                // Assign fwd/rev based on m_bRev3d
+                if (!tv[a].rev3d) {
+                    cfs.fi_fwd = tv[a].fi; cfs.c2i_fwd = ta.m_c2i;
+                    cfs.fi_rev = tv[b].fi; cfs.c2i_rev = tb.m_c2i;
+                } else {
+                    cfs.fi_fwd = tv[b].fi; cfs.c2i_fwd = tb.m_c2i;
+                    cfs.fi_rev = tv[a].fi; cfs.c2i_rev = ta.m_c2i;
+                }
+                cfs.t0 = ta.Domain().Min();
+                cfs.t1 = ta.Domain().Max();
+                cfs.tol = ta.m_tolerance[0] > 0.0
+                               ? ta.m_tolerance[0] : linear_tolerance;
+                break;
+            }
+        }
+    }
+
     std::vector<TopoDS_Face> f_map(brep.m_F.Count());
 
     for (int fi = 0; fi < brep.m_F.Count(); ++fi) {
@@ -450,14 +679,84 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     Handle(Geom2d_Curve) pc = c2_map[trim.m_c2i];
                     if (trim.m_bRev3d)
                         pc = pc->Reversed();
-                    B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
                     double pd_min = trim.Domain().Min();
                     double pd_max = trim.Domain().Max();
-                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
-                    // Clear SameRange when domains differ.
-                    // SameParameter is handled globally after the shape is built.
                     const double kRangeTol = 1e-10;
                     const auto& ed = e3d_domain[ei];
+                    // Remap pcurve knots to the 3D edge domain when they
+                    // differ.  SameRange=false causes BRepLib::SameParameter
+                    // to reparameterize the pcurve, which can produce a
+                    // high-degree B-spline with control points outside the
+                    // UV domain (corrupting BRepTools::UVBounds).  By
+                    // remapping the knots linearly to [ed.first, ed.second]
+                    // we restore SameRange=true without changing geometry.
+                    //
+                    // Case A — same start, scale mismatch:
+                    //   pd_min ≈ ed.first, pd_max ≠ ed.second
+                    //
+                    // Case B — negation pattern (reversed arc-length proxy):
+                    //   After Reversed(), knots run [−L, 0] while ed=[0,L].
+                    //   A pure shift (+L) maps [−L,0]→[0,L] without altering
+                    //   the UV poles.  The edge is also reversed in the wire,
+                    //   so OCCT reads the pcurve backwards—geometrically
+                    //   correct.  This eliminates SameRange=false and prevents
+                    //   BRepLib::SameParameter from producing a pathological
+                    //   high-degree B-spline on complex surfaces (e.g. the
+                    //   spoke faces of v4_Wheel_PG.3dm).
+                    const bool negation_case =
+                        (std::fabs(pd_min + ed.second) <
+                             kRangeTol + 1e-9 * std::fabs(ed.second)) &&
+                        (std::fabs(pd_max + ed.first)  <
+                             kRangeTol + 1e-9 * std::fabs(ed.first))  &&
+                        (ed.second - ed.first > 1e-14) &&
+                        (pd_max - pd_min > 1e-14);
+                    if ((std::fabs(pd_min - ed.first) < kRangeTol &&
+                         std::fabs(pd_max - ed.second) > kRangeTol) ||
+                        negation_case) {
+                        double old_span = pd_max - pd_min;
+                        double new_span = ed.second - ed.first;
+                        Handle(Geom2d_BSplineCurve) bs =
+                            Handle(Geom2d_BSplineCurve)::DownCast(pc);
+                        if (!bs.IsNull() &&
+                            old_span > 1e-15 && new_span > 1e-15) {
+                            const int nk = bs->NbKnots();
+                            TColStd_Array1OfReal    nk_vals(1, nk);
+                            TColStd_Array1OfInteger nk_mults(1, nk);
+                            const double scale = new_span / old_span;
+                            for (int k = 1; k <= nk; ++k) {
+                                nk_vals.SetValue(k, ed.first +
+                                    (bs->Knot(k) - pd_min) * scale);
+                                nk_mults.SetValue(k, bs->Multiplicity(k));
+                            }
+                            const int np = bs->NbPoles();
+                            TColgp_Array1OfPnt2d poles(1, np);
+                            TColStd_Array1OfReal  weights(1, np);
+                            const bool rat = bs->IsRational();
+                            for (int p = 1; p <= np; ++p) {
+                                poles.SetValue(p, bs->Pole(p));
+                                weights.SetValue(p, rat ? bs->Weight(p)
+                                                        : 1.0);
+                            }
+                            try {
+                                Handle(Geom2d_BSplineCurve) remap;
+                                if (rat)
+                                    remap = new Geom2d_BSplineCurve(
+                                        poles, weights, nk_vals, nk_mults,
+                                        bs->Degree());
+                                else
+                                    remap = new Geom2d_BSplineCurve(
+                                        poles, nk_vals, nk_mults,
+                                        bs->Degree());
+                                pc     = remap;
+                                pd_min = ed.first;
+                                pd_max = ed.second;
+                            } catch (...) {}
+                        }
+                    }
+                    B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
+                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
+                    // Clear SameRange when domains still differ after remap.
+                    // SameParameter is handled globally after the shape is built.
                     if (std::fabs(pd_min - ed.first)  > kRangeTol ||
                         std::fabs(pd_max - ed.second) > kRangeTol) {
                         B.SameRange(e_map[ei], Standard_False);
@@ -474,6 +773,90 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             }
 
             B.Add(f_map[fi], wire);
+        }
+    }
+
+    // Post-process: apply two-pcurve UpdateEdge for cross-face seam edges.
+    // The single-pcurve UpdateEdge calls in the face loop above overwrote
+    // each other for these edges (both faces share the same OCCT surface
+    // handle).  Replacing them with the two-pcurve form lets
+    // BRep_Tool::CurveOnSurface correctly distinguish between C1 (edge
+    // traversed FORWARD) and C2 (edge traversed REVERSED).
+    for (auto& kv : cross_face_seam_map) {
+        int ei = kv.first;
+        const CrossFaceSeam& cfs = kv.second;
+        if (ei >= (int)e_map.size()) continue;
+        if (cfs.fi_fwd < 0 || cfs.fi_fwd >= (int)f_map.size()) continue;
+        if (cfs.c2i_fwd < 0 || cfs.c2i_fwd >= (int)c2_map.size()) continue;
+        if (cfs.c2i_rev < 0 || cfs.c2i_rev >= (int)c2_map.size()) continue;
+        if (c2_map[cfs.c2i_fwd].IsNull() || c2_map[cfs.c2i_rev].IsNull()) continue;
+
+        Handle(Geom2d_Curve) c_fwd = c2_map[cfs.c2i_fwd];  // edge-forward dir
+        Handle(Geom2d_Curve) c_rev_efwd = c2_map[cfs.c2i_rev]->Reversed();
+
+        // Remap reversed pcurve domain to [t0,t1] if Reversed() flipped it
+        Handle(Geom2d_BSplineCurve) brev =
+            Handle(Geom2d_BSplineCurve)::DownCast(c_rev_efwd);
+        if (!brev.IsNull() && brev->NbKnots() >= 2) {
+            double old0 = brev->FirstParameter();
+            double old1 = brev->LastParameter();
+            double span = old1 - old0;
+            if (std::abs(span) > 1e-12 &&
+                (std::abs(old0 - cfs.t0) > 1e-10 ||
+                 std::abs(old1 - cfs.t1) > 1e-10)) {
+                const int nk = brev->NbKnots();
+                double scale = (cfs.t1 - cfs.t0) / span;
+                TColStd_Array1OfReal    new_knots(1, nk);
+                TColStd_Array1OfInteger new_mults(1, nk);
+                for (int k = 1; k <= nk; ++k) {
+                    new_knots.SetValue(k, cfs.t0 +
+                                          (brev->Knot(k) - old0) * scale);
+                    new_mults.SetValue(k, brev->Multiplicity(k));
+                }
+                const int np = brev->NbPoles();
+                TColgp_Array1OfPnt2d poles(1, np);
+                TColStd_Array1OfReal  weights(1, np);
+                bool rat = brev->IsRational();
+                for (int p = 1; p <= np; ++p) {
+                    poles.SetValue(p, brev->Pole(p));
+                    weights.SetValue(p, rat ? brev->Weight(p) : 1.0);
+                }
+                try {
+                    Handle(Geom2d_BSplineCurve) remap;
+                    if (rat)
+                        remap = new Geom2d_BSplineCurve(poles, weights,
+                                    new_knots, new_mults, brev->Degree());
+                    else
+                        remap = new Geom2d_BSplineCurve(poles,
+                                    new_knots, new_mults, brev->Degree());
+                    c_rev_efwd = remap;
+                } catch (...) {}
+            }
+        }
+
+        // Use the forward-trim's face as the reference face for UpdateEdge.
+        // For a non-reversed face (m_bRev=0): C1→PCurve (FORWARD edge),
+        // C2→PCurve2 (REVERSED edge).  The reversed-trim face (fi_rev)
+        // traverses the edge in REVERSED orientation, so it receives PCurve2.
+        const ON_BrepFace& fwd_face = brep.m_F[cfs.fi_fwd];
+        Handle(Geom2d_Curve) C1, C2;
+        if (fwd_face.m_bRev) {
+            C1 = c_rev_efwd;
+            C2 = c_fwd;
+        } else {
+            C1 = c_fwd;
+            C2 = c_rev_efwd;
+        }
+        B.UpdateEdge(e_map[ei], C1, C2, f_map[cfs.fi_fwd], cfs.tol);
+        B.Range(e_map[ei], f_map[cfs.fi_fwd], cfs.t0, cfs.t1);
+        {
+            const double kRangeTol = 1e-10;
+            const auto& ed = e3d_domain[ei];
+            if (std::fabs(cfs.t0 - ed.first)  > kRangeTol ||
+                std::fabs(cfs.t1 - ed.second) > kRangeTol) {
+                B.SameRange(e_map[ei], Standard_False);
+                B.SameParameter(e_map[ei], Standard_False);
+            }
         }
     }
 
@@ -1005,6 +1388,150 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
         Handle(Geom_Surface) gs = BRep_Tool::Surface(face);
         int si = -1;
         if (!gs.IsNull()) {
+            // ------------------------------------------------------------------
+            // Try analytical surface types first (cylinder, sphere, plane).
+            // Storing these as ON_RevSurface / ON_PlaneSurface lets ON_BrepToOCCT
+            // reconstruct exact OCCT analytical surfaces, so BRepGProp can use
+            // exact integration rather than Gaussian quadrature on a B-spline.
+            // ------------------------------------------------------------------
+            Standard_Address sk_try = face.TShape().get();
+            if (!surface_map.count(sk_try)) {
+                double u1, u2, v1, v2;
+                BRepTools::UVBounds(face, u1, u2, v1, v2);
+
+                const double kTwoPi = 2.0 * ON_PI;
+                const double kPiOver2 = 0.5 * ON_PI;
+
+                Handle(Geom_SphericalSurface) sph =
+                    Handle(Geom_SphericalSurface)::DownCast(gs);
+
+                // kPoleTol: latitude tolerance for "face touches a pole".
+                // ON_ArcCurve::Evaluate maps [v1,v2] linearly to the arc angle
+                // range, so for partial-sphere faces (v1 ≫ -π/2 or v2 ≪ π/2)
+                // the arc construction is still geometrically correct but OCCT's
+                // BRepCheck_Analyzer may reject the reconstructed face (seam
+                // consistency) or BRepGProp may compute a wrong volume (pcurve
+                // approximation error compounded by the exact sphere surface).
+                // The analytical path is therefore restricted to faces that cover
+                // both poles (full or near-full sphere in V), where the canonical
+                // arc construction with v1≈-π/2 gives reliable results.
+                // Partial spheres (one pole missing, equatorial strip, etc.) fall
+                // back to the NURBS path which handled them correctly before.
+                //
+                // kPoleTol is also the rounding guard for the UVBounds check:
+                // B-spline pcurve domains may report v2 slightly above π/2 or
+                // v1 slightly below -π/2 due to floating-point arithmetic in
+                // Geom2dConvert.  Using kPoleTol as the outer guard (instead of
+                // 1e-10) ensures these numerically-noisy cases still fire the
+                // analytical path.
+                static const double kPoleTol = 0.02; // ≈ 1.1° latitude
+                if (!sph.IsNull() &&
+                    u2 > u1 && (u2 - u1) <= kTwoPi + 1e-10 &&
+                    v2 > v1 &&
+                    v1 >= -kPiOver2 - kPoleTol &&   // v1 within kPoleTol of south pole
+                    v2 <=  kPiOver2 + kPoleTol &&   // v2 within kPoleTol of north pole
+                    v1 <= -kPiOver2 + kPoleTol &&   // face includes south pole
+                    v2 >=  kPiOver2 - kPoleTol) {   // face includes north pole
+                    // Full-sphere (both-pole) face: ON_RevSurface with ON_ArcCurve
+                    // profile gives exact geometry and BRepGProp uses analytical
+                    // sphere integration.
+                    //
+                    // ON_ArcCurve::Evaluate maps domain [v1,v2] LINEARLY to arc span
+                    // [0, SetAngleRadians].  At parameter t, arc angle θ(t) =
+                    // SetAngleRadians*(t-v1)/(v2-v1).  For the evaluation to equal
+                    // Loc+R*(cos(t)*Xax+sin(t)*Zax) we need SetAngleRadians=v2-v1 and
+                    // the arc to be rotated so that:
+                    //   arc.xaxis = cos(v1)*Xax + sin(v1)*Zax  (direction at t=v1)
+                    //   arc.yaxis = -sin(v1)*Xax + cos(v1)*Zax
+                    //   arc.zaxis = Xax × Zax (⊥ to revolution axis — the key
+                    //               sphere-detection criterion in SurfaceToOCCT)
+                    const gp_Ax3& pos = sph->Position();
+                    double R = sph->Radius();
+                    gp_Pnt loc = pos.Location();
+                    gp_Dir zd  = pos.Direction();
+                    gp_Dir xd  = pos.XDirection();
+                    ON_3dPoint  Loc(loc.X(), loc.Y(), loc.Z());
+                    ON_3dVector Zax(zd.X(), zd.Y(), zd.Z());
+                    ON_3dVector Xax(xd.X(), xd.Y(), xd.Z());
+                    // Arc orientation rotated by start-latitude v1 so that the
+                    // ON_ArcCurve linear normalization maps t=v to latitude v.
+                    ON_Plane arc_plane;
+                    arc_plane.origin = Loc;
+                    arc_plane.xaxis  =  cos(v1)*Xax + sin(v1)*Zax;
+                    arc_plane.yaxis  = -sin(v1)*Xax + cos(v1)*Zax;
+                    arc_plane.zaxis  = ON_3dVector::CrossProduct(arc_plane.xaxis, arc_plane.yaxis);
+                    arc_plane.UpdateEquation();
+                    // SetAngleRadians = v2-v1 so arc spans exactly one latitude step
+                    ON_Arc arc(arc_plane, R, v2 - v1);
+                    ON_ArcCurve* ac = new ON_ArcCurve(arc, v1, v2);
+                    ON_RevSurface* rev = new ON_RevSurface();
+                    rev->m_curve = ac;
+                    rev->m_axis.from = Loc;
+                    rev->m_axis.to   = Loc + Zax;
+                    rev->m_angle.Set(u1, u2);
+                    rev->m_t = rev->m_angle;
+                    rev->m_bTransposed = false;
+                    rev->BoundingBox();
+                    if (rev->IsValid()) {
+                        si = brep.AddSurface(rev);
+                    } else {
+                        delete rev;
+                    }
+                }
+            // (closes if(!surface_map.count(sk_try)) after Geom_SurfaceOfRevolution)
+
+                // --- Geom_SurfaceOfRevolution → ON_RevSurface ---
+                // Surfaces stored analytically as Geom_SurfaceOfRevolution
+                // (e.g. produced by SurfaceToOCCT for torus, NurbsCurve-
+                // profile, or partial-revolution arc-profile surfaces) are
+                // converted back to ON_RevSurface to preserve the analytic
+                // structure.  The meridian curve is recovered via NURBS
+                // conversion of BasisCurve(); m_angle is set to the face's
+                // UV U bounds; m_t = m_angle so the UV parameter is the
+                // angle in radians.
+                if (si < 0) {
+                    Handle(Geom_SurfaceOfRevolution) revSrf =
+                        Handle(Geom_SurfaceOfRevolution)::DownCast(gs);
+                    if (!revSrf.IsNull() && u2 > u1 &&
+                        (u2 - u1) <= kTwoPi + 1e-10) {
+                        gp_Ax1 ax  = revSrf->Axis();
+                        gp_Pnt loc = ax.Location();
+                        gp_Dir dir = ax.Direction();
+                        // Convert the meridian (basis curve) to ON_NurbsCurve.
+                        Handle(Geom_Curve) basisC = revSrf->BasisCurve();
+                        Handle(Geom_BSplineCurve) basisBS;
+                        try {
+                            basisBS = GeomConvert::CurveToBSplineCurve(basisC);
+                            if (!basisBS.IsNull() && basisBS->IsPeriodic())
+                                basisBS->SetNotPeriodic();
+                        } catch (...) {}
+                        if (!basisBS.IsNull()) {
+                            ON_NurbsCurve* nc = new ON_NurbsCurve();
+                            if (OCCTCurveToON(basisBS, *nc)) {
+                                ON_RevSurface* rev2 = new ON_RevSurface();
+                                rev2->m_curve = nc;
+                                rev2->m_axis.from =
+                                    ON_3dPoint(loc.X(), loc.Y(), loc.Z());
+                                ON_3dVector axd(dir.X(), dir.Y(), dir.Z());
+                                rev2->m_axis.to = rev2->m_axis.from + axd;
+                                rev2->m_angle.Set(u1, u2);
+                                rev2->m_t = rev2->m_angle;
+                                rev2->m_bTransposed = false;
+                                rev2->BoundingBox();
+                                if (rev2->IsValid()) {
+                                    si = brep.AddSurface(rev2);
+                                } else {
+                                    delete rev2;
+                                    delete nc;
+                                }
+                            } else {
+                                delete nc;
+                            }
+                        }
+                    }
+                }
+            } // closes if(!surface_map.count(sk_try))
+
             Handle(Geom_BSplineSurface) bs =
                 Handle(Geom_BSplineSurface)::DownCast(gs);
             // For periodic BSpline surfaces OR non-BSpline analytical surfaces
@@ -1021,8 +1548,8 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
             // surface area.  Fix: when the face spans ≥99% of the period in
             // U or V, trim only in the OTHER direction and then remove the
             // residual periodicity with SetU/VNotPeriodic().
-            bool need_trimmed = bs.IsNull() ||
-                                bs->IsUPeriodic() || bs->IsVPeriodic();
+            bool need_trimmed = si < 0 && (bs.IsNull() ||
+                                bs->IsUPeriodic() || bs->IsVPeriodic());
             if (need_trimmed) {
                 Handle(Geom_BSplineSurface) bs_orig = bs; // save in case convert fails
                 try {
@@ -1135,7 +1662,7 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                     bs = bs_orig;
                 }
             }
-            if (!bs.IsNull()) {
+            if (si < 0 && !bs.IsNull()) {
                 // Handle any residual periodicity (safety fallback for
                 // surfaces that GeomConvert still left periodic).
                 // BSplCLib::Unperiodize computes scale = 1/(knot_last - knot_first).
