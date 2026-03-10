@@ -346,15 +346,48 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
             if (si < 0 || si >= (int)s_map.size() || s_map[si].IsNull()) continue;
             tv.push_back({fi, si, ti, (bool)tr.m_bRev3d});
         }
-        // Find a pair with same si but different fi
+        // Find a pair with same si but different fi that is a genuine
+        // cross-face seam (two pcurves at different UV positions on the
+        // shared surface), not a regular mated edge (two faces sharing
+        // an edge where both pcurves are reverses of each other).
+        //
+        // Guard: skip when trim a's start≈trim b's end AND a's end≈b's
+        // start — that pattern means both trims are the same curve in
+        // opposite orientations (regular mated edge).  Only fire when the
+        // two pcurves occupy genuinely different UV positions (e.g. one at
+        // the U=0 seam and the other at U=u_max on the same surface).
         for (int a = 0; a < (int)tv.size() && !cross_face_seam_map.count(ei); ++a) {
             for (int b = a+1; b < (int)tv.size(); ++b) {
                 if (tv[a].fi == tv[b].fi) continue;
                 if (tv[a].si != tv[b].si) continue;
-                // Same surface, different faces: cross-face seam
-                CrossFaceSeam& cfs = cross_face_seam_map[ei];
                 const ON_BrepTrim& ta = brep.m_T[tv[a].ti];
                 const ON_BrepTrim& tb = brep.m_T[tv[b].ti];
+                // Check if the two trims are simple reverses of each other
+                // by comparing their 2D start/end UV points.
+                ON_3dPoint ta_s = ta.PointAtStart();
+                ON_3dPoint ta_e = ta.PointAtEnd();
+                ON_3dPoint tb_s = tb.PointAtStart();
+                ON_3dPoint tb_e = tb.PointAtEnd();
+                // "Reverse match" tolerance: 1% of the surface domain.
+                const ON_Surface* srf =
+                    (tv[a].si >= 0 && tv[a].si < brep.m_S.Count())
+                        ? brep.m_S[tv[a].si] : nullptr;
+                double rtol = 1e-4;
+                if (srf) {
+                    double u0s,u1s,v0s,v1s;
+                    srf->GetDomain(0,&u0s,&u1s);
+                    srf->GetDomain(1,&v0s,&v1s);
+                    double uspan = u1s - u0s, vspan = v1s - v0s;
+                    if (uspan > 0 && vspan > 0)
+                        rtol = 0.01 * std::min(uspan, vspan);
+                }
+                bool is_reverse = (ta_s.DistanceTo(tb_e) < rtol &&
+                                   ta_e.DistanceTo(tb_s) < rtol);
+                if (is_reverse) continue; // regular mated edge, skip
+
+                // Same surface, different faces, genuinely different UV:
+                // this is a cross-face seam edge.
+                CrossFaceSeam& cfs = cross_face_seam_map[ei];
                 // Assign fwd/rev based on m_bRev3d
                 if (!tv[a].rev3d) {
                     cfs.fi_fwd = tv[a].fi; cfs.c2i_fwd = ta.m_c2i;
