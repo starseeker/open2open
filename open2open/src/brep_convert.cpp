@@ -195,6 +195,48 @@ SurfaceToOCCT(const ON_Surface* srf)
                     }
                 }
             }
+
+            // --- Geom_SurfaceOfRevolution fallback ---
+            // For any ON_RevSurface whose profile was not handled as a
+            // Geom_CylindricalSurface or Geom_SphericalSurface above, use
+            // Geom_SurfaceOfRevolution with the NURBS form of the profile
+            // as the meridian.  This preserves the revolution structure
+            // analytically (for BRepGProp exact integration and for
+            // round-trip detection in OCCTToON_Brep).
+            //
+            // Precondition 1: m_t == m_angle (the UV parameter IS the angle
+            // in radians) so the pcurves in [m_angle[0], m_angle[1]] map
+            // directly to the periodic U of Geom_SurfaceOfRevolution.
+            // When m_t != m_angle we fall through to the NURBS fallback to
+            // avoid parameter mismatches.
+            //
+            // Precondition 2: profile is NOT an ON_LineCurve.  A line
+            // profile creates a cone which OCCT's GeomConvert approximates
+            // (non-rational) when converting Geom_SurfaceOfRevolution to
+            // BSpline; the resulting error exceeds the round-trip tolerance.
+            // Cones whose apex is off-axis (R > 0) are already handled as
+            // Geom_CylindricalSurface; apex-on-axis cones fall through to
+            // the NURBS path which gives an exact representation.
+            const double tSpan   = rev->m_t[1]     - rev->m_t[0];
+            const double angSpan = rev->m_angle[1] - rev->m_angle[0];
+            const bool   t_is_angle =
+                (fabs(rev->m_t[0] - rev->m_angle[0]) < 1e-8 &&
+                 fabs(rev->m_t[1] - rev->m_angle[1]) < 1e-8) ||
+                (tSpan > 1e-14 &&
+                 fabs(angSpan / tSpan - 1.0) < 1e-6 &&
+                 fabs(rev->m_t[0] - rev->m_angle[0]) < 1e-8);
+            const bool profile_is_line = (ON_LineCurve::Cast(rev->m_curve) != nullptr);
+            if (t_is_angle && !profile_is_line) {
+                Handle(Geom_BSplineCurve) meridian = CurveToOCCT(rev->m_curve);
+                if (!meridian.IsNull()) {
+                    gp_Ax1 ax1(
+                        gp_Pnt(rev->m_axis.from.x,
+                               rev->m_axis.from.y,
+                               rev->m_axis.from.z),
+                        gp_Dir(axdir.x, axdir.y, axdir.z));
+                    return new Geom_SurfaceOfRevolution(meridian, ax1);
+                }
+            }
         }
     }
 
@@ -637,14 +679,63 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     Handle(Geom2d_Curve) pc = c2_map[trim.m_c2i];
                     if (trim.m_bRev3d)
                         pc = pc->Reversed();
-                    B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
                     double pd_min = trim.Domain().Min();
                     double pd_max = trim.Domain().Max();
-                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
-                    // Clear SameRange when domains differ.
-                    // SameParameter is handled globally after the shape is built.
                     const double kRangeTol = 1e-10;
                     const auto& ed = e3d_domain[ei];
+                    // Remap pcurve knots to the 3D edge domain when they
+                    // differ.  SameRange=false causes BRepLib::SameParameter
+                    // to reparameterize the pcurve, which can produce a
+                    // high-degree B-spline with control points outside the
+                    // UV domain (corrupting BRepTools::UVBounds).  By
+                    // remapping the knots linearly to [ed.first, ed.second]
+                    // we restore SameRange=true without changing geometry.
+                    if (std::fabs(pd_min - ed.first)  > kRangeTol ||
+                        std::fabs(pd_max - ed.second) > kRangeTol) {
+                        double old_span = pd_max - pd_min;
+                        double new_span = ed.second - ed.first;
+                        Handle(Geom2d_BSplineCurve) bs =
+                            Handle(Geom2d_BSplineCurve)::DownCast(pc);
+                        if (!bs.IsNull() &&
+                            old_span > 1e-15 && new_span > 1e-15) {
+                            const int nk = bs->NbKnots();
+                            TColStd_Array1OfReal    nk_vals(1, nk);
+                            TColStd_Array1OfInteger nk_mults(1, nk);
+                            const double scale = new_span / old_span;
+                            for (int k = 1; k <= nk; ++k) {
+                                nk_vals.SetValue(k, ed.first +
+                                    (bs->Knot(k) - pd_min) * scale);
+                                nk_mults.SetValue(k, bs->Multiplicity(k));
+                            }
+                            const int np = bs->NbPoles();
+                            TColgp_Array1OfPnt2d poles(1, np);
+                            TColStd_Array1OfReal  weights(1, np);
+                            const bool rat = bs->IsRational();
+                            for (int p = 1; p <= np; ++p) {
+                                poles.SetValue(p, bs->Pole(p));
+                                weights.SetValue(p, rat ? bs->Weight(p)
+                                                        : 1.0);
+                            }
+                            try {
+                                Handle(Geom2d_BSplineCurve) remap;
+                                if (rat)
+                                    remap = new Geom2d_BSplineCurve(
+                                        poles, weights, nk_vals, nk_mults,
+                                        bs->Degree());
+                                else
+                                    remap = new Geom2d_BSplineCurve(
+                                        poles, nk_vals, nk_mults,
+                                        bs->Degree());
+                                pc     = remap;
+                                pd_min = ed.first;
+                                pd_max = ed.second;
+                            } catch (...) {}
+                        }
+                    }
+                    B.UpdateEdge(e_map[ei], pc, f_map[fi], tol2d);
+                    B.Range(e_map[ei], f_map[fi], pd_min, pd_max);
+                    // Clear SameRange when domains still differ after remap.
+                    // SameParameter is handled globally after the shape is built.
                     if (std::fabs(pd_min - ed.first)  > kRangeTol ||
                         std::fabs(pd_max - ed.second) > kRangeTol) {
                         B.SameRange(e_map[ei], Standard_False);
@@ -1366,7 +1457,59 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                         delete rev;
                     }
                 }
-            }
+            // (closes if(!surface_map.count(sk_try)) after Geom_SurfaceOfRevolution)
+
+                // --- Geom_SurfaceOfRevolution → ON_RevSurface ---
+                // Surfaces stored analytically as Geom_SurfaceOfRevolution
+                // (e.g. produced by SurfaceToOCCT for torus, NurbsCurve-
+                // profile, or partial-revolution arc-profile surfaces) are
+                // converted back to ON_RevSurface to preserve the analytic
+                // structure.  The meridian curve is recovered via NURBS
+                // conversion of BasisCurve(); m_angle is set to the face's
+                // UV U bounds; m_t = m_angle so the UV parameter is the
+                // angle in radians.
+                if (si < 0) {
+                    Handle(Geom_SurfaceOfRevolution) revSrf =
+                        Handle(Geom_SurfaceOfRevolution)::DownCast(gs);
+                    if (!revSrf.IsNull() && u2 > u1 &&
+                        (u2 - u1) <= kTwoPi + 1e-10) {
+                        gp_Ax1 ax  = revSrf->Axis();
+                        gp_Pnt loc = ax.Location();
+                        gp_Dir dir = ax.Direction();
+                        // Convert the meridian (basis curve) to ON_NurbsCurve.
+                        Handle(Geom_Curve) basisC = revSrf->BasisCurve();
+                        Handle(Geom_BSplineCurve) basisBS;
+                        try {
+                            basisBS = GeomConvert::CurveToBSplineCurve(basisC);
+                            if (!basisBS.IsNull() && basisBS->IsPeriodic())
+                                basisBS->SetNotPeriodic();
+                        } catch (...) {}
+                        if (!basisBS.IsNull()) {
+                            ON_NurbsCurve* nc = new ON_NurbsCurve();
+                            if (OCCTCurveToON(basisBS, *nc)) {
+                                ON_RevSurface* rev2 = new ON_RevSurface();
+                                rev2->m_curve = nc;
+                                rev2->m_axis.from =
+                                    ON_3dPoint(loc.X(), loc.Y(), loc.Z());
+                                ON_3dVector axd(dir.X(), dir.Y(), dir.Z());
+                                rev2->m_axis.to = rev2->m_axis.from + axd;
+                                rev2->m_angle.Set(u1, u2);
+                                rev2->m_t = rev2->m_angle;
+                                rev2->m_bTransposed = false;
+                                rev2->BoundingBox();
+                                if (rev2->IsValid()) {
+                                    si = brep.AddSurface(rev2);
+                                } else {
+                                    delete rev2;
+                                    delete nc;
+                                }
+                            } else {
+                                delete nc;
+                            }
+                        }
+                    }
+                }
+            } // closes if(!surface_map.count(sk_try))
 
             Handle(Geom_BSplineSurface) bs =
                 Handle(Geom_BSplineSurface)::DownCast(gs);
