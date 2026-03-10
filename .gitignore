@@ -1,4 +1,5 @@
 build/
+build_new/
 *.o
 *.a
 # Re-allow pre-built artifacts committed intentionally
