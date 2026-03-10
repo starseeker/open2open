@@ -33,6 +33,7 @@
 #include <Geom_RectangularTrimmedSurface.hxx>
 #include <Geom_CylindricalSurface.hxx>
 #include <Geom_SphericalSurface.hxx>
+#include <Geom_SurfaceOfRevolution.hxx>
 #include <Geom_Plane.hxx>
 #include <Geom2d_BSplineCurve.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
@@ -149,6 +150,7 @@ SurfaceToOCCT(const ON_Surface* srf)
                     return new Geom_CylindricalSurface(gp_Ax3(loc, zdir, xdir), R);
                 }
             } else if (ac) {
+                // Sphere or Geom_SurfaceOfRevolution with arc profile.
                 // Sphere: profile arc lies in the plane spanned by XDir and ZDir
                 // (the revolution axis direction).  Detection: arc.zaxis ⊥ axdir.
                 // ON_ArcCurve::Evaluate maps domain [v1,v2] linearly to arc span
