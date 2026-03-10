@@ -690,12 +690,29 @@ TopoDS_Shape ON_BrepToOCCT(const ON_Brep& brep, double linear_tolerance)
                     // UV domain (corrupting BRepTools::UVBounds).  By
                     // remapping the knots linearly to [ed.first, ed.second]
                     // we restore SameRange=true without changing geometry.
-                    // Only remap when both domains share the same start
-                    // point (pure scale mismatch, not a shift).  When starts
-                    // differ the pcurve UV poles are already outside the
-                    // surface domain; BRepLib::SameParameter must reproject.
-                    if (std::fabs(pd_min - ed.first) < kRangeTol &&
-                        std::fabs(pd_max - ed.second) > kRangeTol) {
+                    //
+                    // Case A — same start, scale mismatch:
+                    //   pd_min ≈ ed.first, pd_max ≠ ed.second
+                    //
+                    // Case B — negation pattern (reversed arc-length proxy):
+                    //   After Reversed(), knots run [−L, 0] while ed=[0,L].
+                    //   A pure shift (+L) maps [−L,0]→[0,L] without altering
+                    //   the UV poles.  The edge is also reversed in the wire,
+                    //   so OCCT reads the pcurve backwards—geometrically
+                    //   correct.  This eliminates SameRange=false and prevents
+                    //   BRepLib::SameParameter from producing a pathological
+                    //   high-degree B-spline on complex surfaces (e.g. the
+                    //   spoke faces of v4_Wheel_PG.3dm).
+                    const bool negation_case =
+                        (std::fabs(pd_min + ed.second) <
+                             kRangeTol + 1e-9 * std::fabs(ed.second)) &&
+                        (std::fabs(pd_max + ed.first)  <
+                             kRangeTol + 1e-9 * std::fabs(ed.first))  &&
+                        (ed.second - ed.first > 1e-14) &&
+                        (pd_max - pd_min > 1e-14);
+                    if ((std::fabs(pd_min - ed.first) < kRangeTol &&
+                         std::fabs(pd_max - ed.second) > kRangeTol) ||
+                        negation_case) {
                         double old_span = pd_max - pd_min;
                         double new_span = ed.second - ed.first;
                         Handle(Geom2d_BSplineCurve) bs =
