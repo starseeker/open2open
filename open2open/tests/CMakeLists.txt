@@ -22,6 +22,14 @@ add_executable(test_brep_complex test_brep_complex.cpp)
 target_link_libraries(test_brep_complex PRIVATE open2open TKPrim)
 add_test(NAME test_brep_complex COMMAND test_brep_complex)
 
+# Attribute / metadata conversion test (Phase 2 — P1/P2 items).
+# Requires XCAF (OPEN2OPEN_HAVE_XCAF) and TKPrim for building OCCT primitives.
+# When attrs_convert is compiled, OPEN2OPEN_HAVE_XCAF is a PUBLIC compile
+# definition on the open2open target, so linking against it is sufficient.
+add_executable(test_attrs test_attrs.cpp)
+target_link_libraries(test_attrs PRIVATE open2open TKPrim)
+add_test(NAME test_attrs COMMAND test_attrs)
+
 # Round-trip tests for the openNURBS 3dm example files.
 # The example_files directory is expected to be at
 # ${CMAKE_SOURCE_DIR}/../opennurbs-8.24.25281.15001/example_files

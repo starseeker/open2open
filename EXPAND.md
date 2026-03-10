@@ -112,10 +112,10 @@ OCCT's native data model and the XCAF document framework provide:
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Object display colour | 🔲 | 🔲 | High | `ON_3dmObjectAttributes::m_color` ↔ `XCAFDoc_Color` RGBA |
-| Layer colour | 🔲 | 🔲 | High | `ON_Layer::Color()` ↔ `XCAFDoc_Color` on layer label |
-| Diffuse / specular material | 🔲 | 🔲 | Medium | `ON_Material` fields ↔ `XCAFDoc_MaterialTool`; OCCT loses shine/emissive |
-| Transparency | 🔲 | 🔲 | High | Both systems store alpha 0–1 |
+| Object display colour | ✅ | ✅ | High | `ON_3dmObjectAttributes::m_color` ↔ `XCAFDoc_Color` RGBA |
+| Layer colour | ✅ | ✅ | High | `ON_Layer::Color()` ↔ `XCAFDoc_Color` on layer label |
+| Diffuse / specular material | ✅ | ✅ | Medium | `ON_Material` fields ↔ `XCAFDoc_MaterialTool`; OCCT loses shine/emissive |
+| Transparency | ✅ | ✅ | High | Both systems store alpha 0–1 |
 | Texture maps | 🔲 | ❌ | Low | openNURBS embeds texture paths; OCCT/XCAF has no standard texture mapping |
 | Physically-based materials | ❌ | ❌ | None | Rhino PBR data is proprietary; FreeCAD uses Arch material properties |
 | Vertex colors (mesh) | 🟨 | ❌ | None | `ON_Mesh::m_C[]` has no `Poly_Triangulation` equivalent |
@@ -126,7 +126,7 @@ OCCT's native data model and the XCAF document framework provide:
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Object name | 🔲 | 🔲 | Exact | `ON_3dmObjectAttributes::m_name` ↔ `XCAFDoc_Name` / TDF label |
+| Object name | ✅ | ✅ | Exact | `ON_3dmObjectAttributes::m_name` ↔ `XCAFDoc_Name` / TDF label |
 | Layer hierarchy | 🔲 | 🔲 | High | `ON_Layer` parent/child ↔ `XCAFDoc_LayerTool` hierarchy |
 | Block instances (xref) | 🔲 | 🔲 | Medium | `ON_InstanceDefinition` + `ON_InstanceRef` ↔ `XCAFDoc_ShapeTool` compounds |
 | Assembly structure | 🔲 | 🔲 | Medium | XCAF product tree ↔ ON_Layer + block instances; semantic gap |
@@ -138,14 +138,14 @@ OCCT's native data model and the XCAF document framework provide:
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Document title / description | 🔲 | 🔲 | High | `ON_3dmProperties::m_Notes` ↔ STEP header or TDocStd document name |
-| Author / company | 🔲 | 🔲 | High | `ON_3dmProperties::m_RevisionHistory` ↔ STEP file description |
+| Document title / description | ✅ | ✅ | High | `ON_3dmProperties::m_Notes` ↔ STEP header or TDocStd document name |
+| Author / company | ✅ | ✅ | High | `ON_3dmProperties::m_RevisionHistory` ↔ STEP file description |
 | UUID | 🔲 | 🔲 | High | `ON_3dmObjectAttributes::m_uuid` ↔ TDF label tag |
 | URL references | 🔲 | ❌ | Low | `ON_3dmObjectAttributes::m_url` has no standard OCCT field |
 | GD&T / PMI | 🔲 | 🔲 | Medium | `ON_Dimension` ↔ `XCAFDoc_DimTol`; styling may differ |
 | Text annotations | 🔲 | 🔲 | Medium | `ON_Text` ↔ `XCAFNoteObjects_Note`; font/style differences |
 | Dimension styles | ❌ | ❌ | None | Rhino `ON_DimStyle` has no OCCT counterpart |
-| Units / tolerances | 🔲 | 🔲 | High | `ON_3dmSettings` ↔ XCAF unit and tolerance attributes |
+| Units / tolerances | ✅ | ✅ | High | `ON_3dmSettings` ↔ XCAF unit and tolerance attributes |
 
 ### 2.5 Views and Rendering
 
@@ -209,13 +209,13 @@ with both APIs:
 |---|---|---|---|
 | P0 | ~~B-Rep solids~~ | ~~Done~~ | — |
 | P0 | ~~Polygon mesh (tri/quad, normals, UV)~~ | ~~Done~~ | — |
-| P1 | **Object name / label** | 1–2 d | TDF label API |
-| P1 | **Object display colour** | 2–3 d | XCAF `XCAFDoc_Color` |
-| P1 | **Layer name and colour** | 3–5 d | `XCAFDoc_LayerTool`, `ON_Layer` |
-| P2 | **Basic material (diffuse, transparency)** | 3–5 d | `XCAFDoc_MaterialTool`, `ON_Material` |
+| P1 | ~~**Object name / label**~~ | ~~Done~~ | TDF label API |
+| P1 | ~~**Object display colour**~~ | ~~Done~~ | XCAF `XCAFDoc_Color` |
+| P1 | ~~**Layer name and colour**~~ | ~~Done~~ | `XCAFDoc_LayerTool`, `ON_Layer` |
+| P2 | ~~**Basic material (diffuse, transparency)**~~ | ~~Done~~ | `XCAFDoc_MaterialTool`, `ON_Material` |
 | P2 | **FreeCAD per-face colours** (`DiffuseColor` binary) | 2–3 d | Custom ZIP + binary parser |
-| P2 | **Document metadata** (title, author, date) | 1–2 d | `ON_3dmProperties`, TDocStd header |
-| P2 | **Units and tolerance** | 1–2 d | `ON_3dmSettings`, XCAF units |
+| P2 | ~~**Document metadata** (title, author, date)~~ | ~~Done~~ | `ON_3dmProperties`, TDocStd header |
+| P2 | ~~**Units and tolerance**~~ | ~~Done~~ | `ON_3dmSettings`, XCAF units |
 | P3 | **Instance definitions / blocks** | 5–8 d | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
 | P3 | **Assembly tree** | 7–10 d | XCAF product tree → ON_Layer hierarchy |
 | P3 | **GD&T / PMI annotations** | 8–12 d | `XCAFDoc_DimTol`, `ON_Dimension` |
