@@ -4,3 +4,5 @@ build/
 # Re-allow pre-built artifacts committed intentionally
 !build_artifacts/**/*.a
 !build_artifacts/**
+build_prev/
+a.out
