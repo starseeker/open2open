@@ -156,8 +156,16 @@ SurfaceToOCCT(const ON_Surface* srf)
                 // to OCCT's native latitude parameterisation by the start latitude
                 // v1 = ac->Domain().Min().  Recovery: OCCT XDir = cos(v1)*arc.xaxis
                 // - sin(v1)*arc.yaxis (inverse rotation by v1).
+                //
+                // Arc-length-parameterized spheres (ON_BrepSphere sets
+                // m_arc.AngleRadians()=π but domain [-r·π/2, +r·π/2]) must fall
+                // back to NURBS: the arc angle span (radians) must equal the domain
+                // span for the linear mapping to work as angle parameterisation.
                 double R = ac->m_arc.radius;
-                if (R > 1e-14) {
+                double domain_span = ac->Domain().Max() - ac->Domain().Min();
+                bool angle_param =
+                    fabs(ac->m_arc.AngleRadians() - domain_span) < 1e-4 * (1.0 + domain_span);
+                if (R > 1e-14 && angle_param) {
                     const ON_Plane& ap = ac->m_arc.plane;
                     // Check that the arc plane contains the revolution axis
                     // (i.e. arc.zaxis ⊥ axdir).
@@ -1098,13 +1106,36 @@ bool OCCTToON_Brep(const TopoDS_Shape& shape, ON_Brep& brep,
                 Handle(Geom_SphericalSurface) sph =
                     Handle(Geom_SphericalSurface)::DownCast(gs);
 
+                // kPoleTol: latitude tolerance for "face touches a pole".
+                // ON_ArcCurve::Evaluate maps [v1,v2] linearly to the arc angle
+                // range, so for partial-sphere faces (v1 ≫ -π/2 or v2 ≪ π/2)
+                // the arc construction is still geometrically correct but OCCT's
+                // BRepCheck_Analyzer may reject the reconstructed face (seam
+                // consistency) or BRepGProp may compute a wrong volume (pcurve
+                // approximation error compounded by the exact sphere surface).
+                // The analytical path is therefore restricted to faces that cover
+                // both poles (full or near-full sphere in V), where the canonical
+                // arc construction with v1≈-π/2 gives reliable results.
+                // Partial spheres (one pole missing, equatorial strip, etc.) fall
+                // back to the NURBS path which handled them correctly before.
+                //
+                // kPoleTol is also the rounding guard for the UVBounds check:
+                // B-spline pcurve domains may report v2 slightly above π/2 or
+                // v1 slightly below -π/2 due to floating-point arithmetic in
+                // Geom2dConvert.  Using kPoleTol as the outer guard (instead of
+                // 1e-10) ensures these numerically-noisy cases still fire the
+                // analytical path.
+                static const double kPoleTol = 0.02; // ≈ 1.1° latitude
                 if (!sph.IsNull() &&
                     u2 > u1 && (u2 - u1) <= kTwoPi + 1e-10 &&
                     v2 > v1 &&
-                    v1 >= -kPiOver2 - 1e-10 &&
-                    v2 <=  kPiOver2 + 1e-10) {
-                    // Sphere: P(u,v) = Loc + R*(cos(v)*(cos(u)*X+sin(u)*Y)+sin(v)*Z)
-                    // Profile arc at u=0: P(0,v) = Loc + R*(cos(v)*X + sin(v)*Z)
+                    v1 >= -kPiOver2 - kPoleTol &&   // v1 within kPoleTol of south pole
+                    v2 <=  kPiOver2 + kPoleTol &&   // v2 within kPoleTol of north pole
+                    v1 <= -kPiOver2 + kPoleTol &&   // face includes south pole
+                    v2 >=  kPiOver2 - kPoleTol) {   // face includes north pole
+                    // Full-sphere (both-pole) face: ON_RevSurface with ON_ArcCurve
+                    // profile gives exact geometry and BRepGProp uses analytical
+                    // sphere integration.
                     //
                     // ON_ArcCurve::Evaluate maps domain [v1,v2] LINEARLY to arc span
                     // [0, SetAngleRadians].  At parameter t, arc angle θ(t) =
