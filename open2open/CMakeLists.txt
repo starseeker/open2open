@@ -89,6 +89,7 @@ endif()
 add_library(open2open STATIC
     src/geom_convert.cpp
     src/brep_convert.cpp
+    src/mesh_convert.cpp
 )
 
 target_include_directories(open2open

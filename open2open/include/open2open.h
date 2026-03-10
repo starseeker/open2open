@@ -11,5 +11,6 @@
 
 #include "open2open/geom_convert.h"
 #include "open2open/brep_convert.h"
+#include "open2open/mesh_convert.h"
 
 #endif // OPEN2OPEN_H
