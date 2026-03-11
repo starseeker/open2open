@@ -94,7 +94,7 @@ struct FcstdObject {
     std::string type;        ///< FreeCAD object type (e.g. "Part::Feature")
     std::string label;       ///< User-facing label (e.g. "ESQ-126-38-G-D_socket")
     std::string brp_file;    ///< Path inside ZIP to the BRep file (e.g. "PartShape.brp")
-    FcstdColor  shape_color  = 0xC8C8C8FFu; ///< Overall shape colour (packed RGBA)
+    FcstdColor  shape_color  = 0xC8C8C800u; ///< Overall shape colour (packed RGBA, FreeCAD alpha=0 → opaque)
     bool        visible      = true;
     std::vector<FcstdColor> face_colors; ///< Per-face colours (may be empty)
 };
@@ -157,6 +157,23 @@ class ONX_Model;
 // ---------------------------------------------------------------------------
 int FCStdFileToONX_Model(const std::string& path,
                          ONX_Model&         model,
+                         double             tol = 1e-6);
+
+// ---------------------------------------------------------------------------
+// Convert an ONX_Model to a FreeCAD .FCStd archive.
+//
+// Writes each B-Rep geometry object in @p model as an OCCT BRep text file
+// inside the ZIP archive, along with a minimal Document.xml that links
+// object names to their shape files, and a GuiDocument.xml with display
+// colours.
+//
+// @param path     Output filesystem path for the .FCStd file.
+// @param model    Source openNURBS model.
+// @param tol      Linear tolerance passed to ON_BrepToOCCT().
+// @return         Number of shapes successfully written (0 on total failure).
+// ---------------------------------------------------------------------------
+int ONX_ModelToFCStdFile(const std::string& path,
+                         const ONX_Model&   model,
                          double             tol = 1e-6);
 #endif // OPEN2OPEN_HAVE_LIBZIP
 

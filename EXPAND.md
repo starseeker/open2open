@@ -340,10 +340,11 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 
 ### Phase 5 — Full FreeCAD ↔ 3dm pipeline
 - [x] `fcstd_reader` module: `FCStdFileToONX_Model(path, model)` — reads BRep entries from ZIP → `ON_Brep` objects with name/colour/layer attributes
-- [x] `ParseDiffuseColors` always compiled (no libzip dependency); `ReadFcstdDoc` and `FCStdFileToONX_Model` guarded by `OPEN2OPEN_HAVE_LIBZIP`
-- [ ] `fcstd_writer` module: ONX_Model → ZIP + XML
-- [ ] Per-face `DiffuseColor` round-trip via writer
-- [ ] `App::Part` container → ON_Layer hierarchy (via type-based layer grouping for now)
+- [x] `fcstd_writer` module: `ONX_ModelToFCStdFile(path, model)` — writes ON_Brep objects as BRep text files + `Document.xml` + `GuiDocument.xml` into a ZIP archive
+- [x] `ParseDiffuseColors` always compiled (no libzip dependency); `ReadFcstdDoc` and `FCStdFileToONX_Model`/`ONX_ModelToFCStdFile` guarded by `OPEN2OPEN_HAVE_LIBZIP`
+- [x] GuiDocument.xml color format uses FreeCAD's `0xRRGGBBAA` convention (alpha=0 = opaque); reader fixed to use `std::stoul(val, nullptr, 0)` for hex auto-detection
+- [ ] Per-face `DiffuseColor` round-trip in writer
+- [ ] `App::Part` container → ON_Layer hierarchy (type-based layer grouping for now)
 - [ ] Integration test: `test_fcstd_3dm_roundtrip`
 
 ---

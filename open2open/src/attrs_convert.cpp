@@ -423,7 +423,7 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
             if (!ann) continue;
 
             // GD&T: if it's a dimension sub-class, store via DimTolTool
-            const ON_Dimension* dim = dynamic_cast<const ON_Dimension*>(ann);
+            const ON_Dimension* dim = ON_Dimension::Cast(ann);
             if (dim) {
                 Handle(XCAFDoc_DimTolTool) dimTolTool =
                     XCAFDoc_DocumentTool::DimTolTool(doc->Main());
@@ -967,7 +967,8 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
                 {
                     ON_String ts;
                     ts = typeStr;
-                    std::sscanf(ts.Array(), "%u", &typeUint);
+                    if (std::sscanf(ts.Array(), "%u", &typeUint) != 1)
+                        typeUint = 0; // fallback: bitmap_texture
                 }
 
                 ON_Texture tex;
@@ -1378,8 +1379,9 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
                     ON_String coordS;
                     coordS = coordW;
                     double x = 0, y = 0, z = 0;
-                    std::sscanf(coordS.Array(), "%lf %lf %lf", &x, &y, &z);
-                    org = ON_3dPoint(x, y, z);
+                    if (std::sscanf(coordS.Array(), "%lf %lf %lf", &x, &y, &z) == 3)
+                        org = ON_3dPoint(x, y, z);
+                    // else: leave org at (0,0,0) default
                 }
             }
 
