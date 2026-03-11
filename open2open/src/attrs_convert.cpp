@@ -88,6 +88,11 @@
 #include <XCAFDoc_DimTolTool.hxx>
 #include <XCAFDoc_DimTol.hxx>
 
+// OCCT — clipping planes
+#include <XCAFDoc_ClippingPlaneTool.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Ax3.hxx>
+
 #include <map>
 #include <set>
 #include <string>
@@ -613,6 +618,60 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
                 matTool->SetMaterial(label, mit2->second);
             }
         }
+
+        // P6: UUID, URL, Group membership — encoded in ONE "METADATA" child label.
+        // Format: "METADATA|UUID:<hex>|URL:<url>|GROUP:<name>|GROUP:<name>|..."
+        // Groups are stored by NAME (not index) to survive model re-indexing.
+        // Only written if any of UUID/URL/groups are non-default.
+        if (attrs) {
+            const bool hasUuid = (attrs->m_uuid != ON_nil_uuid);
+            const bool hasUrl  = attrs->m_url.IsNotEmpty();
+            const int  gc      = attrs->GroupCount();
+            if (hasUuid || hasUrl || gc > 0) {
+                std::string meta = "METADATA";
+                if (hasUuid) {
+                    char uuidStr[64];
+                    ON_UuidToString(attrs->m_uuid, uuidStr);
+                    meta += "|UUID:";
+                    meta += uuidStr;
+                }
+                if (hasUrl) {
+                    ON_String utf8url;
+                    utf8url = attrs->m_url;
+                    meta += "|URL:";
+                    meta += utf8url.Array();
+                }
+                const int* glist = attrs->GroupList();
+                for (int gi = 0; gi < gc; ++gi) {
+                    // Look up group name from the model's group table
+                    ON_wString groupName;
+                    {
+                        ONX_ModelComponentIterator git(model,
+                            ON_ModelComponent::Type::Group);
+                        for (const ON_ModelComponent* gmc = git.FirstComponent();
+                             gmc; gmc = git.NextComponent()) {
+                            if (gmc->Index() == glist[gi]) {
+                                groupName = gmc->Name();
+                                break;
+                            }
+                        }
+                    }
+                    if (groupName.IsEmpty()) {
+                        char grpStr[32];
+                        std::snprintf(grpStr, sizeof(grpStr), "|GROUP:#%d", glist[gi]);
+                        meta += grpStr;
+                    } else {
+                        ON_String gn;
+                        gn = groupName;
+                        meta += "|GROUP:";
+                        meta += gn.Array();
+                    }
+                }
+                TDF_Label metaLabel = label.NewChild();
+                TDataStd_Comment::Set(metaLabel,
+                    TCollection_ExtendedString(meta.c_str(), Standard_True));
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -799,12 +858,88 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
         }
     }
 
+    // -----------------------------------------------------------------------
+    // P6: Clipping planes — each model-level clipping plane → XCAF.
+    // ON_ClippingPlaneSurface objects are stored in the model geometry.
+    // -----------------------------------------------------------------------
+    {
+        Handle(XCAFDoc_ClippingPlaneTool) clipTool =
+            XCAFDoc_DocumentTool::ClippingPlaneTool(doc->Main());
+        ONX_ModelComponentIterator clipIt(model,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = clipIt.FirstComponent();
+             mc != nullptr; mc = clipIt.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* geom = mgc->Geometry(nullptr);
+            if (!geom || geom->ObjectType() != ON::clipplane_object) continue;
+
+            const ON_ClippingPlaneSurface* cps =
+                ON_ClippingPlaneSurface::Cast(geom);
+            if (!cps) continue;
+
+            const ON_Plane& pln = cps->m_clipping_plane.m_plane;
+            const gp_Ax3 ax3(gp_Pnt(pln.origin.x, pln.origin.y, pln.origin.z),
+                             gp_Dir(pln.zaxis.x,  pln.zaxis.y,  pln.zaxis.z),
+                             gp_Dir(pln.xaxis.x,  pln.xaxis.y,  pln.xaxis.z));
+            const gp_Pln gpPln(ax3);
+
+            const ON_3dmObjectAttributes* attrs = mgc->Attributes(nullptr);
+            TCollection_AsciiString cpName("ClippingPlane");
+            if (attrs && attrs->m_name.IsNotEmpty()) {
+                ON_String utf8;
+                utf8 = attrs->m_name;
+                cpName = TCollection_AsciiString(utf8.Array());
+            }
+
+            TCollection_ExtendedString cpNameExt2(cpName.ToCString(), Standard_True);
+            clipTool->AddClippingPlane(gpPln, cpNameExt2,
+                                       /*isCapping=*/Standard_False);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P6: Lights — store ON_Light objects as serialised comment children of
+    // the document root label.  Format per child:
+    //   "LIGHT:<name>|<type>|<r,g,b>|<px,py,pz>|<dx,dy,dz>|<enabled>"
+    // -----------------------------------------------------------------------
+    {
+        ONX_ModelComponentIterator lightIt(model,
+            ON_ModelComponent::Type::RenderLight);
+        for (const ON_ModelComponent* mc = lightIt.FirstComponent();
+             mc != nullptr; mc = lightIt.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* geom = mgc->Geometry(nullptr);
+            if (!geom || geom->ObjectType() != ON::light_object) continue;
+
+            const ON_Light* light = ON_Light::Cast(geom);
+            if (!light) continue;
+
+            // Serialise into a single string
+            ON_String name;
+            name = light->m_light_name;
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "LIGHT:%s|%d|%d,%d,%d|%.17g,%.17g,%.17g|%.17g,%.17g,%.17g|%d",
+                name.Array(),
+                (int)light->m_style,
+                light->m_diffuse.Red(), light->m_diffuse.Green(), light->m_diffuse.Blue(),
+                light->m_location.x, light->m_location.y, light->m_location.z,
+                light->m_direction.x, light->m_direction.y, light->m_direction.z,
+                light->IsEnabled() ? 1 : 0);
+            TDF_Label lightLabel = doc->Main().NewChild();
+            TDataStd_Comment::Set(lightLabel,
+                TCollection_ExtendedString(buf, Standard_True));
+        }
+    }
+
     return doc;
 }
-
-// ---------------------------------------------------------------------------
-// XCAFDocToONX_Model
-// ---------------------------------------------------------------------------
 
 bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
                         ONX_Model&                      model,
@@ -1109,6 +1244,69 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             }
         }
 
+        // P6: UUID, URL, Group membership — restore from METADATA child label
+        for (TDF_ChildIterator ci(label); ci.More(); ci.Next()) {
+            const TDF_Label& cl = ci.Value();
+            Handle(TDataStd_Comment) cmt;
+            if (!cl.FindAttribute(TDataStd_Comment::GetID(), cmt)) continue;
+            ON_wString entry = ExtToONw(cmt->Get());
+            if (entry.Left(8) != L"METADATA") continue;
+
+            // Parse pipe-delimited fields: METADATA|KEY:VALUE|KEY:VALUE|...
+            ON_String dataS;
+            ON_wString dataW = entry.Mid(9); // skip "METADATA|"
+            dataS = dataW;
+            std::string data(dataS.Array(), (size_t)dataS.Length());
+            // Split by '|'
+            std::string::size_type pos = 0;
+            while (pos <= data.size()) {
+                std::string::size_type next = data.find('|', pos);
+                std::string field = (next == std::string::npos)
+                    ? data.substr(pos) : data.substr(pos, next - pos);
+                pos = (next == std::string::npos) ? data.size() + 1 : next + 1;
+
+                if (field.substr(0, 5) == "UUID:") {
+                    ON_UUID uuid = ON_UuidFromString(
+                        ON_wString(field.c_str() + 5));
+                    if (uuid != ON_nil_uuid)
+                        attrs->m_uuid = uuid;
+                } else if (field.substr(0, 4) == "URL:") {
+                    attrs->m_url = ON_wString(field.c_str() + 4);
+                } else if (field.substr(0, 6) == "GROUP:") {
+                    // Group names are stored. Resolve to a model group index,
+                    // creating the ON_Group entry if it doesn't exist yet.
+                    // The group MUST be in the model manifest BEFORE we call
+                    // AddManagedModelGeometryComponent, because UpdateReferencedComponents
+                    // will otherwise clear the group membership.
+                    const std::string grpName = field.substr(6);
+                    ON_wString wGrpName(grpName.c_str());
+                    int grpIdx = -1;
+                    // Search existing groups in destination model
+                    ONX_ModelComponentIterator git(model, ON_ModelComponent::Type::Group);
+                    for (const ON_ModelComponent* gmc = git.FirstComponent();
+                         gmc; gmc = git.NextComponent()) {
+                        if (gmc->Name() == wGrpName) {
+                            grpIdx = gmc->Index();
+                            break;
+                        }
+                    }
+                    if (grpIdx < 0) {
+                        // Create new group in destination model
+                        ON_Group* newGrp = new ON_Group();
+                        if (!wGrpName.IsEmpty() && wGrpName[0] != L'#')
+                            newGrp->SetName(wGrpName);
+                        ON_ModelComponentReference gref =
+                            model.AddManagedModelComponent(newGrp, false);
+                        if (!gref.IsEmpty())
+                            grpIdx = gref.ModelComponent()->Index();
+                    }
+                    if (grpIdx >= 0)
+                        attrs->AddToGroup(grpIdx);
+                }
+            }
+            break; // only one METADATA label expected
+        }
+
         ON_ModelComponentReference ref =
             model.AddManagedModelGeometryComponent(brep, attrs);
         anyOK = true;
@@ -1397,6 +1595,103 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             }
 
             model.AddManagedModelGeometryComponent(onText, tAttrs);
+            anyOK = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P6: Clipping planes — read XCAF clipping planes → ON_ClippingPlaneSurface
+    // -----------------------------------------------------------------------
+    {
+        Handle(XCAFDoc_ClippingPlaneTool) clipTool =
+            XCAFDoc_DocumentTool::ClippingPlaneTool(doc->Main());
+        TDF_LabelSequence cpLabels;
+        clipTool->GetClippingPlanes(cpLabels);
+        for (Standard_Integer i = 1; i <= cpLabels.Length(); ++i) {
+            gp_Pln gpPln;
+            TCollection_ExtendedString cpNameExt;
+            Standard_Boolean capping = Standard_False;
+            if (!clipTool->GetClippingPlane(cpLabels.Value(i), gpPln,
+                                             cpNameExt, capping))
+                continue;
+
+            // Convert gp_Pln to ON_Plane
+            const gp_Ax3& ax = gpPln.Position();
+            ON_3dPoint org(ax.Location().X(), ax.Location().Y(), ax.Location().Z());
+            ON_3dVector xv(ax.XDirection().X(), ax.XDirection().Y(), ax.XDirection().Z());
+            ON_3dVector yv(ax.YDirection().X(), ax.YDirection().Y(), ax.YDirection().Z());
+            ON_Plane onPln(org, xv, yv);
+
+            ON_ClippingPlaneSurface* cps = new ON_ClippingPlaneSurface();
+            cps->m_clipping_plane.m_plane = onPln;
+            cps->SetExtents(0, ON_Interval(-1e4, 1e4), /*bSynchDomain=*/true);
+            cps->SetExtents(1, ON_Interval(-1e4, 1e4), /*bSynchDomain=*/true);
+
+            ON_3dmObjectAttributes* cAttrs = new ON_3dmObjectAttributes();
+            if (!cpNameExt.IsEmpty())
+                cAttrs->m_name = ExtToONw(cpNameExt);
+            model.AddManagedModelGeometryComponent(cps, cAttrs);
+            anyOK = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P6: Lights — read "LIGHT:..." comments from doc root children
+    // -----------------------------------------------------------------------
+    {
+        for (TDF_ChildIterator ci(doc->Main()); ci.More(); ci.Next()) {
+            const TDF_Label& cl = ci.Value();
+            Handle(TDataStd_Comment) cmt;
+            if (!cl.FindAttribute(TDataStd_Comment::GetID(), cmt)) continue;
+            ON_wString entry = ExtToONw(cmt->Get());
+            if (entry.Left(6) != L"LIGHT:") continue;
+
+            // Format: "LIGHT:<name>|<type>|<r,g,b>|<px,py,pz>|<dx,dy,dz>|<enabled>"
+            ON_wString data = entry.Mid(6);
+            ON_String dataS;
+            dataS = data;
+
+            // Parse pipe-delimited fields
+            std::string s(dataS.Array(), (size_t)dataS.Length());
+            auto split = [](const std::string& str, char delim) {
+                std::vector<std::string> parts;
+                std::string cur;
+                for (char c : str) {
+                    if (c == delim) { parts.push_back(cur); cur.clear(); }
+                    else cur += c;
+                }
+                parts.push_back(cur);
+                return parts;
+            };
+            auto parts = split(s, '|');
+            if (parts.size() < 6) continue;
+
+            ON_Light* light = new ON_Light();
+            light->m_light_name = ON_wString(parts[0].c_str());
+
+            int ltype = 0;
+            std::sscanf(parts[1].c_str(), "%d", &ltype);
+            light->m_style = ON::LightStyle(ltype);
+
+            int r = 255, g = 255, b = 255;
+            std::sscanf(parts[2].c_str(), "%d,%d,%d", &r, &g, &b);
+            light->m_diffuse = ON_Color(r, g, b);
+
+            double px = 0, py = 0, pz = 0;
+            std::sscanf(parts[3].c_str(), "%lf,%lf,%lf", &px, &py, &pz);
+            light->m_location = ON_3dPoint(px, py, pz);
+
+            double dx = 0, dy = 0, dz = -1;
+            std::sscanf(parts[4].c_str(), "%lf,%lf,%lf", &dx, &dy, &dz);
+            light->m_direction = ON_3dVector(dx, dy, dz);
+
+            int enabled = 1;
+            std::sscanf(parts[5].c_str(), "%d", &enabled);
+            light->Enable(enabled != 0);
+
+            ON_3dmObjectAttributes* lAttrs = new ON_3dmObjectAttributes();
+            lAttrs->m_name = light->m_light_name;
+            model.AddManagedModelGeometryComponent(light, lAttrs);
             anyOK = true;
         }
     }

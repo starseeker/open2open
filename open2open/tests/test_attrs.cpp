@@ -801,6 +801,226 @@ static void TestTextureMapRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 11: UUID round-trip
+// ---------------------------------------------------------------------------
+static void TestUUIDRoundTrip()
+{
+    std::printf("--- Test 11: UUID round-trip\n");
+
+    ONX_Model src;
+    BRepPrimAPI_MakeBox mkBox(5.0, 5.0, 5.0);
+    ON_Brep* brep = new ON_Brep();
+    open2open::OCCTToON_Brep(mkBox.Shape(), *brep);
+    ON_3dmObjectAttributes* attrs = new ON_3dmObjectAttributes();
+    attrs->m_name = ON_wString(L"UUIDBox");
+    // Set a specific UUID
+    attrs->m_uuid = ON_CreateId();
+    const ON_UUID srcUuid = attrs->m_uuid;
+    src.AddManagedModelGeometryComponent(brep, attrs);
+
+    Handle(TDocStd_Document) doc = open2open::ONX_ModelToXCAFDoc(src);
+    EXPECT_TRUE(!doc.IsNull());
+
+    ONX_Model dst;
+    open2open::XCAFDocToONX_Model(doc, dst);
+
+    bool uuidFound = false;
+    ONX_ModelComponentIterator it(dst, ON_ModelComponent::Type::ModelGeometry);
+    for (const ON_ModelComponent* mc = it.FirstComponent(); mc; mc = it.NextComponent()) {
+        const ON_ModelGeometryComponent* mgc = ON_ModelGeometryComponent::Cast(mc);
+        if (!mgc) continue;
+        const ON_3dmObjectAttributes* a = mgc->Attributes(nullptr);
+        if (!a) continue;
+        if (a->m_name == ON_wString(L"UUIDBox")) {
+            EXPECT_TRUE(a->m_uuid == srcUuid);
+            uuidFound = true;
+        }
+    }
+    EXPECT_TRUE(uuidFound);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: URL round-trip
+// ---------------------------------------------------------------------------
+static void TestURLRoundTrip()
+{
+    std::printf("--- Test 12: URL round-trip\n");
+
+    ONX_Model src;
+    BRepPrimAPI_MakeBox mkBox(5.0, 5.0, 5.0);
+    ON_Brep* brep = new ON_Brep();
+    open2open::OCCTToON_Brep(mkBox.Shape(), *brep);
+    ON_3dmObjectAttributes* attrs = new ON_3dmObjectAttributes();
+    attrs->m_name = ON_wString(L"URLBox");
+    attrs->m_url = ON_wString(L"https://example.com/model/part42");
+    src.AddManagedModelGeometryComponent(brep, attrs);
+
+    Handle(TDocStd_Document) doc = open2open::ONX_ModelToXCAFDoc(src);
+    EXPECT_TRUE(!doc.IsNull());
+
+    ONX_Model dst;
+    open2open::XCAFDocToONX_Model(doc, dst);
+
+    bool urlFound = false;
+    ONX_ModelComponentIterator it(dst, ON_ModelComponent::Type::ModelGeometry);
+    for (const ON_ModelComponent* mc = it.FirstComponent(); mc; mc = it.NextComponent()) {
+        const ON_ModelGeometryComponent* mgc = ON_ModelGeometryComponent::Cast(mc);
+        if (!mgc) continue;
+        const ON_3dmObjectAttributes* a = mgc->Attributes(nullptr);
+        if (!a) continue;
+        if (a->m_name == ON_wString(L"URLBox")) {
+            EXPECT_TRUE(a->m_url == ON_wString(L"https://example.com/model/part42"));
+            urlFound = true;
+        }
+    }
+    EXPECT_TRUE(urlFound);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Group membership round-trip
+// ---------------------------------------------------------------------------
+static void TestGroupRoundTrip()
+{
+    std::printf("--- Test 13: Group membership round-trip\n");
+
+    ONX_Model src;
+    // Add a group
+    ON_Group* grp = new ON_Group();
+    grp->SetName(L"TestGroup");
+    const int grpIdx = src.AddManagedModelComponent(grp, false).ModelComponentIndex();
+    EXPECT_TRUE(grpIdx >= 0);
+
+    BRepPrimAPI_MakeBox mkBox(5.0, 5.0, 5.0);
+    ON_Brep* brep = new ON_Brep();
+    open2open::OCCTToON_Brep(mkBox.Shape(), *brep);
+    ON_3dmObjectAttributes* attrs = new ON_3dmObjectAttributes();
+    attrs->m_name = ON_wString(L"GroupedBox");
+    attrs->AddToGroup(grpIdx);
+    src.AddManagedModelGeometryComponent(brep, attrs);
+
+    Handle(TDocStd_Document) doc = open2open::ONX_ModelToXCAFDoc(src);
+    EXPECT_TRUE(!doc.IsNull());
+
+    ONX_Model dst;
+    open2open::XCAFDocToONX_Model(doc, dst);
+
+    bool groupFound = false;
+    ONX_ModelComponentIterator it(dst, ON_ModelComponent::Type::ModelGeometry);
+    for (const ON_ModelComponent* mc = it.FirstComponent(); mc; mc = it.NextComponent()) {
+        const ON_ModelGeometryComponent* mgc = ON_ModelGeometryComponent::Cast(mc);
+        if (!mgc) continue;
+        const ON_3dmObjectAttributes* a = mgc->Attributes(nullptr);
+        if (!a) continue;
+        if (a->m_name == ON_wString(L"GroupedBox")) {
+            EXPECT_TRUE(a->GroupCount() >= 1);
+            groupFound = true;
+        }
+    }
+    EXPECT_TRUE(groupFound);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Clipping plane round-trip
+// ---------------------------------------------------------------------------
+#include <XCAFDoc_ClippingPlaneTool.hxx>
+#include <gp_Pln.hxx>
+
+static void TestClippingPlaneRoundTrip()
+{
+    std::printf("--- Test 14: Clipping plane round-trip\n");
+
+    ONX_Model src;
+    // Add a clipping plane at z=5, normal=+Z
+    ON_ClippingPlaneSurface* cps = new ON_ClippingPlaneSurface();
+    cps->m_clipping_plane.m_plane = ON_Plane(ON_3dPoint(0, 0, 5), ON_3dVector::ZAxis);
+    cps->SetExtents(0, ON_Interval(-100, 100), true);
+    cps->SetExtents(1, ON_Interval(-100, 100), true);
+    ON_3dmObjectAttributes* cpAttrs = new ON_3dmObjectAttributes();
+    cpAttrs->m_name = ON_wString(L"MyClipPlane");
+    src.AddManagedModelGeometryComponent(cps, cpAttrs);
+
+    Handle(TDocStd_Document) doc = open2open::ONX_ModelToXCAFDoc(src);
+    EXPECT_TRUE(!doc.IsNull());
+
+    // Verify the clipping plane is in the XCAF document
+    {
+        Handle(XCAFDoc_ClippingPlaneTool) clipTool =
+            XCAFDoc_DocumentTool::ClippingPlaneTool(doc->Main());
+        TDF_LabelSequence cpLabels;
+        clipTool->GetClippingPlanes(cpLabels);
+        EXPECT_TRUE(cpLabels.Length() >= 1);
+    }
+
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst);
+    EXPECT_TRUE(ok);
+
+    // Verify round-trip: should have at least one clipping plane
+    bool clipFound = false;
+    ONX_ModelComponentIterator it(dst, ON_ModelComponent::Type::ModelGeometry);
+    for (const ON_ModelComponent* mc = it.FirstComponent(); mc; mc = it.NextComponent()) {
+        const ON_ModelGeometryComponent* mgc = ON_ModelGeometryComponent::Cast(mc);
+        if (!mgc) continue;
+        const ON_Geometry* geom = mgc->Geometry(nullptr);
+        if (geom && geom->ObjectType() == ON::clipplane_object) {
+            const ON_ClippingPlaneSurface* cps2 =
+                ON_ClippingPlaneSurface::Cast(geom);
+            if (cps2) {
+                // Check normal is approximately +Z
+                const ON_3dVector& zv = cps2->m_clipping_plane.m_plane.zaxis;
+                EXPECT_TRUE(std::fabs(zv.z - 1.0) < 0.01);
+                clipFound = true;
+            }
+        }
+    }
+    EXPECT_TRUE(clipFound);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: Light round-trip
+// ---------------------------------------------------------------------------
+static void TestLightRoundTrip()
+{
+    std::printf("--- Test 15: Light round-trip\n");
+
+    ONX_Model src;
+    ON_Light* light = new ON_Light();
+    light->m_light_name = ON_wString(L"Sun");
+    light->m_style = ON::world_directional_light;
+    light->m_diffuse = ON_Color(255, 255, 200);
+    light->m_direction = ON_3dVector(0.5, -0.5, -0.7);
+    light->m_direction.Unitize();
+    light->Enable(true);
+    ON_3dmObjectAttributes* lAttrs = new ON_3dmObjectAttributes();
+    lAttrs->m_name = ON_wString(L"Sun");
+    src.AddManagedModelGeometryComponent(light, lAttrs);
+
+    Handle(TDocStd_Document) doc = open2open::ONX_ModelToXCAFDoc(src);
+    EXPECT_TRUE(!doc.IsNull());
+
+    ONX_Model dst;
+    open2open::XCAFDocToONX_Model(doc, dst);
+
+    bool lightFound = false;
+    ONX_ModelComponentIterator it(dst, ON_ModelComponent::Type::RenderLight);
+    for (const ON_ModelComponent* mc = it.FirstComponent(); mc; mc = it.NextComponent()) {
+        const ON_ModelGeometryComponent* mgc = ON_ModelGeometryComponent::Cast(mc);
+        if (!mgc) continue;
+        const ON_Geometry* geom = mgc->Geometry(nullptr);
+        if (!geom || geom->ObjectType() != ON::light_object) continue;
+        const ON_Light* l2 = ON_Light::Cast(geom);
+        if (!l2) continue;
+        if (l2->m_light_name == ON_wString(L"Sun")) {
+            EXPECT_TRUE(l2->IsEnabled());
+            EXPECT_EQ(l2->m_diffuse.Red(), 255);
+            EXPECT_EQ(l2->m_diffuse.Green(), 255);
+            lightFound = true;
+        }
+    }
+    EXPECT_TRUE(lightFound);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -815,6 +1035,11 @@ int main()
     TestPointCloudRoundTrip();
     TestTextAnnotationRoundTrip();
     TestTextureMapRoundTrip();
+    TestUUIDRoundTrip();
+    TestURLRoundTrip();
+    TestGroupRoundTrip();
+    TestClippingPlaneRoundTrip();
+    TestLightRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;

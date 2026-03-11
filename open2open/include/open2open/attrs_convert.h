@@ -42,12 +42,15 @@ Handle(TDocStd_Document) CreateXCAFDocument();
 /// All B-Rep geometry objects in the model are converted to TopoDS_Shape and
 /// added to the XCAF ShapeTool.  Per-object attributes are propagated as:
 ///
-/// | openNURBS source                         | XCAF destination            |
-/// |------------------------------------------|-----------------------------|
-/// | `ON_3dmObjectAttributes::m_name`         | `TDataStd_Name` on label    |
-/// | `ON_3dmObjectAttributes::m_color`        | `XCAFDoc_ColorTool` (Gen)   |
-/// | `ON_3dmObjectAttributes::m_layer_index`  | `XCAFDoc_LayerTool`         |
-/// | `ON_3dmObjectAttributes::m_material_index`| `XCAFDoc_MaterialTool`     |
+/// | openNURBS source                         | XCAF destination                      |
+/// |------------------------------------------|---------------------------------------|
+/// | `ON_3dmObjectAttributes::m_name`         | `TDataStd_Name` on shape label        |
+/// | `ON_3dmObjectAttributes::m_color`        | `XCAFDoc_ColorTool` (Gen)             |
+/// | `ON_3dmObjectAttributes::m_layer_index`  | `XCAFDoc_LayerTool`                   |
+/// | `ON_3dmObjectAttributes::m_material_index`| `XCAFDoc_MaterialTool`               |
+/// | `ON_3dmObjectAttributes::m_uuid`         | `TDataStd_Comment` METADATA child     |
+/// | `ON_3dmObjectAttributes::m_url`          | `TDataStd_Comment` METADATA child     |
+/// | `ON_3dmObjectAttributes::m_group[]`      | `TDataStd_Comment` METADATA child     |
 ///
 /// Layer entries are created from the model's layer table, including the
 /// layer colour stored as a `XCAFDoc_ColorTool` entry on the layer label.
@@ -66,7 +69,14 @@ Handle(TDocStd_Document) CreateXCAFDocument();
 ///   - Each `ON_InstanceRef` → XCAF component with `TopLoc_Location` derived
 ///     from `m_xform`.  Instance refs are collected under a "Scene" assembly.
 ///
-/// Mesh objects (ON_Mesh) in the model are currently skipped.
+/// Clipping planes (P6):
+///   - Each `ON_ClippingPlaneSurface` → `XCAFDoc_ClippingPlaneTool` entry.
+///
+/// Lights (P6):
+///   - Each `ON_Light` → serialised `TDataStd_Comment` child of doc root.
+///
+/// Point clouds, SubD control nets and mesh objects are represented as
+/// vertex-only OCCT compounds.
 ///
 /// @param model  Source openNURBS model.
 /// @param tol    Linear tolerance forwarded to ON_BrepToOCCT.
@@ -85,6 +95,9 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model,
 /// | `XCAFDoc_ColorTool` (Gen/Surf)           | `m_color` + `color_from_object`   |
 /// | `XCAFDoc_LayerTool`                      | `ON_Layer` + `m_layer_index`      |
 /// | `XCAFDoc_MaterialTool`                   | `ON_Material` + `m_material_index`|
+/// | `TDataStd_Comment` METADATA child        | `m_uuid`, `m_url`, `m_group[]`    |
+/// | `XCAFDoc_ClippingPlaneTool`              | `ON_ClippingPlaneSurface`         |
+/// | `TDataStd_Comment` "LIGHT:…" on root    | `ON_Light`                        |
 ///
 /// Layer colours are read from the `XCAFDoc_ColorTool` attribute stored on
 /// the layer label.  The model's unit system is initialised from the
