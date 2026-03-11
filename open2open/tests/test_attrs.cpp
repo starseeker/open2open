@@ -470,6 +470,87 @@ static void TestInstanceRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 5b: Multi-level assembly round-trip (P3 — iterative resolution)
+// ---------------------------------------------------------------------------
+// Build a 3-level hierarchy in XCAF:
+//   RootAsm (free/top-level)  →  SubAsm (non-free)  →  Leaf (simple shape)
+// In openNURBS terms:
+//   SubAsm  → ON_InstanceDefinition (block def containing the leaf shape)
+//   RootAsm component → scene-level ON_InstanceRef pointing to SubAsm's idef
+// The iterative Phase A resolves SubAsm before the top-level Phase B creates
+// the scene-level iref, ensuring correct multi-level assembly import.
+// ---------------------------------------------------------------------------
+static void TestMultiLevelAssembly()
+{
+    std::printf("--- Test 5b: multi-level assembly round-trip\n");
+
+    // ---- Build source XCAF document with a 3-level assembly ----
+    Handle(TDocStd_Document) doc = open2open::CreateXCAFDocument();
+    Handle(XCAFDoc_ShapeTool) st =
+        XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+
+    // Leaf shape: a 10×10×10 box
+    TopoDS_Shape leafShape = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+
+    // Level 1: leaf → free simple shape
+    TDF_Label leafLabel = st->AddShape(leafShape, /*makeAssembly=*/Standard_False);
+    TDataStd_Name::Set(leafLabel, TCollection_ExtendedString("Leaf", Standard_True));
+
+    // Level 2: SubAsm — assembly containing one component (the leaf)
+    TDF_Label subAsmLabel = st->NewShape();
+    TDataStd_Name::Set(subAsmLabel, TCollection_ExtendedString("SubAsm", Standard_True));
+    {
+        TopLoc_Location id;
+        st->AddComponent(subAsmLabel, leafLabel, id);
+    }
+
+    // Level 3: RootAsm — assembly containing one component (SubAsm) with a translation
+    TDF_Label rootAsmLabel = st->NewShape();
+    TDataStd_Name::Set(rootAsmLabel, TCollection_ExtendedString("RootAsm", Standard_True));
+    {
+        gp_Trsf tr;
+        tr.SetTranslation(gp_Vec(100.0, 0.0, 0.0));
+        TopLoc_Location loc(tr);
+        st->AddComponent(rootAsmLabel, subAsmLabel, loc);
+    }
+
+    // ---- Convert XCAF → ONX_Model ----
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Expect at least 1 ON_InstanceDefinition object (SubAsm)
+    int idefCount = 0;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::InstanceDefinition);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr; mc = it.NextComponent())
+            ++idefCount;
+    }
+    EXPECT_TRUE(idefCount >= 1); // at least SubAsm idef
+
+    // Expect at least 1 scene-level ON_InstanceRef (placed from RootAsm)
+    int irefCount = 0;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr; mc = it.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* g = mgc->Geometry(nullptr);
+            if (g && g->ObjectType() == ON::instance_reference)
+                ++irefCount;
+        }
+    }
+    EXPECT_TRUE(irefCount >= 1); // at least 1 scene-level iref
+}
+
+
+// ---------------------------------------------------------------------------
 // Test 6: Named views round-trip (P3)
 // ---------------------------------------------------------------------------
 static void TestNamedViewRoundTrip()
@@ -1030,6 +1111,7 @@ int main()
     TestXCAFToModel();
     TestNullDoc();
     TestInstanceRoundTrip();
+    TestMultiLevelAssembly();
     TestNamedViewRoundTrip();
     TestLayerHierarchyRoundTrip();
     TestPointCloudRoundTrip();

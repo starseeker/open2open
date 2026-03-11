@@ -1346,92 +1346,144 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
     // -----------------------------------------------------------------------
     // P3: Assemblies → ON_InstanceDefinition + ON_InstanceRef
     //
-    // Algorithm uses ALL shape labels (not just free ones), in two sub-passes:
+    // Algorithm uses ALL shape labels (not just free ones), in two phases:
     //
-    // Sub-pass A: "block definition" assemblies — assemblies whose direct
-    //   components refer only to simple shapes already in labelTagToGeomUuid.
-    //   → Create one ON_InstanceDefinition per such assembly.
-    //   → Populate asmTagToIdefUuid for sub-pass B.
+    // Phase A (iterative): resolve assemblies bottom-up.  On each iteration,
+    //   find assemblies whose ALL directly-referred shapes are "resolved" —
+    //   meaning they are either simple shapes (in labelTagToGeomUuid) or
+    //   already-converted sub-assemblies (in asmTagToIdefUuid).
+    //   For sub-assembly components, create intermediate ON_InstanceRef objects
+    //   embedded inside the new block definition.
+    //   Repeat until no new assemblies can be resolved (handles arbitrary depth).
     //
-    // Sub-pass B: "scene" assemblies — assemblies whose components refer to
-    //   other assemblies (block definitions from sub-pass A).
-    //   → Create one ON_InstanceRef per such component.
-    //
-    // Both sub-passes iterate ALL shape labels so non-free assemblies (e.g.
-    // a block definition that is itself used as a component) are handled.
+    // Phase B: for each free assembly NOT yet resolved as a block definition
+    //   (top-level "scene" assemblies), create scene-level ON_InstanceRef objects
+    //   for components that reference resolved sub-assembly block definitions.
     // -----------------------------------------------------------------------
 
     // Collect ALL shape labels (free + non-free)
     TDF_LabelSequence allShapes;
     shapeTool->GetShapes(allShapes);
 
-    // asmTag → ON_UUID of the corresponding ON_InstanceDefinition (sub-pass A)
+    // asmTag → ON_UUID of the corresponding ON_InstanceDefinition
     std::map<Standard_Integer, ON_UUID> asmTagToIdefUuid;
 
-    // Sub-pass A: block definition assemblies
-    for (Standard_Integer i = 1; i <= allShapes.Length(); ++i) {
-        const TDF_Label& asmLabel = allShapes.Value(i);
-        if (!XCAFDoc_ShapeTool::IsAssembly(asmLabel))
-            continue;
-        // Skip if already processed
-        if (asmTagToIdefUuid.count(asmLabel.Tag()))
-            continue;
-
-        TDF_LabelSequence components;
-        XCAFDoc_ShapeTool::GetComponents(asmLabel, components,
-                                          /*getsubchilds=*/Standard_False);
-        if (components.IsEmpty())
-            continue;
-
-        // Check that ALL direct referred shapes are simple (in labelTagToGeomUuid)
-        bool allSimple = true;
-        for (Standard_Integer j = 1; j <= components.Length(); ++j) {
-            TDF_Label refLbl;
-            if (!XCAFDoc_ShapeTool::GetReferredShape(
-                    components.Value(j), refLbl)) {
-                allSimple = false; break;
-            }
-            if (!labelTagToGeomUuid.count(refLbl.Tag())) {
-                allSimple = false; break;
-            }
+    // Build a set of "free" (top-level) assembly tags.
+    // Free assemblies serve as scene containers — they should NOT be turned
+    // into block definitions; their components become scene-level irefs.
+    std::set<Standard_Integer> freeAsmTags;
+    {
+        TDF_LabelSequence frees;
+        shapeTool->GetFreeShapes(frees);
+        for (Standard_Integer i = 1; i <= frees.Length(); ++i) {
+            const TDF_Label& fl = frees.Value(i);
+            if (XCAFDoc_ShapeTool::IsAssembly(fl))
+                freeAsmTags.insert(fl.Tag());
         }
-        if (!allSimple)
-            continue;
-
-        // Build member UUID list (unique per referred shape)
-        ON_SimpleArray<ON_UUID> memberUuids;
-        std::set<Standard_Integer> seen;
-        for (Standard_Integer j = 1; j <= components.Length(); ++j) {
-            TDF_Label refLbl;
-            XCAFDoc_ShapeTool::GetReferredShape(components.Value(j), refLbl);
-            Standard_Integer tag = refLbl.Tag();
-            if (seen.insert(tag).second)
-                memberUuids.Append(labelTagToGeomUuid.at(tag));
-        }
-        if (memberUuids.Count() == 0)
-            continue;
-
-        ON_wString idefName;
-        {
-            Handle(TDataStd_Name) na;
-            if (asmLabel.FindAttribute(TDataStd_Name::GetID(), na))
-                idefName = ExtToONw(na->Get());
-        }
-
-        ON_InstanceDefinition* idef = new ON_InstanceDefinition();
-        idef->SetName(idefName.IsNotEmpty() ? (const wchar_t*)idefName : L"Block");
-        idef->SetInstanceGeometryIdList(memberUuids);
-        ON_ModelComponentReference idefRef =
-            model.AddManagedModelComponent(idef, /*resolve conflicts=*/false);
-        asmTagToIdefUuid[asmLabel.Tag()] = idefRef.ModelComponent()->Id();
     }
 
-    // Sub-pass B: scene assemblies — components that refer to block definitions
+    // Helper: get ON_InstanceDefinition name from a XCAF assembly label.
+    auto getAsmName = [&](const TDF_Label& lbl) -> ON_wString {
+        Handle(TDataStd_Name) na;
+        if (lbl.FindAttribute(TDataStd_Name::GetID(), na))
+            return ExtToONw(na->Get());
+        return ON_wString();
+    };
+
+    // Phase A — iterative bottom-up resolution of block definitions.
+    // Only considers NON-FREE assemblies (block definitions, not scene containers).
+    bool madeProgress = true;
+    while (madeProgress) {
+        madeProgress = false;
+        for (Standard_Integer i = 1; i <= allShapes.Length(); ++i) {
+            const TDF_Label& asmLabel = allShapes.Value(i);
+            if (!XCAFDoc_ShapeTool::IsAssembly(asmLabel))
+                continue;
+            if (asmTagToIdefUuid.count(asmLabel.Tag()))
+                continue; // already resolved
+            // Skip free (scene-container) assemblies — handled in Phase B
+            if (freeAsmTags.count(asmLabel.Tag()))
+                continue;
+
+            TDF_LabelSequence components;
+            XCAFDoc_ShapeTool::GetComponents(asmLabel, components,
+                                              /*getsubchilds=*/Standard_False);
+            if (components.IsEmpty())
+                continue;
+
+            // Check that ALL direct referred shapes are resolved
+            bool allResolved = true;
+            for (Standard_Integer j = 1; j <= components.Length(); ++j) {
+                TDF_Label refLbl;
+                if (!XCAFDoc_ShapeTool::GetReferredShape(
+                        components.Value(j), refLbl)) {
+                    allResolved = false; break;
+                }
+                if (!labelTagToGeomUuid.count(refLbl.Tag()) &&
+                    !asmTagToIdefUuid.count(refLbl.Tag())) {
+                    allResolved = false; break;
+                }
+            }
+            if (!allResolved)
+                continue;
+
+            // Build member UUID list.
+            // For sub-assembly components: create embedded ON_InstanceRef.
+            // For simple shapes: use their brep UUID directly.
+            ON_SimpleArray<ON_UUID> memberUuids;
+            for (Standard_Integer j = 1; j <= components.Length(); ++j) {
+                const TDF_Label& compLabel = components.Value(j);
+                TDF_Label refLbl;
+                XCAFDoc_ShapeTool::GetReferredShape(compLabel, refLbl);
+                Standard_Integer refTag = refLbl.Tag();
+
+                if (auto itIdef = asmTagToIdefUuid.find(refTag);
+                    itIdef != asmTagToIdefUuid.end()) {
+                    // Sub-assembly component: create an embedded ON_InstanceRef
+                    TopLoc_Location loc = XCAFDoc_ShapeTool::GetLocation(compLabel);
+                    ON_Xform xform = loc.IsIdentity()
+                        ? ON_Xform::IdentityTransformation
+                        : GpTrsfToONXform(loc.Transformation());
+
+                    ON_InstanceRef* subRef = new ON_InstanceRef();
+                    subRef->m_instance_definition_uuid = itIdef->second;
+                    subRef->m_xform = xform;
+
+                    ON_3dmObjectAttributes* subAttrs = new ON_3dmObjectAttributes();
+                    Handle(TDataStd_Name) cn;
+                    if (compLabel.FindAttribute(TDataStd_Name::GetID(), cn))
+                        subAttrs->m_name = ExtToONw(cn->Get());
+
+                    ON_ModelComponentReference subRefMcr =
+                        model.AddManagedModelGeometryComponent(subRef, subAttrs);
+                    if (!subRefMcr.IsEmpty())
+                        memberUuids.Append(subRefMcr.ModelComponent()->Id());
+                } else {
+                    // Simple shape component
+                    memberUuids.Append(labelTagToGeomUuid.at(refTag));
+                }
+            }
+            if (memberUuids.Count() == 0)
+                continue;
+
+            ON_wString idefName = getAsmName(asmLabel);
+            ON_InstanceDefinition* idef = new ON_InstanceDefinition();
+            idef->SetName(idefName.IsNotEmpty() ? (const wchar_t*)idefName : L"Block");
+            idef->SetInstanceGeometryIdList(memberUuids);
+            ON_ModelComponentReference idefRef =
+                model.AddManagedModelComponent(idef, /*resolve conflicts=*/false);
+            asmTagToIdefUuid[asmLabel.Tag()] = idefRef.ModelComponent()->Id();
+            madeProgress = true;
+        }
+    }
+
+    // Phase B: scene assemblies — create scene-level ON_InstanceRef for each
+    // free assembly that references a resolved block definition.
     for (Standard_Integer i = 1; i <= allShapes.Length(); ++i) {
         const TDF_Label& asmLabel = allShapes.Value(i);
         if (!XCAFDoc_ShapeTool::IsAssembly(asmLabel))
             continue;
-        // Skip block definitions (already handled) and unrecognised assemblies
+        // Skip block definitions that are entirely expressed as idefs
         if (asmTagToIdefUuid.count(asmLabel.Tag()))
             continue;
 
