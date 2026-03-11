@@ -128,6 +128,20 @@ if(_HAVE_XCAF)
     list(APPEND _OPEN2OPEN_SOURCES src/attrs_convert.cpp)
 endif()
 
+# fcstd_convert.cpp requires libzip (for ZIP reading) + OCCT LDOM (TKernel).
+# LDOM is always part of TKernel so no extra link flags are needed beyond -lzip.
+# The module is also optional: silently skip if libzip is not installed.
+find_library(_LIBZIP_LIB NAMES zip DOC "libzip library")
+find_path(_LIBZIP_INC zip.h DOC "libzip header directory")
+if(_LIBZIP_LIB AND _LIBZIP_INC)
+    list(APPEND _OPEN2OPEN_SOURCES src/fcstd_convert.cpp)
+    set(_HAVE_LIBZIP ON)
+    message(STATUS "open2open: FreeCAD FCStd support enabled (libzip found: ${_LIBZIP_LIB})")
+else()
+    set(_HAVE_LIBZIP OFF)
+    message(STATUS "open2open: FreeCAD FCStd support disabled (libzip not found)")
+endif()
+
 add_library(open2open STATIC ${_OPEN2OPEN_SOURCES})
 
 target_include_directories(open2open
@@ -161,6 +175,13 @@ if(_HAVE_XCAF)
     target_link_libraries(open2open PRIVATE
         "$<LINK_GROUP:RESCAN,${_XCAF_LINK_LIBS},TKBO>"
     )
+endif()
+
+# Expose FCStd / libzip availability to all consumers of the library.
+if(_HAVE_LIBZIP)
+    target_compile_definitions(open2open PUBLIC OPEN2OPEN_HAVE_LIBZIP)
+    target_include_directories(open2open PRIVATE "${_LIBZIP_INC}")
+    target_link_libraries(open2open PRIVATE "${_LIBZIP_LIB}")
 endif()
 
 # ---------------------------------------------------------------------------

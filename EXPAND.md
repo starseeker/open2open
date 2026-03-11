@@ -119,7 +119,7 @@ OCCT's native data model and the XCAF document framework provide:
 | Texture maps | 🔲 | ❌ | Low | openNURBS embeds texture paths; OCCT/XCAF has no standard texture mapping |
 | Physically-based materials | ❌ | ❌ | None | Rhino PBR data is proprietary; FreeCAD uses Arch material properties |
 | Vertex colors (mesh) | 🟨 | ❌ | None | `ON_Mesh::m_C[]` has no `Poly_Triangulation` equivalent |
-| Per-face FreeCAD colours | 🔲 | 🟨 | Medium | FreeCAD `DiffuseColor` binary files ↔ per-face XCAF colour |
+| Per-face FreeCAD colours | ✅ | 🟨 | Medium | FreeCAD `DiffuseColor` binary files ↔ per-face XCAF colour |
 | Render content (Rhino plug-in) | ❌ | ❌ | None | Proprietary rendering engine data |
 
 ### 2.3 Hierarchy and Organisation
@@ -213,7 +213,7 @@ with both APIs:
 | P1 | ~~**Object display colour**~~ | ~~Done~~ | XCAF `XCAFDoc_Color` |
 | P1 | ~~**Layer name and colour**~~ | ~~Done~~ | `XCAFDoc_LayerTool`, `ON_Layer` |
 | P2 | ~~**Basic material (diffuse, transparency)**~~ | ~~Done~~ | `XCAFDoc_MaterialTool`, `ON_Material` |
-| P2 | **FreeCAD per-face colours** (`DiffuseColor` binary) | 2–3 d | Custom ZIP + binary parser |
+| P2 | ~~**FreeCAD per-face colours** (`DiffuseColor` binary)~~ | ~~Done~~ | Custom ZIP + binary parser |
 | P2 | ~~**Document metadata** (title, author, date)~~ | ~~Done~~ | `ON_3dmProperties`, TDocStd header |
 | P2 | ~~**Units and tolerance**~~ | ~~Done~~ | `ON_3dmSettings`, XCAF units |
 | P3 | **Instance definitions / blocks** | 5–8 d | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
@@ -317,13 +317,13 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] Polygon mesh round-trip (triangles, quads, normals, UV)
 
 ### Phase 2 — Basic attributes (P1/P2 items above)
-- [ ] Object name in `ON_3dmObjectAttributes` ↔ TDF label / XCAF Name
-- [ ] Object display colour ↔ `XCAFDoc_Color`
-- [ ] Layer name and colour ↔ `XCAFDoc_LayerTool`
-- [ ] Basic material (diffuse colour, transparency)
-- [ ] FreeCAD per-face `DiffuseColor` binary parser
-- [ ] Document title, author, creation date
-- [ ] Unit system and linear tolerance
+- [x] Object name in `ON_3dmObjectAttributes` ↔ TDF label / XCAF Name
+- [x] Object display colour ↔ `XCAFDoc_Color`
+- [x] Layer name and colour ↔ `XCAFDoc_LayerTool`
+- [x] Basic material (diffuse colour, transparency)
+- [x] FreeCAD per-face `DiffuseColor` binary parser (`fcstd_convert` module)
+- [x] Document title, author, creation date
+- [x] Unit system and linear tolerance
 
 ### Phase 3 — Structure (P3 items)
 - [ ] Block instances / assembly references
@@ -390,3 +390,5 @@ topology is needed, an ngon-aware mesh container should be used.
 | NURBS geometry | `open2open/geom_convert.h` | `ON_NurbsCurveToOCCT`, `ON_NurbsCurve2dToOCCT`, `ON_NurbsSurfaceToOCCT`, `OCCTCurveToON`, `OCCTSurfaceToON` |
 | B-Rep topology | `open2open/brep_convert.h` | `ON_BrepToOCCT`, `OCCTToON_Brep` |
 | Polygon mesh | `open2open/mesh_convert.h` | `ON_MeshToOCCT`, `OCCTToON_Mesh` |
+| Attributes & metadata | `open2open/attrs_convert.h` | `CreateXCAFDocument`, `ONX_ModelToXCAFDoc`, `XCAFDocToONX_Model` |
+| FreeCAD FCStd reader | `open2open/fcstd_convert.h` | `ParseDiffuseColors`, `ReadFcstdDoc` |

@@ -30,6 +30,13 @@ add_executable(test_attrs test_attrs.cpp)
 target_link_libraries(test_attrs PRIVATE open2open TKPrim)
 add_test(NAME test_attrs COMMAND test_attrs)
 
+# FreeCAD FCStd attribute / per-face colour extraction test (Phase 2 — P2 item).
+# Requires OPEN2OPEN_HAVE_LIBZIP (set when libzip is found by the library build).
+# When available the test reads two FCStd files from phasma-mech-assembly/.
+add_executable(test_fcstd_attrs test_fcstd_attrs.cpp)
+target_link_libraries(test_fcstd_attrs PRIVATE open2open)
+add_test(NAME test_fcstd_attrs COMMAND test_fcstd_attrs)
+
 # Round-trip tests for the openNURBS 3dm example files.
 # The example_files directory is expected to be at
 # ${CMAKE_SOURCE_DIR}/../opennurbs-8.24.25281.15001/example_files
