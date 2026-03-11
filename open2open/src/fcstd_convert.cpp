@@ -507,13 +507,14 @@ int ONX_ModelToFCStdFile(const std::string& path,
 {
     // Collect geometry objects
     struct ShapeEntry {
-        std::string name;
-        std::string label;
-        std::string brp_file; // e.g. "PartShape.brp"
-        ON_Color    color;
+        std::string          name;
+        std::string          label;
+        std::string          brp_file;        ///< e.g. "PartShape.brp"
+        std::string          diffuse_file;    ///< e.g. "DiffuseColor" (may be empty)
+        ON_Color             color;
+        std::vector<FcstdColor> face_colors;  ///< per-face colours (FreeCAD convention)
     };
     std::vector<ShapeEntry> entries;
-    // We'll store BRep content in parallel
     std::vector<std::string> brp_contents;
 
     {
@@ -573,7 +574,41 @@ int ONX_ModelToFCStdFile(const std::string& path,
                     ? attrs->m_color
                     : ON_Color(200, 200, 200);
 
-            entries.push_back({internalName, label, brpFile, color});
+            // Per-face colours from ON_BrepFace::PerFaceColor()
+            std::vector<FcstdColor> faceColors;
+            if (brep) {
+                const int nf = brep->m_F.Count();
+                bool hasPerFace = false;
+                for (int fi = 0; fi < nf; ++fi) {
+                    if (brep->m_F[fi].PerFaceColor() != ON_Color::UnsetColor) {
+                        hasPerFace = true;
+                        break;
+                    }
+                }
+                if (hasPerFace) {
+                    faceColors.resize(static_cast<size_t>(nf));
+                    for (int fi = 0; fi < nf; ++fi) {
+                        ON_Color fc = brep->m_F[fi].PerFaceColor();
+                        if (fc == ON_Color::UnsetColor) fc = color;
+                        // Pack as 0xRRGGBBAA (FreeCAD: alpha=0=opaque)
+                        std::uint32_t packed =
+                            ((std::uint32_t)fc.Red()   << 24) |
+                            ((std::uint32_t)fc.Green() << 16) |
+                            ((std::uint32_t)fc.Blue()  <<  8) |
+                            0u; // alpha=0 = opaque in FreeCAD
+                        faceColors[static_cast<size_t>(fi)] = packed;
+                    }
+                }
+            }
+
+            std::string diffuseFile;
+            if (!faceColors.empty()) {
+                diffuseFile = (shapeIdx == 0) ? "DiffuseColor"
+                    : "DiffuseColor" + std::to_string(shapeIdx);
+            }
+
+            entries.push_back({internalName, label, brpFile, diffuseFile,
+                                color, std::move(faceColors)});
             brp_contents.push_back(std::move(brp_content));
             ++shapeIdx;
         }
@@ -620,11 +655,18 @@ int ONX_ModelToFCStdFile(const std::string& path,
         char hexColor[16];
         std::snprintf(hexColor, sizeof(hexColor), "0x%02X%02X%02X00",
                       e.color.Red(), e.color.Green(), e.color.Blue());
+        const int propCount = e.diffuse_file.empty() ? 1 : 2;
         guiXml << "    <ViewProvider name=\"" << e.name << "\">\n";
-        guiXml << "      <Properties Count=\"1\">\n";
+        guiXml << "      <Properties Count=\"" << propCount << "\">\n";
         guiXml << "        <Property name=\"ShapeColor\" type=\"App::PropertyColor\">\n";
         guiXml << "          <PropertyColor value=\"" << hexColor << "\"/>\n";
         guiXml << "        </Property>\n";
+        if (!e.diffuse_file.empty()) {
+            guiXml << "        <Property name=\"DiffuseColor\""
+                      " type=\"App::PropertyColorList\">\n";
+            guiXml << "          <ColorList file=\"" << e.diffuse_file << "\"/>\n";
+            guiXml << "        </Property>\n";
+        }
         guiXml << "      </Properties>\n";
         guiXml << "    </ViewProvider>\n";
     }
@@ -648,6 +690,31 @@ int ONX_ModelToFCStdFile(const std::string& path,
         for (size_t i = 0; i < entries.size(); ++i) {
             if (ZipAddStringEntry(raw_zip, entries[i].brp_file, brp_contents[i]))
                 ++nWritten;
+            // Per-face DiffuseColor binary blob
+            if (!entries[i].diffuse_file.empty() &&
+                !entries[i].face_colors.empty())
+            {
+                const auto& fc = entries[i].face_colors;
+                // Write: uint32 count (LE) + count * uint32 (LE, 0xRRGGBBAA)
+                std::uint32_t count = static_cast<std::uint32_t>(fc.size());
+                std::string blob;
+                blob.resize(4 + count * 4);
+                auto* p = reinterpret_cast<unsigned char*>(&blob[0]);
+                p[0] = count & 0xFF;
+                p[1] = (count >> 8) & 0xFF;
+                p[2] = (count >> 16) & 0xFF;
+                p[3] = (count >> 24) & 0xFF;
+                p += 4;
+                for (std::uint32_t ci = 0; ci < count; ++ci) {
+                    std::uint32_t v = fc[ci];
+                    p[0] = v & 0xFF;
+                    p[1] = (v >> 8) & 0xFF;
+                    p[2] = (v >> 16) & 0xFF;
+                    p[3] = (v >> 24) & 0xFF;
+                    p += 4;
+                }
+                ZipAddStringEntry(raw_zip, entries[i].diffuse_file, blob);
+            }
         }
     }
 
