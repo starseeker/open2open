@@ -82,6 +82,7 @@
 #include <XCAFDoc_Note.hxx>
 #include <TDataStd_Comment.hxx>
 #include <TDataStd_Real.hxx>
+#include <TDF_ChildIterator.hxx>
 
 // OCCT — GD&T / dimensioning
 #include <XCAFDoc_DimTolTool.hxx>
@@ -369,6 +370,26 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
 
             matLabelMap[idx]   = matLabel;
             matDiffuseMap[idx] = mat->Diffuse();
+
+            // P4: Embedded texture maps — store texture file references as
+            // TDataStd_Comment attributes on the material label.
+            // Format: "TEXTURE:<type_int>:<full_path>"
+            // Multiple textures → multiple attributes on successive sub-labels.
+            for (int ti = 0; ti < mat->m_textures.Count(); ++ti) {
+                const ON_Texture& tex = mat->m_textures[ti];
+                const ON_wString& fp = tex.m_image_file_reference.FullPath();
+                if (fp.IsEmpty()) continue;
+                ON_String fpUtf8;
+                fpUtf8 = fp;
+                ON_String entry;
+                entry.Format("TEXTURE:%u:%s",
+                             static_cast<unsigned>(tex.m_type),
+                             fpUtf8.Array());
+                // Create a child label per texture
+                TDF_Label texLabel = matLabel.NewChild();
+                TDataStd_Comment::Set(texLabel,
+                    TCollection_ExtendedString(entry.Array(), Standard_True));
+            }
         }
     }
 
@@ -924,6 +945,38 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             ON_Material mat;
             if (!hName.IsNull() && !hName->IsEmpty()) {
                 mat.SetName(ON_wString(hName->ToCString()));
+            }
+
+            // P4: Restore texture file references stored as TDataStd_Comment
+            // on child labels of the material label.
+            for (TDF_ChildIterator ci(ml); ci.More(); ci.Next()) {
+                const TDF_Label& texLbl = ci.Value();
+                Handle(TDataStd_Comment) cmt;
+                if (!texLbl.FindAttribute(TDataStd_Comment::GetID(), cmt))
+                    continue;
+                ON_wString entry = ExtToONw(cmt->Get());
+                // Format: "TEXTURE:<type_int>:<path>"
+                if (entry.Left(8) != L"TEXTURE:") continue;
+                const int firstColon = entry.Find(L':', 8);
+                if (firstColon < 0) continue;
+                ON_wString typeStr = entry.Mid(8, firstColon - 8);
+                ON_wString pathStr = entry.Mid(firstColon + 1);
+                if (pathStr.IsEmpty()) continue;
+
+                unsigned typeUint = 0;
+                {
+                    ON_String ts;
+                    ts = typeStr;
+                    std::sscanf(ts.Array(), "%u", &typeUint);
+                }
+
+                ON_Texture tex;
+                tex.m_type = ON_Texture::TypeFromUnsigned(typeUint);
+                tex.m_image_file_reference =
+                    ON_FileReference::CreateFromFullPath(
+                        static_cast<const wchar_t*>(pathStr),
+                        false, false);
+                mat.AddTexture(tex);
             }
 
             const int matIdx = model.AddManagedModelComponent(

@@ -732,6 +732,75 @@ static void TestTextAnnotationRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 10: Embedded texture map round-trip (P4)
+// ---------------------------------------------------------------------------
+static void TestTextureMapRoundTrip()
+{
+    std::printf("--- Test 10: texture map round-trip\n");
+
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Add material with a texture reference
+    ON_Material* mat = new ON_Material();
+    mat->SetName(L"Painted");
+    mat->SetDiffuse(ON_Color(200, 100, 50));
+    {
+        ON_Texture tex;
+        tex.m_type = ON_Texture::TYPE::bitmap_texture;
+        tex.m_image_file_reference =
+            ON_FileReference::CreateFromFullPath(
+                L"/textures/wood.png", false, false);
+        mat->AddTexture(tex);
+    }
+    const int matIdx = src.AddManagedModelComponent(
+        mat, false).ModelComponentIndex();
+
+    // Add a box using this material
+    {
+        TopoDS_Shape s = BRepPrimAPI_MakeBox(5.0, 5.0, 5.0).Shape();
+        ON_Brep* brep = new ON_Brep();
+        open2open::OCCTToON_Brep(s, *brep, 1e-3);
+        ON_3dmObjectAttributes* a = new ON_3dmObjectAttributes();
+        a->m_name = L"Box";
+        a->m_material_index = matIdx;
+        src.AddManagedModelGeometryComponent(brep, a);
+    }
+
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    // Round-trip
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Check texture was restored
+    bool foundTexture = false;
+    {
+        ONX_ModelComponentIterator mit(dst,
+            ON_ModelComponent::Type::RenderMaterial);
+        for (const ON_ModelComponent* mc = mit.FirstComponent();
+             mc != nullptr; mc = mit.NextComponent())
+        {
+            const ON_Material* m = ON_Material::Cast(mc);
+            if (!m) continue;
+            if (m->m_textures.Count() >= 1) {
+                const ON_wString& fp =
+                    m->m_textures[0].m_image_file_reference.FullPath();
+                if (fp == ON_wString(L"/textures/wood.png")) {
+                    foundTexture = true;
+                    break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(foundTexture);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -745,6 +814,7 @@ int main()
     TestLayerHierarchyRoundTrip();
     TestPointCloudRoundTrip();
     TestTextAnnotationRoundTrip();
+    TestTextureMapRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;

@@ -336,7 +336,7 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] SubD → mesh fallback (`ON_SubD::GetControlNetMesh` → vertex compound)
 - [x] Text annotations (`ON_Text`/`ON_Leader` ↔ `XCAFDoc_NotesTool` comment notes)
 - [x] GD&T / PMI annotations (`ON_Dimension` ↔ `XCAFDoc_DimTolTool`)
-- [ ] Embedded texture maps
+- [x] Embedded texture maps (`ON_Texture::m_image_file_reference` ↔ `TDataStd_Comment` on material child label)
 
 ### Phase 5 — Full FreeCAD ↔ 3dm pipeline
 - [ ] `fcstd_reader` module: ZIP + XML → ONX_Model
