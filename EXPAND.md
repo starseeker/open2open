@@ -104,8 +104,8 @@ OCCT's native data model and the XCAF document framework provide:
 | Polygon meshes | ✅ | ✅ | High | Implemented in `mesh_convert.h`; vertex colors dropped |
 | NURBS curves (2-D, trim) | ✅ | ✅ | Exact | Used internally for B-Rep |
 | Analytic surfaces (plane, cyl, cone, sphere, torus) | ✅ | ✅ | High | Converted to NURBS; sphere singularity handled |
-| Point clouds | 🔲 | 🔲 | Medium | openNURBS `ON_PointCloud` ↔ `TColgp_Array1OfPnt`; OCCT has no standard container |
-| SubD surfaces | 🔲 | ❌ | Low | openNURBS `ON_SubD` has no OCCT equivalent; tessellate to mesh as fallback |
+| Point clouds | ✅ | ✅ | Medium | `ON_PointCloud` ↔ `TopoDS_Compound` of vertices via `BRepBuilderAPI_MakeVertex` |
+| SubD surfaces | ✅ | ❌ | Low | `ON_SubD::GetControlNetMesh()` → vertex compound; no OCCT→SubD path |
 | Extrusions | 🟨 | 🟨 | Medium | openNURBS `ON_Extrusion` converted to B-Rep via `BrepForm()`; OCCT has no ON_Extrusion |
 
 ### 2.2 Colour and Material
@@ -116,7 +116,7 @@ OCCT's native data model and the XCAF document framework provide:
 | Layer colour | ✅ | ✅ | High | `ON_Layer::Color()` ↔ `XCAFDoc_Color` on layer label |
 | Diffuse / specular material | ✅ | ✅ | Medium | `ON_Material` fields ↔ `XCAFDoc_MaterialTool`; OCCT loses shine/emissive |
 | Transparency | ✅ | ✅ | High | Both systems store alpha 0–1 |
-| Texture maps | 🔲 | ❌ | Low | openNURBS embeds texture paths; OCCT/XCAF has no standard texture mapping |
+| Texture maps | ✅ | ✅ | Low | `ON_Texture::m_image_file_reference` ↔ `TDataStd_Comment` on material child label; path round-trips, image data not embedded |
 | Physically-based materials | ❌ | ❌ | None | Rhino PBR data is proprietary; FreeCAD uses Arch material properties |
 | Vertex colors (mesh) | 🟨 | ❌ | None | `ON_Mesh::m_C[]` has no `Poly_Triangulation` equivalent |
 | Per-face FreeCAD colours | ✅ | 🟨 | Medium | FreeCAD `DiffuseColor` binary files ↔ per-face XCAF colour |
@@ -142,8 +142,8 @@ OCCT's native data model and the XCAF document framework provide:
 | Author / company | ✅ | ✅ | High | `ON_3dmProperties::m_RevisionHistory` ↔ STEP file description |
 | UUID | 🔲 | 🔲 | High | `ON_3dmObjectAttributes::m_uuid` ↔ TDF label tag |
 | URL references | 🔲 | ❌ | Low | `ON_3dmObjectAttributes::m_url` has no standard OCCT field |
-| GD&T / PMI | 🔲 | 🔲 | Medium | `ON_Dimension` ↔ `XCAFDoc_DimTol`; styling may differ |
-| Text annotations | 🔲 | 🔲 | Medium | `ON_Text` ↔ `XCAFNoteObjects_Note`; font/style differences |
+| GD&T / PMI | ✅ | ✅ | Medium | `ON_Dimension` ↔ `XCAFDoc_DimTol`; styling may differ |
+| Text annotations | ✅ | ✅ | Medium | `ON_Text` ↔ `XCAFDoc_NotesTool` comment note; font/style differences |
 | Dimension styles | ❌ | ❌ | None | Rhino `ON_DimStyle` has no OCCT counterpart |
 | Units / tolerances | ✅ | ✅ | High | `ON_3dmSettings` ↔ XCAF unit and tolerance attributes |
 
@@ -329,7 +329,7 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] Block instances / assembly references (`ON_InstanceDefinition` + `ON_InstanceRef` ↔ XCAF assembly)
 - [x] Named views / cameras (`ON_3dmView` ↔ `XCAFDoc_ViewTool` + `XCAFView_Object`)
 - [x] Assembly hierarchy / layer nesting (`ON_Layer::ParentLayerId` ↔ XCAF `"Parent/Child"` encoded layer names)
-- [ ] GD&T / PMI annotations
+- [x] GD&T / PMI annotations (`ON_Dimension` ↔ `XCAFDoc_DimTolTool`; `ON_Text`/`ON_Leader` ↔ `XCAFDoc_NotesTool`)
 
 ### Phase 4 — Extended types (P4 items)
 - [x] Point clouds (`ON_PointCloud` ↔ OCCT `TopoDS_Compound` of vertices)
