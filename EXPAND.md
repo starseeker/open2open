@@ -104,56 +104,56 @@ OCCT's native data model and the XCAF document framework provide:
 | Polygon meshes | ✅ | ✅ | High | Implemented in `mesh_convert.h`; vertex colors dropped |
 | NURBS curves (2-D, trim) | ✅ | ✅ | Exact | Used internally for B-Rep |
 | Analytic surfaces (plane, cyl, cone, sphere, torus) | ✅ | ✅ | High | Converted to NURBS; sphere singularity handled |
-| Point clouds | 🔲 | 🔲 | Medium | openNURBS `ON_PointCloud` ↔ `TColgp_Array1OfPnt`; OCCT has no standard container |
-| SubD surfaces | 🔲 | ❌ | Low | openNURBS `ON_SubD` has no OCCT equivalent; tessellate to mesh as fallback |
+| Point clouds | ✅ | ✅ | Medium | `ON_PointCloud` ↔ `TopoDS_Compound` of vertices via `BRepBuilderAPI_MakeVertex` |
+| SubD surfaces | ✅ | ❌ | Low | `ON_SubD::GetControlNetMesh()` → vertex compound; no OCCT→SubD path |
 | Extrusions | 🟨 | 🟨 | Medium | openNURBS `ON_Extrusion` converted to B-Rep via `BrepForm()`; OCCT has no ON_Extrusion |
 
 ### 2.2 Colour and Material
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Object display colour | 🔲 | 🔲 | High | `ON_3dmObjectAttributes::m_color` ↔ `XCAFDoc_Color` RGBA |
-| Layer colour | 🔲 | 🔲 | High | `ON_Layer::Color()` ↔ `XCAFDoc_Color` on layer label |
-| Diffuse / specular material | 🔲 | 🔲 | Medium | `ON_Material` fields ↔ `XCAFDoc_MaterialTool`; OCCT loses shine/emissive |
-| Transparency | 🔲 | 🔲 | High | Both systems store alpha 0–1 |
-| Texture maps | 🔲 | ❌ | Low | openNURBS embeds texture paths; OCCT/XCAF has no standard texture mapping |
+| Object display colour | ✅ | ✅ | High | `ON_3dmObjectAttributes::m_color` ↔ `XCAFDoc_Color` RGBA |
+| Layer colour | ✅ | ✅ | High | `ON_Layer::Color()` ↔ `XCAFDoc_Color` on layer label |
+| Diffuse / specular material | ✅ | ✅ | Medium | `ON_Material` fields ↔ `XCAFDoc_MaterialTool`; OCCT loses shine/emissive |
+| Transparency | ✅ | ✅ | High | Both systems store alpha 0–1 |
+| Texture maps | ✅ | ✅ | Low | `ON_Texture::m_image_file_reference` ↔ `TDataStd_Comment` on material child label; path round-trips, image data not embedded |
 | Physically-based materials | ❌ | ❌ | None | Rhino PBR data is proprietary; FreeCAD uses Arch material properties |
 | Vertex colors (mesh) | 🟨 | ❌ | None | `ON_Mesh::m_C[]` has no `Poly_Triangulation` equivalent |
-| Per-face FreeCAD colours | 🔲 | 🟨 | Medium | FreeCAD `DiffuseColor` binary files ↔ per-face XCAF colour |
+| Per-face FreeCAD colours | ✅ | 🟨 | Medium | FreeCAD `DiffuseColor` binary files ↔ per-face XCAF colour |
 | Render content (Rhino plug-in) | ❌ | ❌ | None | Proprietary rendering engine data |
 
 ### 2.3 Hierarchy and Organisation
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Object name | 🔲 | 🔲 | Exact | `ON_3dmObjectAttributes::m_name` ↔ `XCAFDoc_Name` / TDF label |
-| Layer hierarchy | 🔲 | 🔲 | High | `ON_Layer` parent/child ↔ `XCAFDoc_LayerTool` hierarchy |
-| Block instances (xref) | 🔲 | 🔲 | Medium | `ON_InstanceDefinition` + `ON_InstanceRef` ↔ `XCAFDoc_ShapeTool` compounds |
-| Assembly structure | 🔲 | 🔲 | Medium | XCAF product tree ↔ ON_Layer + block instances; semantic gap |
-| Groups | 🔲 | 🔲 | Medium | `ON_Group` ↔ XCAF compound or layer; groups are flat in openNURBS |
+| Object name | ✅ | ✅ | Exact | `ON_3dmObjectAttributes::m_name` ↔ `XCAFDoc_Name` / TDF label |
+| Layer hierarchy | ✅ | ✅ | High | `ON_Layer` parent/child ↔ `XCAFDoc_LayerTool` `"Parent/Child"` encoded names; two-pass read restores parent links |
+| Block instances (xref) | ✅ | ✅ | High | `ON_InstanceDefinition` + `ON_InstanceRef` ↔ `XCAFDoc_ShapeTool` assembly + located component |
+| Assembly structure | ✅ | ✅ | High | Non-free XCAF assemblies → `ON_InstanceDefinition`; iterative bottom-up Phase A resolves arbitrary-depth nesting; free (scene-level) assemblies → scene-level `ON_InstanceRef` |
+| Groups | ✅ | ✅ | Medium | `ON_Group` ↔ `TDataStd_Comment` METADATA child; groups stored by name; membership restored on read-back |
 | FreeCAD part design tree | ❌ | ❌ | None | Sketch + feature ops have no openNURBS equivalent |
-| FreeCAD `App::Part` containers | 🔲 | 🔲 | Medium | Translate to block instance / layer in 3dm |
+| FreeCAD `App::Part` containers | ✅ | ✅ | Medium | `App::Part` label → `ON_Layer` name in `FCStdFileToONX_Model`; `ONX_ModelToFCStdFile` emits layer as `App::Part` |
 
 ### 2.4 Metadata and Annotations
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Document title / description | 🔲 | 🔲 | High | `ON_3dmProperties::m_Notes` ↔ STEP header or TDocStd document name |
-| Author / company | 🔲 | 🔲 | High | `ON_3dmProperties::m_RevisionHistory` ↔ STEP file description |
-| UUID | 🔲 | 🔲 | High | `ON_3dmObjectAttributes::m_uuid` ↔ TDF label tag |
-| URL references | 🔲 | ❌ | Low | `ON_3dmObjectAttributes::m_url` has no standard OCCT field |
-| GD&T / PMI | 🔲 | 🔲 | Medium | `ON_Dimension` ↔ `XCAFDoc_DimTol`; styling may differ |
-| Text annotations | 🔲 | 🔲 | Medium | `ON_Text` ↔ `XCAFNoteObjects_Note`; font/style differences |
+| Document title / description | ✅ | ✅ | High | `ON_3dmProperties::m_Notes` ↔ STEP header or TDocStd document name |
+| Author / company | ✅ | ✅ | High | `ON_3dmProperties::m_RevisionHistory` ↔ STEP file description |
+| UUID | ✅ | ✅ | High | `ON_3dmObjectAttributes::m_uuid` ↔ `TDataStd_Comment` METADATA child on shape label |
+| URL references | ✅ | ✅ | Medium | `ON_3dmObjectAttributes::m_url` ↔ `TDataStd_Comment` METADATA child; no standard XCAF field |
+| GD&T / PMI | ✅ | ✅ | Medium | `ON_Dimension` ↔ `XCAFDoc_DimTol`; styling may differ |
+| Text annotations | ✅ | ✅ | Medium | `ON_Text` ↔ `XCAFDoc_NotesTool` comment note; font/style differences |
 | Dimension styles | ❌ | ❌ | None | Rhino `ON_DimStyle` has no OCCT counterpart |
-| Units / tolerances | 🔲 | 🔲 | High | `ON_3dmSettings` ↔ XCAF unit and tolerance attributes |
+| Units / tolerances | ✅ | ✅ | High | `ON_3dmSettings` ↔ XCAF unit and tolerance attributes |
 
 ### 2.5 Views and Rendering
 
 | Feature | ON→OCCT | OCCT→ON | Fidelity | Notes |
 |---|---|---|---|---|
-| Named views / cameras | 🔲 | 🔲 | Medium | `ON_3dmView` ↔ `XCAFDoc_ViewTool`; projection type differences |
-| Lights | 🔲 | ❌ | Low | `ON_Light` has no standard XCAF equivalent |
-| Clipping planes | 🔲 | 🔲 | Medium | `ON_ClippingPlaneObject` ↔ `XCAFDoc_ClippingPlaneTool` |
+| Named views / cameras | ✅ | ✅ | Medium | `ON_3dmView` ↔ `XCAFDoc_ViewTool` + `XCAFView_Object`; perspective + parallel; projection type preserved |
+| Lights | ✅ | ✅ | Medium | `ON_Light` ↔ `TDataStd_Comment` "LIGHT:…" children of doc root; style, colour, position, direction, enabled flag all round-trip |
+| Clipping planes | ✅ | ✅ | High | `ON_ClippingPlaneSurface` ↔ `XCAFDoc_ClippingPlaneTool::AddClippingPlane`; plane normal/origin preserved |
 | Preview image | 🟨 | 🟨 | Low | Thumbnails embedded differently in each format |
 
 ---
@@ -209,21 +209,26 @@ with both APIs:
 |---|---|---|---|
 | P0 | ~~B-Rep solids~~ | ~~Done~~ | — |
 | P0 | ~~Polygon mesh (tri/quad, normals, UV)~~ | ~~Done~~ | — |
-| P1 | **Object name / label** | 1–2 d | TDF label API |
-| P1 | **Object display colour** | 2–3 d | XCAF `XCAFDoc_Color` |
-| P1 | **Layer name and colour** | 3–5 d | `XCAFDoc_LayerTool`, `ON_Layer` |
-| P2 | **Basic material (diffuse, transparency)** | 3–5 d | `XCAFDoc_MaterialTool`, `ON_Material` |
-| P2 | **FreeCAD per-face colours** (`DiffuseColor` binary) | 2–3 d | Custom ZIP + binary parser |
-| P2 | **Document metadata** (title, author, date) | 1–2 d | `ON_3dmProperties`, TDocStd header |
-| P2 | **Units and tolerance** | 1–2 d | `ON_3dmSettings`, XCAF units |
-| P3 | **Instance definitions / blocks** | 5–8 d | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
-| P3 | **Assembly tree** | 7–10 d | XCAF product tree → ON_Layer hierarchy |
-| P3 | **GD&T / PMI annotations** | 8–12 d | `XCAFDoc_DimTol`, `ON_Dimension` |
-| P3 | **Named views / cameras** | 3–5 d | `XCAFDoc_ViewTool`, `ON_3dmView` |
-| P4 | **Point clouds** | 3–5 d | `ON_PointCloud` ↔ TColgp arrays |
-| P4 | **SubD → mesh fallback** | 2–4 d | `ON_SubD::GetMesh()` tessellation |
-| P4 | **Text annotations** | 5–8 d | `XCAFNoteObjects`, `ON_Text` |
-| P4 | **Texture maps** | 8–12 d | Embed images in both archives |
+| P1 | ~~**Object name / label**~~ | ~~Done~~ | TDF label API |
+| P1 | ~~**Object display colour**~~ | ~~Done~~ | XCAF `XCAFDoc_Color` |
+| P1 | ~~**Layer name and colour**~~ | ~~Done~~ | `XCAFDoc_LayerTool`, `ON_Layer` |
+| P2 | ~~**Basic material (diffuse, transparency)**~~ | ~~Done~~ | `XCAFDoc_MaterialTool`, `ON_Material` |
+| P2 | ~~**FreeCAD per-face colours** (`DiffuseColor` binary)~~ | ~~Done~~ | Custom ZIP + binary parser |
+| P2 | ~~**Document metadata** (title, author, date)~~ | ~~Done~~ | `ON_3dmProperties`, TDocStd header |
+| P2 | ~~**Units and tolerance**~~ | ~~Done~~ | `ON_3dmSettings`, XCAF units |
+| P3 | ~~**Instance definitions / blocks**~~ | ~~Done~~ | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
+| P3 | ~~**Assembly tree / layer hierarchy**~~ | ~~Done~~ | XCAF product tree ↔ ON_Layer + block instances; iterative Phase A handles arbitrary depth |
+| P3 | ~~**GD&T / PMI annotations**~~ | ~~Done~~ | `XCAFDoc_DimTol`, `ON_Dimension` |
+| P3 | ~~**Named views / cameras**~~ | ~~Done~~ | `XCAFDoc_ViewTool`, `ON_3dmView` |
+| P4 | ~~**Point clouds**~~ | ~~Done~~ | `ON_PointCloud` ↔ TColgp arrays |
+| P4 | ~~**SubD → mesh fallback**~~ | ~~Done~~ | `ON_SubD::GetMesh()` tessellation |
+| P4 | ~~**Text annotations**~~ | ~~Done~~ | `XCAFNoteObjects`, `ON_Text` |
+| P4 | ~~**Texture maps**~~ | ~~Done~~ | `TDataStd_Comment` on material child label |
+| P6 | ~~**UUID per object**~~ | ~~Done~~ | `TDataStd_Comment` METADATA child |
+| P6 | ~~**URL references**~~ | ~~Done~~ | `TDataStd_Comment` METADATA child |
+| P6 | ~~**Group membership**~~ | ~~Done~~ | `TDataStd_Comment` METADATA child (name-keyed) |
+| P6 | ~~**Clipping planes**~~ | ~~Done~~ | `XCAFDoc_ClippingPlaneTool` |
+| P6 | ~~**Lights**~~ | ~~Done~~ | `TDataStd_Comment` "LIGHT:…" on doc root |
 
 ---
 
@@ -317,32 +322,44 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] Polygon mesh round-trip (triangles, quads, normals, UV)
 
 ### Phase 2 — Basic attributes (P1/P2 items above)
-- [ ] Object name in `ON_3dmObjectAttributes` ↔ TDF label / XCAF Name
-- [ ] Object display colour ↔ `XCAFDoc_Color`
-- [ ] Layer name and colour ↔ `XCAFDoc_LayerTool`
-- [ ] Basic material (diffuse colour, transparency)
-- [ ] FreeCAD per-face `DiffuseColor` binary parser
-- [ ] Document title, author, creation date
-- [ ] Unit system and linear tolerance
+- [x] Object name in `ON_3dmObjectAttributes` ↔ TDF label / XCAF Name
+- [x] Object display colour ↔ `XCAFDoc_Color`
+- [x] Layer name and colour ↔ `XCAFDoc_LayerTool`
+- [x] Basic material (diffuse colour, transparency)
+- [x] FreeCAD per-face `DiffuseColor` binary parser (`fcstd_convert` module)
+- [x] Document title, author, creation date
+- [x] Unit system and linear tolerance
 
 ### Phase 3 — Structure (P3 items)
-- [ ] Block instances / assembly references
-- [ ] Assembly hierarchy (XCAF product tree ↔ layer nesting)
-- [ ] Named views / cameras
-- [ ] GD&T / PMI annotations
+- [x] Block instances / assembly references (`ON_InstanceDefinition` + `ON_InstanceRef` ↔ XCAF assembly)
+- [x] Named views / cameras (`ON_3dmView` ↔ `XCAFDoc_ViewTool` + `XCAFView_Object`)
+- [x] Assembly hierarchy / layer nesting (`ON_Layer::ParentLayerId` ↔ XCAF `"Parent/Child"` encoded layer names)
+- [x] GD&T / PMI annotations (`ON_Dimension` ↔ `XCAFDoc_DimTolTool`; `ON_Text`/`ON_Leader` ↔ `XCAFDoc_NotesTool`)
+- [x] Multi-level assembly resolution: iterative bottom-up Phase A resolves non-free assemblies of arbitrary depth; non-free → `ON_InstanceDefinition`, free (scene containers) → scene-level `ON_InstanceRef`
 
 ### Phase 4 — Extended types (P4 items)
-- [ ] Point clouds
-- [ ] SubD → mesh fallback
-- [ ] Text annotations
-- [ ] Embedded texture maps
+- [x] Point clouds (`ON_PointCloud` ↔ OCCT `TopoDS_Compound` of vertices)
+- [x] SubD → mesh fallback (`ON_SubD::GetControlNetMesh` → vertex compound)
+- [x] Text annotations (`ON_Text`/`ON_Leader` ↔ `XCAFDoc_NotesTool` comment notes)
+- [x] GD&T / PMI annotations (`ON_Dimension` ↔ `XCAFDoc_DimTolTool`)
+- [x] Embedded texture maps (`ON_Texture::m_image_file_reference` ↔ `TDataStd_Comment` on material child label)
 
 ### Phase 5 — Full FreeCAD ↔ 3dm pipeline
-- [ ] `fcstd_reader` module: ZIP + XML → ONX_Model
-- [ ] `fcstd_writer` module: ONX_Model → ZIP + XML
-- [ ] Per-face `DiffuseColor` round-trip
-- [ ] `App::Part` container → ON_Layer hierarchy
-- [ ] Integration test: `test_fcstd_3dm_roundtrip`
+- [x] `fcstd_reader` module: `FCStdFileToONX_Model(path, model)` — reads BRep entries from ZIP → `ON_Brep` objects with name/colour/layer attributes
+- [x] `fcstd_writer` module: `ONX_ModelToFCStdFile(path, model)` — writes ON_Brep objects as BRep text files + `Document.xml` + `GuiDocument.xml` into a ZIP archive
+- [x] Per-face `DiffuseColor` round-trip — writer serialises `ON_BrepFace::PerFaceColor()` as binary `DiffuseColor` blobs; reader already parses them
+- [x] `ParseDiffuseColors` always compiled (no libzip dependency); `ReadFcstdDoc` and `FCStdFileToONX_Model`/`ONX_ModelToFCStdFile` guarded by `OPEN2OPEN_HAVE_LIBZIP`
+- [x] GuiDocument.xml color format uses FreeCAD's `0xRRGGBBAA` convention (alpha=0 = opaque); reader fixed to use `std::stoul(val, nullptr, 0)` for hex auto-detection
+- [x] `App::Part` container → ON_Layer hierarchy — `ParseDocumentXml` parses `App::Part::Group` property; children get `part_label` field → FCStdFileToONX_Model uses part label as layer name
+- [x] Integration test: `test_fcstd_attrs` Test 7 — `ONX_ModelToFCStdFile` + `FCStdFileToONX_Model` round-trip (box with per-face colors; skipped when libzip unavailable)
+
+### Phase 6 — Per-object identity and scene metadata (P6 items)
+- [x] UUID (`ON_3dmObjectAttributes::m_uuid`) — encoded in a METADATA `TDataStd_Comment` child label on every shape label; field: `UUID:<hex-uuid>`
+- [x] URL references (`ON_3dmObjectAttributes::m_url`) — same METADATA child label; field: `URL:<url>`
+- [x] Group membership (`ON_3dmObjectAttributes::m_group[]`) — same METADATA child label; one `GROUP:<name>` field per group; stored by name to survive model re-indexing; group is created in destination model manifest before `AddManagedModelGeometryComponent` to satisfy `UpdateReferencedComponents`
+- [x] Clipping planes (`ON_ClippingPlaneSurface`) — `XCAFDoc_ClippingPlaneTool::AddClippingPlane`; plane normal and origin preserved; read back via `GetClippingPlanes`
+- [x] Lights (`ON_Light`) — serialised as `TDataStd_Comment` children of `doc->Main()` in format `LIGHT:<name>|<style>|<r,g,b>|<px,py,pz>|<dx,dy,dz>|<enabled>`; iterated via `ON_ModelComponent::Type::RenderLight`
+- [x] Tests 11–15 in `test_attrs.cpp` cover all five P6 features; 74/74 pass
 
 ---
 
@@ -390,3 +407,29 @@ topology is needed, an ngon-aware mesh container should be used.
 | NURBS geometry | `open2open/geom_convert.h` | `ON_NurbsCurveToOCCT`, `ON_NurbsCurve2dToOCCT`, `ON_NurbsSurfaceToOCCT`, `OCCTCurveToON`, `OCCTSurfaceToON` |
 | B-Rep topology | `open2open/brep_convert.h` | `ON_BrepToOCCT`, `OCCTToON_Brep` |
 | Polygon mesh | `open2open/mesh_convert.h` | `ON_MeshToOCCT`, `OCCTToON_Mesh` |
+| Attributes & metadata | `open2open/attrs_convert.h` | `CreateXCAFDocument`, `ONX_ModelToXCAFDoc`, `XCAFDocToONX_Model` |
+| FreeCAD FCStd pipeline | `open2open/fcstd_convert.h` | `ParseDiffuseColors`, `ReadFcstdDoc`, `FCStdFileToONX_Model`, `ONX_ModelToFCStdFile` |
+
+### 8.1 Feature coverage of `ONX_ModelToXCAFDoc` / `XCAFDocToONX_Model`
+
+| openNURBS | XCAF/TDF storage |
+|---|---|
+| `ON_3dmObjectAttributes::m_name` | `TDataStd_Name` on shape label |
+| `m_color` | `XCAFDoc_ColorTool` (Gen) |
+| `m_layer_index` / `ON_Layer` (parent/child) | `XCAFDoc_LayerTool` with `"Parent/Child"` encoded names |
+| `m_material_index` / `ON_Material` | `XCAFDoc_MaterialTool` + diffuse colour on shape |
+| `ON_Texture::m_image_file_reference` | `TDataStd_Comment` child of material label |
+| `m_uuid` | `TDataStd_Comment` METADATA child — `UUID:<hex>` |
+| `m_url` | `TDataStd_Comment` METADATA child — `URL:<url>` |
+| `m_group[]` | `TDataStd_Comment` METADATA child — `GROUP:<name>` per group |
+| `ON_InstanceDefinition` + `ON_InstanceRef` | `XCAFDoc_ShapeTool` assembly + located component |
+| `ON_3dmView` | `XCAFDoc_ViewTool` + `XCAFView_Object` |
+| `ON_Dimension` | `XCAFDoc_DimTolTool::AddDimTol` |
+| `ON_Text` / `ON_Leader` | `XCAFDoc_NotesTool::CreateComment` |
+| `ON_PointCloud` | `TopoDS_Compound` of vertices |
+| `ON_SubD` (control net) | `TopoDS_Compound` of vertices via `GetControlNetMesh` |
+| `ON_ClippingPlaneSurface` | `XCAFDoc_ClippingPlaneTool::AddClippingPlane` |
+| `ON_Light` | `TDataStd_Comment` "LIGHT:…" child of `doc->Main()` |
+| `ON_3dmProperties` (author, company) | `TDataStd_Name` on doc root |
+| `ON_3dmUnitsAndTolerances` | `XCAFDoc_LengthUnit` on doc root |
+

@@ -86,11 +86,66 @@ endif()
 # ---------------------------------------------------------------------------
 # 3. open2open library
 # ---------------------------------------------------------------------------
-add_library(open2open STATIC
+
+# Detect XCAF availability.
+#
+# The build_artifacts/occt package (the default) always provides both the
+# ApplicationFramework module (TKLCAF, TKCAF, TKCDF) and the DataExchange
+# module (TKXCAF).  The bundled source build (BUILD_MODULE_ApplicationFramework=OFF)
+# does NOT; in that case _HAVE_XCAF stays OFF and attrs_convert is skipped.
+#
+# XCAF libs required by attrs_convert.cpp:
+#   TKLCAF  — TDF_Label, TDataStd_Name, TDocStd_Document
+#   TKCDF   — CDM framework (base of TDocStd_Document)
+#   TKXCAF  — XCAFDoc_* tools (ShapeTool, ColorTool, LayerTool, MaterialTool)
+#
+# TKService / TKV3d are NOT needed here — we intentionally avoid the
+# XCAFDoc_VisMaterialTool path that would pull in Graphic3d.
+set(_HAVE_XCAF OFF)
+if(OpenCASCADE_FOUND AND DEFINED OpenCASCADE_ApplicationFramework_LIBRARIES)
+    # Pre-built OCCT (build_artifacts/ or installed): ApplicationFramework
+    # module guarantees TKLCAF/TKCAF/TKCDF; DataExchange guarantees TKXCAF.
+    set(_HAVE_XCAF ON)
+    set(_XCAF_LINK_LIBS TKLCAF TKCAF TKCDF TKXCAF)
+    message(STATUS "open2open: XCAF support enabled (pre-built OCCT)")
+elseif(TARGET TKLCAF AND TARGET TKXCAF)
+    # In-tree bundled OCCT build that was configured WITH ApplicationFramework.
+    set(_HAVE_XCAF ON)
+    set(_XCAF_LINK_LIBS TKLCAF TKCAF TKCDF TKXCAF)
+    message(STATUS "open2open: XCAF support enabled (bundled OCCT)")
+else()
+    message(STATUS "open2open: XCAF support disabled (ApplicationFramework/DataExchange not available)")
+endif()
+
+# Core sources (always compiled)
+set(_OPEN2OPEN_SOURCES
     src/geom_convert.cpp
     src/brep_convert.cpp
     src/mesh_convert.cpp
 )
+# attrs_convert.cpp requires XCAF
+if(_HAVE_XCAF)
+    list(APPEND _OPEN2OPEN_SOURCES src/attrs_convert.cpp)
+endif()
+
+# fcstd_convert.cpp requires libzip (for ZIP reading) + OCCT LDOM (TKernel).
+# LDOM is always part of TKernel so no extra link flags are needed beyond -lzip.
+# The module is also optional: silently skip if libzip is not installed.
+find_library(_LIBZIP_LIB NAMES zip DOC "libzip library")
+find_path(_LIBZIP_INC zip.h DOC "libzip header directory")
+# fcstd_convert.cpp is always compiled: ParseDiffuseColors has no zip dependency.
+# The full ReadFcstdDoc function requires libzip and is guarded by
+# OPEN2OPEN_HAVE_LIBZIP in the source.
+list(APPEND _OPEN2OPEN_SOURCES src/fcstd_convert.cpp)
+if(_LIBZIP_LIB AND _LIBZIP_INC)
+    set(_HAVE_LIBZIP ON)
+    message(STATUS "open2open: FreeCAD FCStd support enabled (libzip found: ${_LIBZIP_LIB})")
+else()
+    set(_HAVE_LIBZIP OFF)
+    message(STATUS "open2open: FreeCAD FCStd support disabled (libzip not found)")
+endif()
+
+add_library(open2open STATIC ${_OPEN2OPEN_SOURCES})
 
 target_include_directories(open2open
     PUBLIC
@@ -110,6 +165,27 @@ target_link_libraries(open2open
         -Wl,--end-group
     PRIVATE ${OCCT_LINK_LIBS}
 )
+
+# Expose XCAF availability to all consumers of the library.
+if(_HAVE_XCAF)
+    target_compile_definitions(open2open PUBLIC OPEN2OPEN_HAVE_XCAF)
+    # TKCAF (TNaming.cxx) has an undeclared dependency on TKBO
+    # (IntTools_FClass2d) that is absent from TKCAF's cmake
+    # INTERFACE_LINK_LIBRARIES.  TKBO is also in OCCT_LINK_LIBS but
+    # appears before TKCAF.  Using LINK_GROUP:RESCAN wraps these libraries
+    # in --start-group/--end-group so the linker rescans them and resolves
+    # the forward reference from TKCAF to TKBO.
+    target_link_libraries(open2open PRIVATE
+        "$<LINK_GROUP:RESCAN,${_XCAF_LINK_LIBS},TKBO>"
+    )
+endif()
+
+# Expose FCStd / libzip availability to all consumers of the library.
+if(_HAVE_LIBZIP)
+    target_compile_definitions(open2open PUBLIC OPEN2OPEN_HAVE_LIBZIP)
+    target_include_directories(open2open PRIVATE "${_LIBZIP_INC}")
+    target_link_libraries(open2open PRIVATE "${_LIBZIP_LIB}")
+endif()
 
 # ---------------------------------------------------------------------------
 # 4. Tests
