@@ -328,7 +328,7 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 ### Phase 3 — Structure (P3 items)
 - [x] Block instances / assembly references (`ON_InstanceDefinition` + `ON_InstanceRef` ↔ XCAF assembly)
 - [x] Named views / cameras (`ON_3dmView` ↔ `XCAFDoc_ViewTool` + `XCAFView_Object`)
-- [ ] Assembly hierarchy (XCAF product tree ↔ layer nesting)
+- [x] Assembly hierarchy / layer nesting (`ON_Layer::ParentLayerId` ↔ XCAF `"Parent/Child"` encoded layer names)
 - [ ] GD&T / PMI annotations
 
 ### Phase 4 — Extended types (P4 items)

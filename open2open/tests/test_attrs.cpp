@@ -534,6 +534,93 @@ static void TestNamedViewRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 7: Layer hierarchy (P3) — parent/child ON_Layer ↔ XCAF "Parent/Child"
+// ---------------------------------------------------------------------------
+static void TestLayerHierarchyRoundTrip()
+{
+    std::printf("--- Test 7: layer hierarchy round-trip\n");
+
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Add parent layer
+    const int parentIdx = src.AddLayer(L"Mechanical", ON_Color::UnsetColor);
+
+    // Get parent layer UUID
+    ON_ModelComponentReference pref =
+        src.ComponentFromIndex(ON_ModelComponent::Type::Layer, parentIdx);
+    const ON_Layer* pLayer = ON_Layer::Cast(pref.ModelComponent());
+    EXPECT_TRUE(pLayer != nullptr);
+    if (!pLayer) return;
+    const ON_UUID parentUuid = pLayer->Id();
+
+    // Add child layer with parent set
+    ON_Layer* childLayer = new ON_Layer();
+    childLayer->SetName(L"Bolts");
+    childLayer->SetParentLayerId(parentUuid);
+    childLayer->m_color = ON_Color(255, 0, 0);
+    const int childIdx = src.AddManagedModelComponent(
+        childLayer, false).ModelComponentIndex();
+    EXPECT_TRUE(childIdx >= 0);
+
+    // Add a box on the child layer
+    {
+        TopoDS_Shape s = BRepPrimAPI_MakeBox(5.0, 5.0, 5.0).Shape();
+        ON_Brep* brep = new ON_Brep();
+        open2open::OCCTToON_Brep(s, *brep, 1e-3);
+        ON_3dmObjectAttributes* a = new ON_3dmObjectAttributes();
+        a->m_name = L"Bolt";
+        a->m_layer_index = childIdx;
+        src.AddManagedModelGeometryComponent(brep, a);
+    }
+
+    // Convert to XCAF
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    // Verify XCAF layer names include "Mechanical/Bolts"
+    Handle(XCAFDoc_LayerTool) layerTool2 =
+        XCAFDoc_DocumentTool::LayerTool(doc->Main());
+    TDF_LabelSequence layerLabels;
+    layerTool2->GetLayerLabels(layerLabels);
+    bool foundChild = false;
+    for (Standard_Integer i = 1; i <= layerLabels.Length(); ++i) {
+        TCollection_ExtendedString ln;
+        layerTool2->GetLayer(layerLabels.Value(i), ln);
+        // Check if name contains "Mechanical/Bolts"
+        TCollection_ExtendedString expected("Mechanical/Bolts");
+        if (ln == expected) { foundChild = true; break; }
+    }
+    EXPECT_TRUE(foundChild);
+
+    // Round-trip back
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Find child layer in dst and verify it has a parent
+    bool childHasParent = false;
+    {
+        ONX_ModelComponentIterator lit(dst, ON_ModelComponent::Type::Layer);
+        for (const ON_ModelComponent* mc = lit.FirstComponent();
+             mc != nullptr; mc = lit.NextComponent())
+        {
+            const ON_Layer* l = ON_Layer::Cast(mc);
+            if (!l) continue;
+            if (l->Name() == ON_wString(L"Bolts") &&
+                l->ParentLayerId() != ON_nil_uuid)
+            {
+                childHasParent = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(childHasParent);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -544,6 +631,7 @@ int main()
     TestNullDoc();
     TestInstanceRoundTrip();
     TestNamedViewRoundTrip();
+    TestLayerHierarchyRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;

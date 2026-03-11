@@ -254,6 +254,20 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
     // -----------------------------------------------------------------------
     std::map<int, TDF_Label> layerLabelMap;
     {
+        // Build a map from ON_UUID → layer name to resolve parent names
+        // for encoding hierarchical names as "ParentName/ChildName".
+        std::map<ON_UUID, ON_wString, UuidLess> layerNameById;
+        {
+            ONX_ModelComponentIterator lit2(model, ON_ModelComponent::Type::Layer);
+            for (const ON_ModelComponent* mc2 = lit2.FirstComponent();
+                 mc2 != nullptr;
+                 mc2 = lit2.NextComponent())
+            {
+                const ON_Layer* l2 = ON_Layer::Cast(mc2);
+                if (l2) layerNameById[l2->Id()] = l2->Name();
+            }
+        }
+
         ONX_ModelComponentIterator lit(model, ON_ModelComponent::Type::Layer);
         for (const ON_ModelComponent* mc = lit.FirstComponent();
              mc != nullptr;
@@ -265,10 +279,20 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
             const int idx = layer->Index();
             const ON_wString& name = layer->Name();
 
-            TCollection_ExtendedString extName =
-                name.IsNotEmpty() ? ONwToExt(name)
-                                  : TCollection_ExtendedString("Layer");
+            // Build fully-qualified name: "Parent/Child" for nested layers
+            ON_wString fullName = name.IsNotEmpty() ? name : ON_wString(L"Layer");
+            const ON_UUID parentId = layer->ParentLayerId();
+            if (parentId != ON_nil_uuid) {
+                auto pit = layerNameById.find(parentId);
+                if (pit != layerNameById.end() && pit->second.IsNotEmpty()) {
+                    ON_wString qualified = pit->second;
+                    qualified += L"/";
+                    qualified += fullName;
+                    fullName = qualified;
+                }
+            }
 
+            TCollection_ExtendedString extName = ONwToExt(fullName);
             TDF_Label layerLabel = layerTool->AddLayer(extName);
             layerLabelMap[idx] = layerLabel;
 
@@ -647,36 +671,85 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
     }
 
     // -----------------------------------------------------------------------
-    // P1: Layer table — each XCAF layer label → ON_Layer
+    // P1/P3: Layer table — each XCAF layer label → ON_Layer.
+    // Hierarchical names encoded as "Parent/Child" are decoded to set
+    // ParentLayerId on the child ON_Layer.
+    // Two-pass: first add all layers, then fix parent links using UUID map.
     // Map: layer label tag → ON layer index
     // -----------------------------------------------------------------------
     std::map<Standard_Integer, int> layerTagToIndex;
     {
         TDF_LabelSequence layerLabels;
         layerTool->GetLayerLabels(layerLabels);
+
+        // Pass 1: add all layers with their leaf name; record fqName → UUID.
+        std::map<std::string, ON_UUID, std::less<std::string>> fqNameToUuid;
+
         for (Standard_Integer i = 1; i <= layerLabels.Length(); ++i) {
             const TDF_Label& ll = layerLabels.Value(i);
 
             TCollection_ExtendedString layerName;
             layerTool->GetLayer(ll, layerName);
+            ON_wString fullName = layerName.IsEmpty()
+                ? ON_wString(L"Layer") : ExtToONw(layerName);
 
-            ON_Layer onLayer;
-            if (!layerName.IsEmpty())
-                onLayer.SetName(ExtToONw(layerName));
-            else
-                onLayer.SetName(L"Layer");
+            // Leaf name = part after last "/"
+            ON_wString leafName = fullName;
+            const int slashPos = fullName.ReverseFind(L'/');
+            if (slashPos >= 0)
+                leafName = fullName.Mid(slashPos + 1);
 
-            // Layer colour stored as generic colour on the layer label
+            ON_Layer* onLayer = new ON_Layer();
+            onLayer->SetName(leafName.IsNotEmpty()
+                ? (const wchar_t*)leafName : L"Layer");
+
+            // Layer colour
             Quantity_ColorRGBA qc;
-            if (colorTool->GetColor(ll, XCAFDoc_ColorGen, qc)) {
-                onLayer.m_color = RGBAToONColor(qc);
-            }
+            if (colorTool->GetColor(ll, XCAFDoc_ColorGen, qc))
+                onLayer->m_color = RGBAToONColor(qc);
 
-            const int layerIdx = model.AddLayer(
-                static_cast<const wchar_t*>(onLayer.Name()),
-                onLayer.m_color);
-
+            ON_ModelComponentReference ref =
+                model.AddManagedModelComponent(onLayer, false);
+            const int layerIdx = ref.ModelComponentIndex();
             layerTagToIndex[ll.Tag()] = layerIdx;
+
+            // Record fqName → UUID for parent-linking
+            ON_String utf8;
+            utf8 = fullName;
+            const ON_Layer* added = ON_Layer::Cast(ref.ModelComponent());
+            if (added)
+                fqNameToUuid[std::string(utf8.Array())] = added->Id();
+        }
+
+        // Pass 2: set ParentLayerId on child layers.
+        for (Standard_Integer i = 1; i <= layerLabels.Length(); ++i) {
+            const TDF_Label& ll = layerLabels.Value(i);
+            TCollection_ExtendedString layerName;
+            layerTool->GetLayer(ll, layerName);
+            if (layerName.IsEmpty()) continue;
+
+            ON_wString fullName = ExtToONw(layerName);
+            const int slashPos = fullName.ReverseFind(L'/');
+            if (slashPos < 0) continue; // top-level
+
+            ON_wString parentFull = fullName.Left(slashPos);
+            ON_String parentUtf8;
+            parentUtf8 = parentFull;
+            auto pit = fqNameToUuid.find(std::string(parentUtf8.Array()));
+            if (pit == fqNameToUuid.end()) continue;
+
+            const int childIdx = layerTagToIndex.at(ll.Tag());
+            ON_ModelComponentReference childRef =
+                model.ComponentFromIndex(
+                    ON_ModelComponent::Type::Layer, childIdx);
+            const ON_Layer* childLayer = ON_Layer::Cast(childRef.ModelComponent());
+            if (!childLayer) continue;
+
+            // Clone with parent set, replace using AddManagedModelComponent
+            // with the same UUID (conflict resolution will match by UUID)
+            ON_Layer* withParent = new ON_Layer(*childLayer);
+            withParent->SetParentLayerId(pit->second);
+            model.AddManagedModelComponent(withParent, true);
         }
     }
 
