@@ -61,6 +61,11 @@ Handle(TDocStd_Document) CreateXCAFDocument();
 ///   - Model unit system → `XCAFDoc_LengthUnit` scale-factor on doc root
 ///   - Created-by string → `TDataStd_Name` on doc root
 ///
+/// Instance definitions and references (P3):
+///   - Each `ON_InstanceDefinition` → XCAF assembly label with sub-components.
+///   - Each `ON_InstanceRef` → XCAF component with `TopLoc_Location` derived
+///     from `m_xform`.  Instance refs are collected under a "Scene" assembly.
+///
 /// Mesh objects (ON_Mesh) in the model are currently skipped.
 ///
 /// @param model  Source openNURBS model.

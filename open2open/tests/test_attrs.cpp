@@ -342,6 +342,132 @@ static void TestNullDoc()
 }
 
 // ---------------------------------------------------------------------------
+// Test 5: Instance definitions / blocks (P3)
+// ---------------------------------------------------------------------------
+// Build an ONX_Model with one block definition containing two boxes, then
+// place two instances of that block with different transforms.
+// Verify that ONX_ModelToXCAFDoc creates an XCAF assembly, and that
+// XCAFDocToONX_Model restores the ON_InstanceDefinition + ON_InstanceRef.
+// ---------------------------------------------------------------------------
+static void TestInstanceRoundTrip()
+{
+    std::printf("--- Test 5: instance definition round-trip\n");
+
+    // ---- Build source model ----
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Add two boxes as block member geometry
+    ON_Brep* box1 = new ON_Brep();
+    {
+        TopoDS_Shape s = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+        bool ok = open2open::OCCTToON_Brep(s, *box1, 1e-3);
+        EXPECT_TRUE(ok);
+        (void)ok;
+    }
+    ON_Brep* box2 = new ON_Brep();
+    {
+        TopoDS_Shape s = BRepPrimAPI_MakeBox(5.0, 5.0, 5.0).Shape();
+        bool ok = open2open::OCCTToON_Brep(s, *box2, 1e-3);
+        EXPECT_TRUE(ok);
+        (void)ok;
+    }
+
+    ON_3dmObjectAttributes* a1 = new ON_3dmObjectAttributes();
+    a1->m_name = L"Box1";
+    ON_3dmObjectAttributes* a2 = new ON_3dmObjectAttributes();
+    a2->m_name = L"Box2";
+
+    auto ref1 = src.AddManagedModelGeometryComponent(box1, a1);
+    auto ref2 = src.AddManagedModelGeometryComponent(box2, a2);
+    ON_UUID uuid1 = ref1.ModelComponent()->Id();
+    ON_UUID uuid2 = ref2.ModelComponent()->Id();
+
+    // Create an instance definition containing both boxes
+    ON_InstanceDefinition* idef = new ON_InstanceDefinition();
+    idef->SetName(L"DualBox");
+    ON_SimpleArray<ON_UUID> members;
+    members.Append(uuid1);
+    members.Append(uuid2);
+    idef->SetInstanceGeometryIdList(members);
+    auto idefRef = src.AddManagedModelComponent(idef, false);
+    ON_UUID idefUuid = idefRef.ModelComponent()->Id();
+
+    // Place the block twice: once at origin, once translated by (50,0,0)
+    ON_InstanceRef* iref_a = new ON_InstanceRef();
+    iref_a->m_instance_definition_uuid = idefUuid;
+    iref_a->m_xform = ON_Xform::IdentityTransformation;
+    ON_3dmObjectAttributes* ia_attrs = new ON_3dmObjectAttributes();
+    ia_attrs->m_name = L"Instance_A";
+    src.AddManagedModelGeometryComponent(iref_a, ia_attrs);
+
+    ON_InstanceRef* iref_b = new ON_InstanceRef();
+    iref_b->m_instance_definition_uuid = idefUuid;
+    iref_b->m_xform = ON_Xform::TranslationTransformation(
+        ON_3dVector(50.0, 0.0, 0.0));
+    ON_3dmObjectAttributes* ib_attrs = new ON_3dmObjectAttributes();
+    ib_attrs->m_name = L"Instance_B";
+    src.AddManagedModelGeometryComponent(iref_b, ib_attrs);
+
+    // ---- Convert ONX → XCAF ----
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    Handle(XCAFDoc_ShapeTool) shapeTool =
+        XCAFDoc_DocumentTool::ShapeTool(doc->Main());
+
+    // Verify an assembly exists in the XCAF document
+    TDF_LabelSequence freeShapes;
+    shapeTool->GetFreeShapes(freeShapes);
+
+    bool hasAssembly = false;
+    for (Standard_Integer i = 1; i <= freeShapes.Length(); ++i) {
+        if (XCAFDoc_ShapeTool::IsAssembly(freeShapes.Value(i))) {
+            hasAssembly = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(hasAssembly);
+
+    // ---- Convert XCAF → ONX_Model ----
+    ONX_Model dst;
+    bool ok2 = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok2);
+
+    // Count instance definitions and instance refs in restored model
+    int idefCount = 0;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::InstanceDefinition);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr;
+             mc = it.NextComponent())
+            ++idefCount;
+    }
+    EXPECT_EQ(idefCount, 1); // one block definition
+
+    int irefCount = 0;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr;
+             mc = it.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* g = mgc->Geometry(nullptr);
+            if (g && g->ObjectType() == ON::instance_reference)
+                ++irefCount;
+        }
+    }
+    EXPECT_EQ(irefCount, 2); // two instances
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -350,6 +476,7 @@ int main()
     TestModelToXCAF();
     TestXCAFToModel();
     TestNullDoc();
+    TestInstanceRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;

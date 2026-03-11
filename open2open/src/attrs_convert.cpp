@@ -14,6 +14,9 @@
 //   P2  Material         ON_Material                     ↔  XCAFDoc_MaterialTool
 //   P2  Document author  ON_3dmRevisionHistory::m_sCreatedBy ↔ TDataStd_Name
 //   P2  Unit system      ON_3dmUnitsAndTolerances         ↔  XCAFDoc_LengthUnit
+// Phase-3 items implemented here:
+//   P3  Instance defs / blocks  ON_InstanceDefinition + ON_InstanceRef
+//                               ↔  XCAFDoc_ShapeTool assembly + component
 
 #include "open2open/attrs_convert.h"
 #include "open2open/brep_convert.h"
@@ -46,10 +49,20 @@
 
 // OCCT — shape
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Compound.hxx>
+#include <BRep_Builder.hxx>
+
+// OCCT — transforms (for instance placement)
+#include <gp_Trsf.hxx>
+#include <TopLoc_Location.hxx>
+#include <XCAFDoc_Location.hxx>
 
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
+#include <array>
+#include <functional>
 
 namespace open2open {
 
@@ -111,6 +124,42 @@ static ON_Color RGBAToONColor(const Quantity_ColorRGBA& rgba)
                     (int)(rgb.Blue()  * 255.0 + 0.5),
                     alpha);
 }
+
+// ---------------------------------------------------------------------------
+// Transform helpers (P3 — instance definitions)
+// ---------------------------------------------------------------------------
+
+/// Convert an ON_Xform (row-major 4×4) to a gp_Trsf (3×4 affine).
+/// Only the 3×4 upper block is used; the last row must be [0,0,0,1].
+static gp_Trsf ONXformToGpTrsf(const ON_Xform& x)
+{
+    gp_Trsf trsf;
+    trsf.SetValues(x.m_xform[0][0], x.m_xform[0][1], x.m_xform[0][2], x.m_xform[0][3],
+                   x.m_xform[1][0], x.m_xform[1][1], x.m_xform[1][2], x.m_xform[1][3],
+                   x.m_xform[2][0], x.m_xform[2][1], x.m_xform[2][2], x.m_xform[2][3]);
+    return trsf;
+}
+
+/// Convert a gp_Trsf (3×4 affine, 1-indexed) to an ON_Xform (4×4 row-major).
+static ON_Xform GpTrsfToONXform(const gp_Trsf& trsf)
+{
+    ON_Xform x;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            x.m_xform[r][c] = trsf.Value(r + 1, c + 1);
+    x.m_xform[3][0] = x.m_xform[3][1] = x.m_xform[3][2] = 0.0;
+    x.m_xform[3][3] = 1.0;
+    return x;
+}
+
+// ---------------------------------------------------------------------------
+// ON_UUID comparison for std::map
+// ---------------------------------------------------------------------------
+struct UuidLess {
+    bool operator()(const ON_UUID& a, const ON_UUID& b) const {
+        return std::memcmp(&a, &b, sizeof(ON_UUID)) < 0;
+    }
+};
 
 /// Return scale-to-metres factor for an openNURBS length unit system.
 static double ONUnitScaleToMetres(ON::LengthUnitSystem us)
@@ -269,8 +318,11 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
     }
 
     // -----------------------------------------------------------------------
-    // P1/P2: Geometry objects
+    // P1/P2: Geometry objects — first pass: brep/extrusion shapes.
+    // Also records ON_UUID → TDF_Label for instance-definition assembly.
     // -----------------------------------------------------------------------
+    std::map<ON_UUID, TDF_Label, UuidLess> uuidToLabel; // P3: geometry UUID → XCAF label
+
     ONX_ModelComponentIterator it(model, ON_ModelComponent::Type::ModelGeometry);
     for (const ON_ModelComponent* mc = it.FirstComponent();
          mc != nullptr;
@@ -282,6 +334,10 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
 
         const ON_Geometry* geom = mgc->Geometry(nullptr);
         if (!geom) continue;
+
+        // Skip instance references — handled in the P3 pass below
+        if (geom->ObjectType() == ON::instance_reference)
+            continue;
 
         // Convert geometry to TopoDS_Shape
         TopoDS_Shape shape;
@@ -305,6 +361,9 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
         // Add to XCAF shape tool
         TDF_Label label = shapeTool->AddShape(shape);
         if (label.IsNull()) continue;
+
+        // Record UUID → label for instance-definition assembly pass
+        uuidToLabel[mc->Id()] = label;
 
         const ON_3dmObjectAttributes* attrs = mgc->Attributes(nullptr);
 
@@ -350,6 +409,113 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
             auto mit2 = matLabelMap.find(attrs->m_material_index);
             if (mit2 != matLabelMap.end()) {
                 matTool->SetMaterial(label, mit2->second);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: Instance definitions — create XCAF "product" assemblies.
+    // Each ON_InstanceDefinition becomes an XCAF assembly label whose sub-
+    // components are the geometry shapes referenced by the idef's member list.
+    // Map: idef ON_UUID → XCAF assembly label.
+    // -----------------------------------------------------------------------
+    std::map<ON_UUID, TDF_Label, UuidLess> idefUuidToLabel;
+
+    {
+        ONX_ModelComponentIterator idit(model,
+            ON_ModelComponent::Type::InstanceDefinition);
+        for (const ON_ModelComponent* mc = idit.FirstComponent();
+             mc != nullptr;
+             mc = idit.NextComponent())
+        {
+            const ON_InstanceDefinition* idef =
+                ON_InstanceDefinition::Cast(mc);
+            if (!idef) continue;
+
+            // Create a new empty XCAF assembly label for this block definition
+            TDF_Label asmLabel = shapeTool->NewShape();
+            if (asmLabel.IsNull()) continue;
+
+            // Set the name on the assembly label
+            if (idef->Name().IsNotEmpty())
+                TDataStd_Name::Set(asmLabel, ONwToExt(idef->Name()));
+
+            // Add each member geometry as a sub-component with identity location
+            const ON_SimpleArray<ON_UUID>& members =
+                idef->InstanceGeometryIdList();
+            for (int i = 0; i < members.Count(); ++i) {
+                auto found = uuidToLabel.find(members[i]);
+                if (found == uuidToLabel.end())
+                    continue;
+                shapeTool->AddComponent(asmLabel, found->second,
+                                        TopLoc_Location()); // identity
+            }
+
+            idefUuidToLabel[mc->Id()] = asmLabel;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: Instance references — create XCAF components with locations.
+    // Each ON_InstanceRef becomes an XCAF component in a top-level "scene"
+    // assembly, referencing the corresponding instance-definition label.
+    // If no instance refs exist the scene assembly is not created.
+    // -----------------------------------------------------------------------
+    {
+        // Collect all instance refs first so we can decide whether to create
+        // the scene assembly
+        struct IRefInfo {
+            TDF_Label     idefLabel;
+            TopLoc_Location loc;
+            ON_wString    name;
+        };
+        std::vector<IRefInfo> irefInfos;
+
+        ONX_ModelComponentIterator geoIt(model,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = geoIt.FirstComponent();
+             mc != nullptr;
+             mc = geoIt.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* geom = mgc->Geometry(nullptr);
+            if (!geom || geom->ObjectType() != ON::instance_reference)
+                continue;
+            const ON_InstanceRef* iref = ON_InstanceRef::Cast(geom);
+            if (!iref) continue;
+
+            // Find the XCAF assembly for the referenced instance definition
+            auto found = idefUuidToLabel.find(
+                iref->m_instance_definition_uuid);
+            if (found == idefUuidToLabel.end())
+                continue;
+
+            // Convert ON_Xform → gp_Trsf → TopLoc_Location
+            gp_Trsf trsf = ONXformToGpTrsf(iref->m_xform);
+            TopLoc_Location loc(trsf);
+
+            const ON_3dmObjectAttributes* attrs = mgc->Attributes(nullptr);
+            ON_wString name;
+            if (attrs) name = attrs->m_name;
+
+            irefInfos.push_back({found->second, loc, name});
+        }
+
+        if (!irefInfos.empty()) {
+            // Create a top-level "Scene" compound to hold the instances
+            TDF_Label sceneLabel = shapeTool->NewShape();
+            TDataStd_Name::Set(sceneLabel,
+                               TCollection_ExtendedString("Scene"));
+
+            for (const auto& info : irefInfos) {
+                TDF_Label compLabel =
+                    shapeTool->AddComponent(sceneLabel,
+                                            info.idefLabel,
+                                            info.loc);
+                if (!compLabel.IsNull() && info.name.IsNotEmpty())
+                    TDataStd_Name::Set(compLabel, ONwToExt(info.name));
             }
         }
     }
@@ -461,25 +627,39 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
     }
 
     // -----------------------------------------------------------------------
-    // P1/P2: Top-level shapes
+    // P1/P2/P3: Walk ALL shape labels in the document (free + nested).
+    //
+    // Two passes:
+    //   Pass 1: collect all "leaf" (simple, non-assembly) shapes as breps,
+    //           including those that are components of assemblies.
+    //           Builds labelTag → geomUuid for use in assembly construction.
+    //   Pass 2: for each free assembly, create ON_InstanceDefinition + refs.
     // -----------------------------------------------------------------------
     TDF_LabelSequence freeShapes;
     shapeTool->GetFreeShapes(freeShapes);
 
+    // P3: label-tag → ON_UUID for brep shapes added to the model
+    std::map<Standard_Integer, ON_UUID> labelTagToGeomUuid;
     bool anyOK = false;
-    for (Standard_Integer i = 1; i <= freeShapes.Length(); ++i) {
-        const TDF_Label& label = freeShapes.Value(i);
+
+    // Helper lambda: add one simple-shape label as a brep to the model.
+    // Skips labels already processed (idempotent via labelTagToGeomUuid).
+    auto addSimpleShape = [&](const TDF_Label& label) {
+        Standard_Integer tag = label.Tag();
+        if (labelTagToGeomUuid.count(tag))
+            return; // already added
+
         const TopoDS_Shape shape = shapeTool->GetShape(label);
-        if (shape.IsNull()) continue;
+        if (shape.IsNull()) return;
 
         ON_Brep* brep = new ON_Brep();
         if (!OCCTToON_Brep(shape, *brep, tol)) {
             delete brep;
-            continue;
+            return;
         }
         if (!brep->IsValid() || brep->m_F.Count() == 0) {
             delete brep;
-            continue;
+            return;
         }
 
         // Build per-object attributes
@@ -488,9 +668,8 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
         // P1: Name
         {
             Handle(TDataStd_Name) nameAttr;
-            if (label.FindAttribute(TDataStd_Name::GetID(), nameAttr)) {
+            if (label.FindAttribute(TDataStd_Name::GetID(), nameAttr))
                 attrs->m_name = ExtToONw(nameAttr->Get());
-            }
         }
 
         // P1: Object colour (XCAFDoc_ColorGen preferred, then XCAFDoc_ColorSurf)
@@ -509,9 +688,7 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             Handle(TColStd_HSequenceOfExtendedString) layerNames =
                 layerTool->GetLayers(shape);
             if (!layerNames.IsNull() && !layerNames->IsEmpty()) {
-                const TCollection_ExtendedString& lname =
-                    layerNames->Value(1);
-                // Find the corresponding ON layer index
+                const TCollection_ExtendedString& lname = layerNames->Value(1);
                 TDF_LabelSequence lls;
                 layerTool->GetLayerLabels(lls);
                 for (Standard_Integer j = 1; j <= lls.Length(); ++j) {
@@ -539,8 +716,160 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             }
         }
 
-        model.AddManagedModelGeometryComponent(brep, attrs);
+        ON_ModelComponentReference ref =
+            model.AddManagedModelGeometryComponent(brep, attrs);
         anyOK = true;
+        labelTagToGeomUuid[tag] = ref.ModelComponent()->Id();
+    };
+
+    // Recursive helper: collect all leaf simple-shape labels in sub-tree.
+    // (forward declare the variable then assign the lambda so it can self-recurse)
+    std::function<void(const TDF_Label&)> collectAndAddSimple;
+    collectAndAddSimple = [&](const TDF_Label& label) {
+        if (XCAFDoc_ShapeTool::IsReference(label)) {
+            TDF_Label ref;
+            if (XCAFDoc_ShapeTool::GetReferredShape(label, ref))
+                collectAndAddSimple(ref);
+            return;
+        }
+        if (XCAFDoc_ShapeTool::IsAssembly(label)) {
+            TDF_LabelSequence comps;
+            XCAFDoc_ShapeTool::GetComponents(label, comps,
+                                              /*sub=*/Standard_False);
+            for (Standard_Integer k = 1; k <= comps.Length(); ++k)
+                collectAndAddSimple(comps.Value(k));
+            return;
+        }
+        // Simple shape: add it to the model
+        addSimpleShape(label);
+    };
+
+    // Pass 1: add all leaf shapes (free simple + nested inside assemblies)
+    for (Standard_Integer i = 1; i <= freeShapes.Length(); ++i)
+        collectAndAddSimple(freeShapes.Value(i));
+
+    // -----------------------------------------------------------------------
+    // P3: Assemblies → ON_InstanceDefinition + ON_InstanceRef
+    //
+    // Algorithm uses ALL shape labels (not just free ones), in two sub-passes:
+    //
+    // Sub-pass A: "block definition" assemblies — assemblies whose direct
+    //   components refer only to simple shapes already in labelTagToGeomUuid.
+    //   → Create one ON_InstanceDefinition per such assembly.
+    //   → Populate asmTagToIdefUuid for sub-pass B.
+    //
+    // Sub-pass B: "scene" assemblies — assemblies whose components refer to
+    //   other assemblies (block definitions from sub-pass A).
+    //   → Create one ON_InstanceRef per such component.
+    //
+    // Both sub-passes iterate ALL shape labels so non-free assemblies (e.g.
+    // a block definition that is itself used as a component) are handled.
+    // -----------------------------------------------------------------------
+
+    // Collect ALL shape labels (free + non-free)
+    TDF_LabelSequence allShapes;
+    shapeTool->GetShapes(allShapes);
+
+    // asmTag → ON_UUID of the corresponding ON_InstanceDefinition (sub-pass A)
+    std::map<Standard_Integer, ON_UUID> asmTagToIdefUuid;
+
+    // Sub-pass A: block definition assemblies
+    for (Standard_Integer i = 1; i <= allShapes.Length(); ++i) {
+        const TDF_Label& asmLabel = allShapes.Value(i);
+        if (!XCAFDoc_ShapeTool::IsAssembly(asmLabel))
+            continue;
+        // Skip if already processed
+        if (asmTagToIdefUuid.count(asmLabel.Tag()))
+            continue;
+
+        TDF_LabelSequence components;
+        XCAFDoc_ShapeTool::GetComponents(asmLabel, components,
+                                          /*getsubchilds=*/Standard_False);
+        if (components.IsEmpty())
+            continue;
+
+        // Check that ALL direct referred shapes are simple (in labelTagToGeomUuid)
+        bool allSimple = true;
+        for (Standard_Integer j = 1; j <= components.Length(); ++j) {
+            TDF_Label refLbl;
+            if (!XCAFDoc_ShapeTool::GetReferredShape(
+                    components.Value(j), refLbl)) {
+                allSimple = false; break;
+            }
+            if (!labelTagToGeomUuid.count(refLbl.Tag())) {
+                allSimple = false; break;
+            }
+        }
+        if (!allSimple)
+            continue;
+
+        // Build member UUID list (unique per referred shape)
+        ON_SimpleArray<ON_UUID> memberUuids;
+        std::set<Standard_Integer> seen;
+        for (Standard_Integer j = 1; j <= components.Length(); ++j) {
+            TDF_Label refLbl;
+            XCAFDoc_ShapeTool::GetReferredShape(components.Value(j), refLbl);
+            Standard_Integer tag = refLbl.Tag();
+            if (seen.insert(tag).second)
+                memberUuids.Append(labelTagToGeomUuid.at(tag));
+        }
+        if (memberUuids.Count() == 0)
+            continue;
+
+        ON_wString idefName;
+        {
+            Handle(TDataStd_Name) na;
+            if (asmLabel.FindAttribute(TDataStd_Name::GetID(), na))
+                idefName = ExtToONw(na->Get());
+        }
+
+        ON_InstanceDefinition* idef = new ON_InstanceDefinition();
+        idef->SetName(idefName.IsNotEmpty() ? (const wchar_t*)idefName : L"Block");
+        idef->SetInstanceGeometryIdList(memberUuids);
+        ON_ModelComponentReference idefRef =
+            model.AddManagedModelComponent(idef, /*resolve conflicts=*/false);
+        asmTagToIdefUuid[asmLabel.Tag()] = idefRef.ModelComponent()->Id();
+    }
+
+    // Sub-pass B: scene assemblies — components that refer to block definitions
+    for (Standard_Integer i = 1; i <= allShapes.Length(); ++i) {
+        const TDF_Label& asmLabel = allShapes.Value(i);
+        if (!XCAFDoc_ShapeTool::IsAssembly(asmLabel))
+            continue;
+        // Skip block definitions (already handled) and unrecognised assemblies
+        if (asmTagToIdefUuid.count(asmLabel.Tag()))
+            continue;
+
+        TDF_LabelSequence components;
+        XCAFDoc_ShapeTool::GetComponents(asmLabel, components,
+                                          /*getsubchilds=*/Standard_False);
+
+        for (Standard_Integer j = 1; j <= components.Length(); ++j) {
+            const TDF_Label& compLabel = components.Value(j);
+            TDF_Label refLbl;
+            if (!XCAFDoc_ShapeTool::GetReferredShape(compLabel, refLbl))
+                continue;
+            auto it_idef = asmTagToIdefUuid.find(refLbl.Tag());
+            if (it_idef == asmTagToIdefUuid.end())
+                continue;
+
+            TopLoc_Location loc = XCAFDoc_ShapeTool::GetLocation(compLabel);
+            ON_Xform xform = loc.IsIdentity()
+                ? ON_Xform::IdentityTransformation
+                : GpTrsfToONXform(loc.Transformation());
+
+            ON_InstanceRef* iref = new ON_InstanceRef();
+            iref->m_instance_definition_uuid = it_idef->second;
+            iref->m_xform                    = xform;
+
+            ON_3dmObjectAttributes* iattrs = new ON_3dmObjectAttributes();
+            Handle(TDataStd_Name) cn;
+            if (compLabel.FindAttribute(TDataStd_Name::GetID(), cn))
+                iattrs->m_name = ExtToONw(cn->Get());
+
+            model.AddManagedModelGeometryComponent(iref, iattrs);
+            anyOK = true;
+        }
     }
 
     return anyOK || freeShapes.IsEmpty();

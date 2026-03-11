@@ -216,7 +216,7 @@ with both APIs:
 | P2 | ~~**FreeCAD per-face colours** (`DiffuseColor` binary)~~ | ~~Done~~ | Custom ZIP + binary parser |
 | P2 | ~~**Document metadata** (title, author, date)~~ | ~~Done~~ | `ON_3dmProperties`, TDocStd header |
 | P2 | ~~**Units and tolerance**~~ | ~~Done~~ | `ON_3dmSettings`, XCAF units |
-| P3 | **Instance definitions / blocks** | 5–8 d | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
+| P3 | ~~**Instance definitions / blocks**~~ | ~~Done~~ | `XCAFDoc_ShapeTool`, `ON_InstanceDefinition` |
 | P3 | **Assembly tree** | 7–10 d | XCAF product tree → ON_Layer hierarchy |
 | P3 | **GD&T / PMI annotations** | 8–12 d | `XCAFDoc_DimTol`, `ON_Dimension` |
 | P3 | **Named views / cameras** | 3–5 d | `XCAFDoc_ViewTool`, `ON_3dmView` |
@@ -326,7 +326,7 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] Unit system and linear tolerance
 
 ### Phase 3 — Structure (P3 items)
-- [ ] Block instances / assembly references
+- [x] Block instances / assembly references (`ON_InstanceDefinition` + `ON_InstanceRef` ↔ XCAF assembly)
 - [ ] Assembly hierarchy (XCAF product tree ↔ layer nesting)
 - [ ] Named views / cameras
 - [ ] GD&T / PMI annotations
