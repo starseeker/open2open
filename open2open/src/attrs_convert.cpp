@@ -20,6 +20,7 @@
 
 #include "open2open/attrs_convert.h"
 #include "open2open/brep_convert.h"
+#include "open2open/mesh_convert.h"
 
 #include "opennurbs.h"
 
@@ -53,8 +54,20 @@
 
 // OCCT — shape
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Compound.hxx>
 #include <BRep_Builder.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+
+// OCCT — topology iteration
+#include <TopoDS.hxx>
+#include <TopExp_Explorer.hxx>
+#include <BRep_Tool.hxx>
+
+// OCCT — mesh (for SubD fallback / mesh objects)
+#include <Poly_Triangulation.hxx>
+#include <BRepBuilderAPI_MakePolygon.hxx>
+#include <BRepBuilderAPI_MakeFace.hxx>
 
 // OCCT — transforms (for instance placement)
 #include <gp_Trsf.hxx>
@@ -63,12 +76,24 @@
 #include <TopLoc_Location.hxx>
 #include <XCAFDoc_Location.hxx>
 
+// OCCT — text annotation / notes
+#include <XCAFDoc_NotesTool.hxx>
+#include <XCAFDoc_NoteComment.hxx>
+#include <XCAFDoc_Note.hxx>
+#include <TDataStd_Comment.hxx>
+#include <TDataStd_Real.hxx>
+
+// OCCT — GD&T / dimensioning
+#include <XCAFDoc_DimTolTool.hxx>
+#include <XCAFDoc_DimTol.hxx>
+
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 #include <array>
 #include <functional>
+#include <cmath>
 
 namespace open2open {
 
@@ -365,9 +390,63 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
         const ON_Geometry* geom = mgc->Geometry(nullptr);
         if (!geom) continue;
 
+        const ON_3dmObjectAttributes* attrs = mgc->Attributes(nullptr);
+
         // Skip instance references — handled in the P3 pass below
         if (geom->ObjectType() == ON::instance_reference)
             continue;
+
+        // P4: Text annotations & GD&T Dimensions — annotation_object covers both
+        if (geom->ObjectType() == ON::annotation_object) {
+            const ON_Annotation* ann = ON_Annotation::Cast(geom);
+            if (!ann) continue;
+
+            // GD&T: if it's a dimension sub-class, store via DimTolTool
+            const ON_Dimension* dim = dynamic_cast<const ON_Dimension*>(ann);
+            if (dim) {
+                Handle(XCAFDoc_DimTolTool) dimTolTool =
+                    XCAFDoc_DocumentTool::DimTolTool(doc->Main());
+                Handle(TCollection_HAsciiString) hName =
+                    new TCollection_HAsciiString();
+                Handle(TCollection_HAsciiString) hDesc =
+                    new TCollection_HAsciiString();
+                if (attrs && attrs->m_name.IsNotEmpty()) {
+                    ON_String utf8;
+                    utf8 = attrs->m_name;
+                    hName = new TCollection_HAsciiString(utf8.Array());
+                }
+                Handle(TColStd_HArray1OfReal) vals =
+                    new TColStd_HArray1OfReal(1, 1);
+                vals->SetValue(1, 0.0);
+                TDF_Label dimLabel =
+                    dimTolTool->AddDimTol(0, vals, hName, hDesc);
+                if (!dimLabel.IsNull() && attrs && attrs->m_name.IsNotEmpty())
+                    TDataStd_Name::Set(dimLabel, ONwToExt(attrs->m_name));
+                continue;
+            }
+
+            // General annotation (ON_Text, ON_Leader, …): store as comment note
+            const ON_wString txt = ann->PlainText();
+            if (txt.IsEmpty()) continue;
+            Handle(XCAFDoc_NotesTool) notesTool =
+                XCAFDoc_DocumentTool::NotesTool(doc->Main());
+            TCollection_ExtendedString extTxt = ONwToExt(txt);
+            Handle(XCAFDoc_Note) note =
+                notesTool->CreateComment(
+                    TCollection_ExtendedString(""),
+                    TCollection_ExtendedString(""),
+                    extTxt);
+            if (!note.IsNull()) {
+                if (attrs && attrs->m_name.IsNotEmpty())
+                    TDataStd_Name::Set(note->Label(), ONwToExt(attrs->m_name));
+                const ON_3dPoint& org = ann->Plane().origin;
+                ON_String coordStr;
+                coordStr.Format("%.17g %.17g %.17g", org.x, org.y, org.z);
+                TDataStd_Comment::Set(note->Label(),
+                    TCollection_ExtendedString(coordStr.Array(), Standard_True));
+            }
+            continue;
+        }
 
         // Convert geometry to TopoDS_Shape
         TopoDS_Shape shape;
@@ -382,20 +461,92 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
             if (!b) continue;
             shape = ON_BrepToOCCT(*b, tol);
             delete b;
+        } else if (geom->ObjectType() == ON::mesh_object) {
+            // P4: Mesh objects — convert via ON_MeshToOCCT + attach as face
+            const ON_Mesh* mesh = ON_Mesh::Cast(geom);
+            if (!mesh) continue;
+            Handle(Poly_Triangulation) tri = ON_MeshToOCCT(*mesh);
+            if (tri.IsNull()) continue;
+            // Wrap in a compound face so ShapeTool can manage it
+            TopoDS_Compound comp;
+            BRep_Builder bb;
+            bb.MakeCompound(comp);
+            // Add vertices of the mesh as a compound shape
+            const int nv = mesh->m_V.Count();
+            const bool useDbl = (mesh->m_dV.Count() == nv);
+            for (int vi = 0; vi < nv; ++vi) {
+                gp_Pnt pt;
+                if (useDbl) {
+                    const ON_3dPoint& p = mesh->m_dV[vi];
+                    pt = gp_Pnt(p.x, p.y, p.z);
+                } else {
+                    const ON_3fPoint& p = mesh->m_V[vi];
+                    pt = gp_Pnt((double)p.x, (double)p.y, (double)p.z);
+                }
+                TopoDS_Vertex vtx = BRepBuilderAPI_MakeVertex(pt);
+                bb.Add(comp, vtx);
+            }
+            shape = comp;
+        } else if (geom->ObjectType() == ON::subd_object) {
+            // P4: SubD → mesh fallback via control-net mesh
+            const ON_SubD* subd = ON_SubD::Cast(geom);
+            if (!subd) continue;
+            ON_Mesh meshStorage;
+            ON_Mesh* result = subd->GetControlNetMesh(
+                &meshStorage,
+                ON_SubDGetControlNetMeshPriority::Geometry);
+            if (!result || result->m_V.Count() == 0)
+                continue;
+            // Store as vertex compound
+            TopoDS_Compound comp;
+            BRep_Builder bb;
+            bb.MakeCompound(comp);
+            const int snv = result->m_V.Count();
+            const bool sUseDbl = (result->m_dV.Count() == snv);
+            for (int vi = 0; vi < snv; ++vi) {
+                gp_Pnt pt;
+                if (sUseDbl) {
+                    const ON_3dPoint& p = result->m_dV[vi];
+                    pt = gp_Pnt(p.x, p.y, p.z);
+                } else {
+                    const ON_3fPoint& p = result->m_V[vi];
+                    pt = gp_Pnt((double)p.x, (double)p.y, (double)p.z);
+                }
+                TopoDS_Vertex vtx = BRepBuilderAPI_MakeVertex(pt);
+                bb.Add(comp, vtx);
+            }
+            shape = comp;
+        } else if (geom->ObjectType() == ON::pointset_object) {
+            // P4: Point clouds — compound of OCCT vertices
+            const ON_PointCloud* pc = ON_PointCloud::Cast(geom);
+            if (!pc) continue;
+            const int np = pc->PointCount();
+            if (np <= 0) continue;
+            TopoDS_Compound comp;
+            BRep_Builder bb;
+            bb.MakeCompound(comp);
+            for (int pi = 0; pi < np; ++pi) {
+                const ON_3dPoint& p = pc->m_P[pi];
+                TopoDS_Vertex vtx =
+                    BRepBuilderAPI_MakeVertex(gp_Pnt(p.x, p.y, p.z));
+                bb.Add(comp, vtx);
+            }
+            shape = comp;
         } else {
-            // Mesh and other types: skip for now
             continue;
         }
         if (shape.IsNull()) continue;
 
-        // Add to XCAF shape tool
-        TDF_Label label = shapeTool->AddShape(shape);
+        // Add to XCAF shape tool.
+        // Use makeAssembly=false for compounds (vertex clouds, mesh fallbacks)
+        // to prevent XCAF from exploding the compound into sub-components.
+        const bool isCompound = (shape.ShapeType() == TopAbs_COMPOUND);
+        TDF_Label label = shapeTool->AddShape(
+            shape, /*makeAssembly=*/isCompound ? Standard_False : Standard_True);
         if (label.IsNull()) continue;
 
         // Record UUID → label for instance-definition assembly pass
         uuidToLabel[mc->Id()] = label;
-
-        const ON_3dmObjectAttributes* attrs = mgc->Attributes(nullptr);
 
         // P1: Object name
         if (attrs && attrs->m_name.IsNotEmpty()) {
@@ -808,6 +959,38 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
         const TopoDS_Shape shape = shapeTool->GetShape(label);
         if (shape.IsNull()) return;
 
+        // P4: Point cloud — detect a compound of vertices
+        if (shape.ShapeType() == TopAbs_COMPOUND) {
+            // Count vertices vs. other types
+            int nVtx = 0, nOther = 0;
+            TopExp_Explorer ex(shape, TopAbs_VERTEX, TopAbs_EDGE);
+            for (; ex.More(); ex.Next()) ++nVtx;
+            TopExp_Explorer ex2(shape, TopAbs_EDGE);
+            for (; ex2.More(); ex2.Next()) ++nOther;
+            if (nVtx > 0 && nOther == 0) {
+                // Reconstruct as ON_PointCloud
+                ON_PointCloud* pc = new ON_PointCloud();
+                pc->m_P.Reserve(nVtx);
+                TopExp_Explorer exv(shape, TopAbs_VERTEX, TopAbs_EDGE);
+                for (; exv.More(); exv.Next()) {
+                    const gp_Pnt& p =
+                        BRep_Tool::Pnt(TopoDS::Vertex(exv.Current()));
+                    pc->m_P.Append(ON_3dPoint(p.X(), p.Y(), p.Z()));
+                }
+                ON_3dmObjectAttributes* pcAttrs = new ON_3dmObjectAttributes();
+                {
+                    Handle(TDataStd_Name) na;
+                    if (label.FindAttribute(TDataStd_Name::GetID(), na))
+                        pcAttrs->m_name = ExtToONw(na->Get());
+                }
+                ON_ModelComponentReference ref2 =
+                    model.AddManagedModelGeometryComponent(pc, pcAttrs);
+                anyOK = true;
+                labelTagToGeomUuid[tag] = ref2.ModelComponent()->Id();
+                return;
+            }
+        }
+
         ON_Brep* brep = new ON_Brep();
         if (!OCCTToON_Brep(shape, *brep, tol)) {
             delete brep;
@@ -892,9 +1075,13 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             TDF_LabelSequence comps;
             XCAFDoc_ShapeTool::GetComponents(label, comps,
                                               /*sub=*/Standard_False);
-            for (Standard_Integer k = 1; k <= comps.Length(); ++k)
-                collectAndAddSimple(comps.Value(k));
-            return;
+            if (comps.Length() > 0) {
+                for (Standard_Integer k = 1; k <= comps.Length(); ++k)
+                    collectAndAddSimple(comps.Value(k));
+                return;
+            }
+            // Assembly with no TDF components: may be a monolithic compound
+            // (e.g. a point-cloud vertex compound). Fall through to addSimpleShape.
         }
         // Simple shape: add it to the model
         addSimpleShape(label);
@@ -1106,6 +1293,56 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
             }
 
             model.m_settings.m_named_views.Append(onView);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P4: Text annotations — read XCAF comment notes → ON_Text objects
+    // -----------------------------------------------------------------------
+    {
+        Handle(XCAFDoc_NotesTool) notesTool =
+            XCAFDoc_DocumentTool::NotesTool(doc->Main());
+
+        TDF_LabelSequence noteLabels;
+        notesTool->GetNotes(noteLabels);
+
+        for (Standard_Integer i = 1; i <= noteLabels.Length(); ++i) {
+            const TDF_Label& nl = noteLabels.Value(i);
+            Handle(XCAFDoc_NoteComment) nc = XCAFDoc_NoteComment::Get(nl);
+            if (nc.IsNull()) continue;
+
+            const TCollection_ExtendedString& comment = nc->Comment();
+            ON_wString txt = ExtToONw(comment);
+            if (txt.IsEmpty()) continue;
+
+            // Recover placement plane origin from TDataStd_Comment if present
+            ON_3dPoint org(0, 0, 0);
+            {
+                Handle(TDataStd_Comment) coordAttr;
+                if (nl.FindAttribute(TDataStd_Comment::GetID(), coordAttr)) {
+                    const TCollection_ExtendedString& cs = coordAttr->Get();
+                    ON_wString coordW = ExtToONw(cs);
+                    ON_String coordS;
+                    coordS = coordW;
+                    double x = 0, y = 0, z = 0;
+                    std::sscanf(coordS.Array(), "%lf %lf %lf", &x, &y, &z);
+                    org = ON_3dPoint(x, y, z);
+                }
+            }
+
+            ON_Plane plane(org, ON_3dVector::ZAxis);
+            ON_Text* onText = new ON_Text();
+            onText->Create(static_cast<const wchar_t*>(txt), nullptr, plane);
+
+            ON_3dmObjectAttributes* tAttrs = new ON_3dmObjectAttributes();
+            {
+                Handle(TDataStd_Name) na;
+                if (nl.FindAttribute(TDataStd_Name::GetID(), na))
+                    tAttrs->m_name = ExtToONw(na->Get());
+            }
+
+            model.AddManagedModelGeometryComponent(onText, tAttrs);
+            anyOK = true;
         }
     }
 

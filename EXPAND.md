@@ -332,9 +332,10 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [ ] GD&T / PMI annotations
 
 ### Phase 4 — Extended types (P4 items)
-- [ ] Point clouds
-- [ ] SubD → mesh fallback
-- [ ] Text annotations
+- [x] Point clouds (`ON_PointCloud` ↔ OCCT `TopoDS_Compound` of vertices)
+- [x] SubD → mesh fallback (`ON_SubD::GetControlNetMesh` → vertex compound)
+- [x] Text annotations (`ON_Text`/`ON_Leader` ↔ `XCAFDoc_NotesTool` comment notes)
+- [x] GD&T / PMI annotations (`ON_Dimension` ↔ `XCAFDoc_DimTolTool`)
 - [ ] Embedded texture maps
 
 ### Phase 5 — Full FreeCAD ↔ 3dm pipeline

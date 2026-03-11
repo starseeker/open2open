@@ -44,6 +44,7 @@ int main()
 #include <XCAFDoc_LayerTool.hxx>
 #include <XCAFDoc_MaterialTool.hxx>
 #include <XCAFDoc_ViewTool.hxx>
+#include <XCAFDoc_NotesTool.hxx>
 
 // OCCT — geometry
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -621,6 +622,116 @@ static void TestLayerHierarchyRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 8: Point cloud round-trip (P4)
+// ---------------------------------------------------------------------------
+static void TestPointCloudRoundTrip()
+{
+    std::printf("--- Test 8: point cloud round-trip\n");
+
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Create a 5-point cloud
+    ON_PointCloud* pc = new ON_PointCloud();
+    pc->m_P.Append(ON_3dPoint(0, 0, 0));
+    pc->m_P.Append(ON_3dPoint(1, 0, 0));
+    pc->m_P.Append(ON_3dPoint(0, 1, 0));
+    pc->m_P.Append(ON_3dPoint(0, 0, 1));
+    pc->m_P.Append(ON_3dPoint(1, 1, 1));
+    ON_3dmObjectAttributes* a = new ON_3dmObjectAttributes();
+    a->m_name = L"TestCloud";
+    src.AddManagedModelGeometryComponent(pc, a);
+
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    // Round-trip back
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Find point cloud in dst
+    bool foundCloud = false;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr; mc = it.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* g = mgc->Geometry(nullptr);
+            if (!g) continue;
+            const ON_PointCloud* rpc = ON_PointCloud::Cast(g);
+            if (rpc && rpc->PointCount() == 5) {
+                foundCloud = true;
+                break;
+            }
+        }
+    }
+    EXPECT_TRUE(foundCloud);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Text annotation round-trip (P4)
+// ---------------------------------------------------------------------------
+static void TestTextAnnotationRoundTrip()
+{
+    std::printf("--- Test 9: text annotation round-trip\n");
+
+    ONX_Model src;
+
+    // Add text annotation
+    ON_Text* txt = new ON_Text();
+    ON_Plane plane(ON_3dPoint(5, 10, 0), ON_3dVector::ZAxis);
+    txt->Create(L"Hello World", nullptr, plane);
+    ON_3dmObjectAttributes* a = new ON_3dmObjectAttributes();
+    a->m_name = L"Label1";
+    src.AddManagedModelGeometryComponent(txt, a);
+
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    // Check XCAF has a note
+    Handle(XCAFDoc_NotesTool) notesTool =
+        XCAFDoc_DocumentTool::NotesTool(doc->Main());
+    TDF_LabelSequence noteLabels;
+    notesTool->GetNotes(noteLabels);
+    EXPECT_EQ(noteLabels.Length(), 1);
+
+    // Round-trip back
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Find text in dst
+    bool foundText = false;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr; mc = it.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* g = mgc->Geometry(nullptr);
+            if (!g || g->ObjectType() != ON::annotation_object) continue;
+            const ON_Annotation* ann = ON_Annotation::Cast(g);
+            if (ann) {
+                const ON_wString t = ann->PlainText();
+                if (t == ON_wString(L"Hello World")) { foundText = true; break; }
+            }
+        }
+    }
+    EXPECT_TRUE(foundText);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -632,6 +743,8 @@ int main()
     TestInstanceRoundTrip();
     TestNamedViewRoundTrip();
     TestLayerHierarchyRoundTrip();
+    TestPointCloudRoundTrip();
+    TestTextAnnotationRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;
