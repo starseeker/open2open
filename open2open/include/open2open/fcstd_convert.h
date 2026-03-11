@@ -93,6 +93,7 @@ struct FcstdObject {
     std::string name;        ///< Internal name used as key (e.g. "Part__Feature")
     std::string type;        ///< FreeCAD object type (e.g. "Part::Feature")
     std::string label;       ///< User-facing label (e.g. "ESQ-126-38-G-D_socket")
+    std::string part_label;  ///< Label of the containing App::Part (empty if none)
     std::string brp_file;    ///< Path inside ZIP to the BRep file (e.g. "PartShape.brp")
     FcstdColor  shape_color  = 0xC8C8C800u; ///< Overall shape colour (packed RGBA, FreeCAD alpha=0 → opaque)
     bool        visible      = true;

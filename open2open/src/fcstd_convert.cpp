@@ -254,6 +254,36 @@ ParseDocumentXml(const std::string& xml_content, FcstdDocMeta& meta)
             std::string brp = FindPropertyValue(elem, "Shape", "Part", "file");
             if (!brp.empty())
                 result[name].brp_file = brp;
+
+            // App::Part membership: look for <Property name="Group" type="...">
+            // containing child <LinkList> or <LinkSub> elements with child names.
+            // FreeCAD stores the group as: <Property name="Group"><LinkList>
+            //   <Link value="Child1"/><Link value="Child2"/>...</LinkList></Property>
+            {
+                auto it = result.find(name);
+                if (it != result.end() && it->second.type == "App::Part") {
+                    const std::string& partLabel =
+                        it->second.label.empty() ? name : it->second.label;
+                    for (LDOM_Node n = elem.getFirstChild();
+                         !n.isNull(); n = n.getNextSibling())
+                    {
+                        if (n.getNodeType() != LDOM_Node::ELEMENT_NODE) continue;
+                        LDOM_Element propElem = (const LDOM_Element&)n;
+                        if (LAttr(propElem, "name") != "Group") continue;
+                        LDOM_NodeList links =
+                            propElem.getElementsByTagName(LDOMString("Link"));
+                        for (int li = 0; li < links.getLength(); ++li) {
+                            LDOM_Node ln = links.item(li);
+                            if (ln.getNodeType() != LDOM_Node::ELEMENT_NODE) continue;
+                            LDOM_Element le = (const LDOM_Element&)ln;
+                            std::string child_name = LAttr(le, "value");
+                            if (!child_name.empty())
+                                result[child_name].part_label = partLabel;
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -443,32 +473,40 @@ int FCStdFileToONX_Model(const std::string& path,
             attrs->SetColorSource(ON::color_from_object);
         }
 
-        // Layer name → find or add layer with this name
-        if (!obj.type.empty()) {
-            // Use FreeCAD type prefix as a simple layer grouping
-            std::string layerName =
-                (obj.type.find("Part::") != std::string::npos) ? "Part"
-              : (obj.type.find("PartDesign::") != std::string::npos) ? "PartDesign"
-              : "Other";
-            ON_wString onLayerName(layerName.c_str());
-            // Search for existing layer with this name
-            int layerIdx = -1;
-            ONX_ModelComponentIterator lit(model,
-                ON_ModelComponent::Type::Layer);
-            for (const ON_ModelComponent* mc = lit.FirstComponent();
-                 mc != nullptr; mc = lit.NextComponent())
-            {
-                const ON_Layer* l = ON_Layer::Cast(mc);
-                if (l && l->Name() == onLayerName) {
-                    layerIdx = l->Index();
-                    break;
-                }
+        // Layer name → use App::Part label if available, else type-based group
+        {
+            // If the object belongs to an App::Part container, use its label
+            // as the layer name; otherwise fall back to type-based grouping.
+            std::string layerName;
+            if (!obj.part_label.empty()) {
+                layerName = obj.part_label;
+            } else if (!obj.type.empty()) {
+                layerName =
+                    (obj.type.find("Part::") != std::string::npos) ? "Part"
+                  : (obj.type.find("PartDesign::") != std::string::npos) ? "PartDesign"
+                  : "Other";
             }
-            if (layerIdx < 0)
-                layerIdx = model.AddLayer(
-                    static_cast<const wchar_t*>(onLayerName),
-                    ON_Color::UnsetColor);
-            attrs->m_layer_index = layerIdx;
+
+            if (!layerName.empty()) {
+                ON_wString onLayerName(layerName.c_str());
+                int layerIdx = -1;
+                ONX_ModelComponentIterator lit(model,
+                    ON_ModelComponent::Type::Layer);
+                for (const ON_ModelComponent* mc = lit.FirstComponent();
+                     mc != nullptr; mc = lit.NextComponent())
+                {
+                    const ON_Layer* l = ON_Layer::Cast(mc);
+                    if (l && l->Name() == onLayerName) {
+                        layerIdx = l->Index();
+                        break;
+                    }
+                }
+                if (layerIdx < 0)
+                    layerIdx = model.AddLayer(
+                        static_cast<const wchar_t*>(onLayerName),
+                        ON_Color::UnsetColor);
+                attrs->m_layer_index = layerIdx;
+            }
         }
 
         model.AddManagedModelGeometryComponent(brep, attrs);

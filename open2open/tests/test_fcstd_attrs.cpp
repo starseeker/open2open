@@ -272,6 +272,82 @@ static void Test_ReadFcstdDoc_3UStructure(const std::string& fcstd_path)
     }
 }
 
+#ifdef OPEN2OPEN_HAVE_LIBZIP
+// ---------------------------------------------------------------------------
+// Test 7: ONX_ModelToFCStdFile + FCStdFileToONX_Model round-trip
+// ---------------------------------------------------------------------------
+#include "open2open/brep_convert.h"
+#include "opennurbs.h"
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <TopoDS_Shape.hxx>
+
+static void Test_FCStdRoundTrip()
+{
+    std::printf("--- Test 7: FCStd model round-trip (ONX_Model ↔ FCStd)\n");
+
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Add a box brep
+    {
+        TopoDS_Shape shape = BRepPrimAPI_MakeBox(10.0, 20.0, 5.0).Shape();
+        ON_Brep* brep = new ON_Brep();
+        open2open::OCCTToON_Brep(shape, *brep, 1e-3);
+        ON_3dmObjectAttributes* a = new ON_3dmObjectAttributes();
+        a->m_name = L"TestBox";
+        a->m_color = ON_Color(100, 150, 200);
+        a->SetColorSource(ON::color_from_object);
+        // Add per-face colours
+        for (int fi = 0; fi < brep->m_F.Count(); ++fi) {
+            const ON_Color fc = (fi % 2 == 0)
+                ? ON_Color(255, 0, 0) : ON_Color(0, 255, 0);
+            brep->m_F[fi].SetPerFaceColor(fc);
+        }
+        src.AddManagedModelGeometryComponent(brep, a);
+    }
+
+    // Write to /tmp
+    const std::string tmpFile = "/tmp/test_fcstd_roundtrip.FCStd";
+    int nWritten = open2open::ONX_ModelToFCStdFile(tmpFile, src, 1e-3);
+    CHECK(nWritten == 1);
+    if (nWritten == 0) return;
+
+    // Read back
+    ONX_Model dst;
+    int nRead = open2open::FCStdFileToONX_Model(tmpFile, dst, 1e-3);
+    CHECK(nRead == 1);
+
+    // Verify object name
+    bool foundBox = false;
+    {
+        ONX_ModelComponentIterator it(dst,
+            ON_ModelComponent::Type::ModelGeometry);
+        for (const ON_ModelComponent* mc = it.FirstComponent();
+             mc != nullptr; mc = it.NextComponent())
+        {
+            const ON_ModelGeometryComponent* mgc =
+                ON_ModelGeometryComponent::Cast(mc);
+            if (!mgc) continue;
+            const ON_Geometry* g = mgc->Geometry(nullptr);
+            if (!g || g->ObjectType() != ON::brep_object) continue;
+            const ON_Brep* brep = ON_Brep::Cast(g);
+            if (!brep) continue;
+            // Should have 6 faces (box)
+            if (brep->m_F.Count() == 6) {
+                const ON_3dmObjectAttributes* at = mgc->Attributes(nullptr);
+                if (at && at->m_name == ON_wString(L"TestBox"))
+                    foundBox = true;
+            }
+        }
+    }
+    CHECK(foundBox);
+
+    // Clean up
+    std::remove(tmpFile.c_str());
+}
+#endif // OPEN2OPEN_HAVE_LIBZIP
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -341,9 +417,16 @@ int main(int argc, char* argv[])
         }
     }
 
+#ifdef OPEN2OPEN_HAVE_LIBZIP
+    Test_FCStdRoundTrip();
+#else
+    ++g_skip;
+    std::printf("SKIP [Test_FCStdRoundTrip: libzip not available]\n");
+#endif
+
     std::printf("\n%d/%d tests passed", g_pass, g_pass + g_fail);
     if (g_skip > 0)
-        std::printf(", %d skipped (FCStd files not found)", g_skip);
+        std::printf(", %d skipped (FCStd files not found or libzip unavailable)", g_skip);
     std::printf("\n");
 
     return (g_fail == 0) ? 0 : 1;
