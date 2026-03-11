@@ -526,6 +526,83 @@ Handle(TDocStd_Document) ONX_ModelToXCAFDoc(const ONX_Model& model, double tol)
         }
     }
 
+    // -----------------------------------------------------------------------
+    // P3: Named views — each ON_3dmView becomes an XCAF view entry.
+    // Stores name, projection type, camera location/direction/up.
+    // -----------------------------------------------------------------------
+    {
+        Handle(XCAFDoc_ViewTool) viewTool =
+            XCAFDoc_DocumentTool::ViewTool(doc->Main());
+
+        const int nViews = model.m_settings.m_named_views.Count();
+        for (int vi = 0; vi < nViews; ++vi) {
+            const ON_3dmView& v = model.m_settings.m_named_views[vi];
+            const ON_Viewport& vp = v.m_vp;
+
+            // Skip degenerate viewports
+            if (!vp.IsValidCamera()) continue;
+
+            TDF_Label viewLabel = viewTool->AddView();
+            if (viewLabel.IsNull()) continue;
+
+            Handle(XCAFView_Object) vo = new XCAFView_Object();
+
+            // Name
+            Handle(TCollection_HAsciiString) hName =
+                new TCollection_HAsciiString(
+                    v.m_name.IsNotEmpty()
+                        ? ON_String(v.m_name).Array()
+                        : "View");
+            vo->SetName(hName);
+
+            // Projection type
+            vo->SetType(vp.IsPerspectiveProjection()
+                ? XCAFView_ProjectionType_Central
+                : XCAFView_ProjectionType_Parallel);
+
+            // Camera location (projection point in parallel projection = target)
+            const ON_3dPoint loc = vp.CameraLocation();
+            vo->SetProjectionPoint(gp_Pnt(loc.x, loc.y, loc.z));
+
+            // View direction
+            const ON_3dVector dir = vp.CameraDirection();
+            if (dir.IsNotZero()) {
+                ON_3dVector d = dir;
+                d.Unitize();
+                vo->SetViewDirection(gp_Dir(d.x, d.y, d.z));
+            }
+
+            // Up direction
+            const ON_3dVector up = vp.CameraUp();
+            if (up.IsNotZero()) {
+                ON_3dVector u = up;
+                u.Unitize();
+                vo->SetUpDirection(gp_Dir(u.x, u.y, u.z));
+            }
+
+            // Window size (frustum width/height at near plane)
+            vo->SetWindowHorizontalSize(vp.FrustumWidth());
+            vo->SetWindowVerticalSize(vp.FrustumHeight());
+
+            // Zoom factor: use 1/frustum_height as a normalised scale
+            const double fh = vp.FrustumHeight();
+            if (fh > 0.0)
+                vo->SetZoomFactor(1.0 / fh);
+
+            Handle(XCAFDoc_View) viewAttr = XCAFDoc_View::Set(viewLabel);
+            viewAttr->SetObject(vo);
+
+            // Name the label
+            if (v.m_name.IsNotEmpty())
+                TDataStd_Name::Set(viewLabel, ONwToExt(v.m_name));
+
+            // Associate with all free shapes
+            TDF_LabelSequence shapeLabels;
+            shapeTool->GetFreeShapes(shapeLabels);
+            viewTool->SetView(shapeLabels, TDF_LabelSequence(), viewLabel);
+        }
+    }
+
     return doc;
 }
 
@@ -875,6 +952,87 @@ bool XCAFDocToONX_Model(const Handle(TDocStd_Document)& doc,
 
             model.AddManagedModelGeometryComponent(iref, iattrs);
             anyOK = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // P3: Named views — read XCAF view labels → ON_3dmView
+    // -----------------------------------------------------------------------
+    {
+        Handle(XCAFDoc_ViewTool) viewTool =
+            XCAFDoc_DocumentTool::ViewTool(doc->Main());
+
+        TDF_LabelSequence viewLabels;
+        viewTool->GetViewLabels(viewLabels);
+
+        for (Standard_Integer i = 1; i <= viewLabels.Length(); ++i) {
+            const TDF_Label& vl = viewLabels.Value(i);
+
+            Handle(XCAFDoc_View) viewAttr;
+            if (!vl.FindAttribute(XCAFDoc_View::GetID(), viewAttr))
+                continue;
+            Handle(XCAFView_Object) vo = viewAttr->GetObject();
+            if (vo.IsNull()) continue;
+
+            ON_3dmView onView;
+
+            // Name
+            ON_wString viewName;
+            if (!vo->Name().IsNull() && !vo->Name()->IsEmpty())
+                viewName = ON_wString(vo->Name()->ToCString());
+            if (viewName.IsEmpty()) {
+                // Fallback: check TDataStd_Name on the label
+                Handle(TDataStd_Name) na;
+                if (vl.FindAttribute(TDataStd_Name::GetID(), na))
+                    viewName = ExtToONw(na->Get());
+            }
+            if (!viewName.IsEmpty())
+                onView.m_name = viewName;
+
+            ON_Viewport& vp = onView.m_vp;
+
+            // Projection type
+            const bool isPerspective =
+                (vo->Type() == XCAFView_ProjectionType_Central);
+
+            // Camera location
+            gp_Pnt projPt = vo->ProjectionPoint();
+            vp.SetCameraLocation(
+                ON_3dPoint(projPt.X(), projPt.Y(), projPt.Z()));
+
+            // View direction
+            gp_Dir viewDir = vo->ViewDirection();
+            vp.SetCameraDirection(
+                ON_3dVector(viewDir.X(), viewDir.Y(), viewDir.Z()));
+
+            // Up direction
+            gp_Dir upDir = vo->UpDirection();
+            vp.SetCameraUp(
+                ON_3dVector(upDir.X(), upDir.Y(), upDir.Z()));
+
+            // Window size
+            const double hw = vo->WindowHorizontalSize();
+            const double hh = vo->WindowVerticalSize();
+
+            if (isPerspective) {
+                vp.SetProjection(ON::perspective_view);
+                // Approximate camera angle from window height
+                if (hh > 0.0) {
+                    const double halfAngle = std::atan2(hh * 0.5, 1.0);
+                    vp.ChangeToPerspectiveProjection(
+                        ON_UNSET_VALUE, // target_dist
+                        std::tan(halfAngle),
+                        true);
+                }
+            } else {
+                vp.SetProjection(ON::parallel_view);
+                if (hw > 0.0 && hh > 0.0)
+                    vp.SetFrustum(-hw * 0.5, hw * 0.5,
+                                  -hh * 0.5, hh * 0.5,
+                                   0.1, 1e4);
+            }
+
+            model.m_settings.m_named_views.Append(onView);
         }
     }
 

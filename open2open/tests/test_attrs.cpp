@@ -43,6 +43,7 @@ int main()
 #include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_LayerTool.hxx>
 #include <XCAFDoc_MaterialTool.hxx>
+#include <XCAFDoc_ViewTool.hxx>
 
 // OCCT — geometry
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -468,6 +469,71 @@ static void TestInstanceRoundTrip()
 }
 
 // ---------------------------------------------------------------------------
+// Test 6: Named views round-trip (P3)
+// ---------------------------------------------------------------------------
+static void TestNamedViewRoundTrip()
+{
+    std::printf("--- Test 6: named view round-trip\n");
+
+    ONX_Model src;
+    src.m_settings.m_ModelUnitsAndTolerances.m_unit_system =
+        ON_UnitSystem(ON::LengthUnitSystem::Millimeters);
+
+    // Add a perspective view
+    {
+        ON_3dmView v;
+        v.m_name = L"Perspective";
+        v.m_vp.SetProjection(ON::perspective_view);
+        v.m_vp.SetCameraLocation(ON_3dPoint(100, 200, 300));
+        v.m_vp.SetCameraDirection(ON_3dVector(-1, -2, -3));
+        v.m_vp.SetCameraUp(ON_3dVector(0, 0, 1));
+        v.m_vp.SetFrustum(-5, 5, -4, 4, 1.0, 1000.0);
+        src.m_settings.m_named_views.Append(v);
+    }
+    // Add a parallel view
+    {
+        ON_3dmView v;
+        v.m_name = L"Top";
+        v.m_vp.SetProjection(ON::parallel_view);
+        v.m_vp.SetCameraLocation(ON_3dPoint(0, 0, 500));
+        v.m_vp.SetCameraDirection(ON_3dVector(0, 0, -1));
+        v.m_vp.SetCameraUp(ON_3dVector(0, 1, 0));
+        v.m_vp.SetFrustum(-50, 50, -50, 50, 0.1, 1e4);
+        src.m_settings.m_named_views.Append(v);
+    }
+
+    auto doc = open2open::ONX_ModelToXCAFDoc(src, 1e-3);
+    EXPECT_TRUE(!doc.IsNull());
+    if (doc.IsNull()) return;
+
+    // Check XCAF view count
+    Handle(XCAFDoc_ViewTool) viewTool =
+        XCAFDoc_DocumentTool::ViewTool(doc->Main());
+    TDF_LabelSequence viewLabels;
+    viewTool->GetViewLabels(viewLabels);
+    EXPECT_EQ(viewLabels.Length(), 2);
+
+    // Round-trip back to ONX_Model
+    ONX_Model dst;
+    bool ok = open2open::XCAFDocToONX_Model(doc, dst, 1e-3);
+    EXPECT_TRUE(ok);
+
+    // Named views should be restored
+    EXPECT_EQ(dst.m_settings.m_named_views.Count(), 2);
+
+    if (dst.m_settings.m_named_views.Count() >= 1) {
+        const ON_3dmView& v0 = dst.m_settings.m_named_views[0];
+        const ON_wString& n0 = v0.m_name;
+        EXPECT_TRUE(n0 == L"Perspective");
+    }
+    if (dst.m_settings.m_named_views.Count() >= 2) {
+        const ON_3dmView& v1 = dst.m_settings.m_named_views[1];
+        EXPECT_TRUE(v1.m_name == L"Top");
+        EXPECT_TRUE(!v1.m_vp.IsPerspectiveProjection());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -477,6 +543,7 @@ int main()
     TestXCAFToModel();
     TestNullDoc();
     TestInstanceRoundTrip();
+    TestNamedViewRoundTrip();
 
     std::printf("\n%d/%d tests passed.\n", g_pass, g_pass + g_fail);
     return (g_fail == 0) ? 0 : 1;
