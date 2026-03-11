@@ -39,6 +39,10 @@
 #include <XCAFDoc_LayerTool.hxx>
 #include <XCAFDoc_MaterialTool.hxx>
 #include <XCAFDoc_LengthUnit.hxx>
+#include <XCAFDoc_ViewTool.hxx>
+#include <XCAFDoc_View.hxx>
+#include <XCAFView_Object.hxx>
+#include <XCAFView_ProjectionType.hxx>
 
 // OCCT — colour
 #include <Quantity_Color.hxx>
@@ -54,6 +58,8 @@
 
 // OCCT — transforms (for instance placement)
 #include <gp_Trsf.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Dir.hxx>
 #include <TopLoc_Location.hxx>
 #include <XCAFDoc_Location.hxx>
 
