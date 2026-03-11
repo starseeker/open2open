@@ -133,8 +133,11 @@ endif()
 # The module is also optional: silently skip if libzip is not installed.
 find_library(_LIBZIP_LIB NAMES zip DOC "libzip library")
 find_path(_LIBZIP_INC zip.h DOC "libzip header directory")
+# fcstd_convert.cpp is always compiled: ParseDiffuseColors has no zip dependency.
+# The full ReadFcstdDoc function requires libzip and is guarded by
+# OPEN2OPEN_HAVE_LIBZIP in the source.
+list(APPEND _OPEN2OPEN_SOURCES src/fcstd_convert.cpp)
 if(_LIBZIP_LIB AND _LIBZIP_INC)
-    list(APPEND _OPEN2OPEN_SOURCES src/fcstd_convert.cpp)
     set(_HAVE_LIBZIP ON)
     message(STATUS "open2open: FreeCAD FCStd support enabled (libzip found: ${_LIBZIP_LIB})")
 else()

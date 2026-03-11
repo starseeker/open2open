@@ -12,10 +12,17 @@
 //   uint32 color[count]           (packed 0xRRGGBBAA, stored little-endian)
 // FreeCAD alpha=0 means fully opaque (inverted convention vs. standard).
 //
-// Dependencies: libzip (link -lzip), OCCT LDOM XML parser (TKernel).
+// Dependencies: ParseDiffuseColors has no external deps.
+//              ReadFcstdDoc requires libzip (OPEN2OPEN_HAVE_LIBZIP).
 
 #include "open2open/fcstd_convert.h"
 
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#ifdef OPEN2OPEN_HAVE_LIBZIP
 // OCCT LDOM XML parser
 #include <LDOMParser.hxx>
 #include <LDOM_Document.hxx>
@@ -24,14 +31,23 @@
 #include <LDOM_NodeList.hxx>
 #include <LDOMString.hxx>
 
+// OCCT BRep reading (for FCStdFileToONX_Model)
+#include <BRep_Builder.hxx>
+#include <BRepTools.hxx>
+#include <TopoDS_Shape.hxx>
+
 // libzip
 #include <zip.h>
 
-#include <cstring>
+// openNURBS
+#include "opennurbs.h"
+
+// open2open B-Rep converter
+#include "open2open/brep_convert.h"
+
 #include <map>
 #include <sstream>
-#include <string>
-#include <vector>
+#endif // OPEN2OPEN_HAVE_LIBZIP
 
 namespace open2open {
 
@@ -76,6 +92,8 @@ bool ParseDiffuseColors(const void*              data,
     }
     return true;
 }
+
+#ifdef OPEN2OPEN_HAVE_LIBZIP
 
 // ---------------------------------------------------------------------------
 // RAII wrapper around a libzip archive handle.
@@ -361,5 +379,112 @@ bool ReadFcstdDoc(const std::string& path, FcstdDoc& doc)
 
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// FCStdFileToONX_Model — convert an FCStd file → ONX_Model.
+// ---------------------------------------------------------------------------
+int FCStdFileToONX_Model(const std::string& path,
+                         ONX_Model&         model,
+                         double             tol)
+{
+    FcstdDoc doc;
+    if (!ReadFcstdDoc(path, doc))
+        return 0;
+
+    // Open the archive a second time for B-Rep reading
+    int err = 0;
+    zip_t* raw_zip = zip_open(path.c_str(), ZIP_RDONLY, &err);
+    if (!raw_zip)
+        return 0;
+    ZipGuard guard(raw_zip);
+
+    int nConverted = 0;
+
+    for (const FcstdObject& obj : doc.objects) {
+        if (obj.brp_file.empty()) continue;
+
+        // Read the OCCT BRep text from the archive
+        std::string brp_content = ZipReadEntry(raw_zip, obj.brp_file.c_str());
+        if (brp_content.empty()) continue;
+
+        // Parse the BRep using OCCT BRep reader
+        BRep_Builder builder;
+        TopoDS_Shape shape;
+        std::istringstream iss(brp_content);
+        BRepTools::Read(shape, iss, builder);
+        if (shape.IsNull()) continue;
+
+        // Convert to ON_Brep
+        ON_Brep* brep = new ON_Brep();
+        if (!open2open::OCCTToON_Brep(shape, *brep, tol)) {
+            delete brep;
+            continue;
+        }
+        if (!brep->IsValid()) {
+            delete brep;
+            continue;
+        }
+
+        // Build attributes
+        ON_3dmObjectAttributes* attrs = new ON_3dmObjectAttributes();
+        // Name
+        if (!obj.label.empty())
+            attrs->m_name = ON_wString(obj.label.c_str());
+        else if (!obj.name.empty())
+            attrs->m_name = ON_wString(obj.name.c_str());
+
+        // Overall shape colour
+        {
+            float r, g, b, a;
+            FcstdColorToRGBAf(obj.shape_color, r, g, b, a);
+            attrs->m_color = ON_Color(
+                (int)(r * 255), (int)(g * 255), (int)(b * 255),
+                (int)((1.0f - a) * 255));
+            attrs->SetColorSource(ON::color_from_object);
+        }
+
+        // Layer name → find or add layer with this name
+        if (!obj.type.empty()) {
+            // Use FreeCAD type prefix as a simple layer grouping
+            std::string layerName =
+                (obj.type.find("Part::") != std::string::npos) ? "Part"
+              : (obj.type.find("PartDesign::") != std::string::npos) ? "PartDesign"
+              : "Other";
+            ON_wString onLayerName(layerName.c_str());
+            // Search for existing layer with this name
+            int layerIdx = -1;
+            ONX_ModelComponentIterator lit(model,
+                ON_ModelComponent::Type::Layer);
+            for (const ON_ModelComponent* mc = lit.FirstComponent();
+                 mc != nullptr; mc = lit.NextComponent())
+            {
+                const ON_Layer* l = ON_Layer::Cast(mc);
+                if (l && l->Name() == onLayerName) {
+                    layerIdx = l->Index();
+                    break;
+                }
+            }
+            if (layerIdx < 0)
+                layerIdx = model.AddLayer(
+                    static_cast<const wchar_t*>(onLayerName),
+                    ON_Color::UnsetColor);
+            attrs->m_layer_index = layerIdx;
+        }
+
+        model.AddManagedModelGeometryComponent(brep, attrs);
+        ++nConverted;
+    }
+
+    return nConverted;
+}
+
+#else // !OPEN2OPEN_HAVE_LIBZIP
+
+bool ReadFcstdDoc(const std::string& /*path*/, FcstdDoc& /*doc*/)
+{
+    return false; // libzip not available
+}
+
+#endif // OPEN2OPEN_HAVE_LIBZIP
 
 } // namespace open2open

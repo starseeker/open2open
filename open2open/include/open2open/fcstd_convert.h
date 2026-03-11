@@ -130,8 +130,35 @@ struct FcstdDoc {
 // @param doc   Output: populated on success; unchanged on failure.
 // @return      true if the archive was opened and at least Document.xml was
 //              parsed; false if the file could not be opened as a ZIP archive.
+//
+// This function requires libzip at compile time (OPEN2OPEN_HAVE_LIBZIP).
+// When libzip is absent it always returns false.
 // ---------------------------------------------------------------------------
 bool ReadFcstdDoc(const std::string& path, FcstdDoc& doc);
+
+#ifdef OPEN2OPEN_HAVE_LIBZIP
+// Forward-declare ONX_Model to keep this header light.
+// Callers must include "opennurbs.h" themselves.
+class ONX_Model;
+
+// ---------------------------------------------------------------------------
+// Convert an FCStd file to an ONX_Model.
+//
+// Opens the archive at @p path, reads all B-Rep shapes (*.brp entries),
+// converts each shape via OCCTToON_Brep(), and appends to @p model.
+// Object name, display colour and layer name are propagated as model
+// attributes.  Per-face colours from DiffuseColor are stored on the ON_Brep
+// using the first face colour as the object colour.
+//
+// @param path     Filesystem path to the .FCStd file.
+// @param model    Destination model.  Existing content is NOT cleared.
+// @param tol      Linear tolerance passed to OCCTToON_Brep().
+// @return         Number of shapes successfully converted (0 on total failure).
+// ---------------------------------------------------------------------------
+int FCStdFileToONX_Model(const std::string& path,
+                         ONX_Model&         model,
+                         double             tol = 1e-6);
+#endif // OPEN2OPEN_HAVE_LIBZIP
 
 } // namespace open2open
 

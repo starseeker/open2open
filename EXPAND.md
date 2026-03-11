@@ -339,10 +339,11 @@ A complete FreeCAD ↔ Rhino 3dm pipeline requires three layers:
 - [x] Embedded texture maps (`ON_Texture::m_image_file_reference` ↔ `TDataStd_Comment` on material child label)
 
 ### Phase 5 — Full FreeCAD ↔ 3dm pipeline
-- [ ] `fcstd_reader` module: ZIP + XML → ONX_Model
+- [x] `fcstd_reader` module: `FCStdFileToONX_Model(path, model)` — reads BRep entries from ZIP → `ON_Brep` objects with name/colour/layer attributes
+- [x] `ParseDiffuseColors` always compiled (no libzip dependency); `ReadFcstdDoc` and `FCStdFileToONX_Model` guarded by `OPEN2OPEN_HAVE_LIBZIP`
 - [ ] `fcstd_writer` module: ONX_Model → ZIP + XML
-- [ ] Per-face `DiffuseColor` round-trip
-- [ ] `App::Part` container → ON_Layer hierarchy
+- [ ] Per-face `DiffuseColor` round-trip via writer
+- [ ] `App::Part` container → ON_Layer hierarchy (via type-based layer grouping for now)
 - [ ] Integration test: `test_fcstd_3dm_roundtrip`
 
 ---
